@@ -44,7 +44,7 @@ def load_watchlist():
         """SELECT coin_id, name, symbol, price_usd, change_24h, change_7d, change_30d,
                   market_cap, volume_24h, sentiment_up, sentiment_down
            FROM token_data 
-           WHERE fetched_at = (SELECT MAX(fetched_at) FROM token_data)
+           WHERE fetched_at >= (SELECT datetime(MAX(fetched_at), '-5 minutes') FROM token_data)
            AND name IS NOT NULL
            ORDER BY market_cap DESC""",
         conn
