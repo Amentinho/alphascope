@@ -7,6 +7,7 @@ import requests
 import sqlite3
 import time
 from datetime import datetime
+from telegram_monitor import fetch_all_telegram
 
 # ============================================================
 # YOUR WATCHLIST — Edit this anytime!
@@ -272,20 +273,6 @@ def fetch_reddit_and_detect_narratives():
 # ============================================================
 # CRYPTOPANIC — Free News Sentiment
 # ============================================================
-def fetch_cryptopanic():
-    """Fetch trending crypto news from CryptoPanic (no API key for basic)."""
-    try:
-        res = requests.get(
-            'https://cryptopanic.com/api/free/v1/posts/?auth_token=free&public=true&kind=news',
-            timeout=10
-        )
-        if res.status_code == 200:
-            posts = res.json().get('results', [])[:15]
-            print(f"  ✓ CryptoPanic: {len(posts)} news items")
-            return posts
-        else:
-            print(f"  ✗ CryptoPanic: status {res.status_code}")
-            return None
     except Exception as e:
         print(f"  ✗ CryptoPanic failed: {e}")
         return None
@@ -293,6 +280,180 @@ def fetch_cryptopanic():
 # ============================================================
 # RUN ALL
 # ============================================================
+# ============================================================
+# NEW LISTINGS — Recently added coins (potential early alpha)
+# ============================================================
+def fetch_new_listings():
+    """Fetch recently listed coins from CoinGecko."""
+    try:
+        res = requests.get(
+            'https://api.coingecko.com/api/v3/coins/list/new',
+            timeout=10
+        )
+        if res.status_code != 200:
+            print(f"  ✗ New listings: API returned {res.status_code}")
+            return None
+        
+        coins = res.json()[:15]
+        
+        conn = sqlite3.connect('alphascope.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS new_listings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin_id TEXT,
+            name TEXT,
+            symbol TEXT,
+            activated_at TEXT,
+            fetched_at TEXT
+        )''')
+        now = datetime.now().isoformat()
+        
+        for coin in coins:
+            c.execute('INSERT INTO new_listings (coin_id, name, symbol, activated_at, fetched_at) VALUES (?, ?, ?, ?, ?)',
+                      (coin.get('id'), coin.get('name'), coin.get('symbol', '').upper(),
+                       coin.get('activated_at', ''), now))
+        
+        conn.commit()
+        conn.close()
+        print(f"  ✓ New listings: {len(coins)} coins ({', '.join(c.get('symbol','?').upper() for c in coins[:5])})")
+        return coins
+    except Exception as e:
+        print(f"  ✗ New listings: {e}")
+        return None
+
+# ============================================================
+# HIDDEN GEMS — Low-cap trending coins (alpha signal)
+# ============================================================
+def detect_hidden_gems():
+    """Find coins that are trending but have low market cap — potential gems."""
+    conn = sqlite3.connect('alphascope.db')
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS hidden_gems (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        symbol TEXT,
+        market_cap_rank INTEGER,
+        signal_type TEXT,
+        signal_detail TEXT,
+        fetched_at TEXT
+    )''')
+    
+    # Get trending coins
+    c.execute("SELECT name, symbol, market_cap_rank FROM trending ORDER BY fetched_at DESC LIMIT 10")
+    trending = c.fetchall()
+    
+    now = datetime.now().isoformat()
+    gems = []
+    
+    for name, symbol, rank in trending:
+        if rank and rank > 100:  # Outside top 100 = potential gem
+            signal = "LOW_CAP_TRENDING"
+            detail = f"Rank #{rank} but trending on CoinGecko — early attention signal"
+            c.execute('INSERT INTO hidden_gems (name, symbol, market_cap_rank, signal_type, signal_detail, fetched_at) VALUES (?, ?, ?, ?, ?, ?)',
+                      (name, symbol, rank, signal, detail, now))
+            gems.append(f"{symbol}(#{rank})")
+    
+    conn.commit()
+    conn.close()
+    
+    if gems:
+        print(f"  ✓ Hidden gems: {', '.join(gems)}")
+    else:
+        print(f"  ✓ Hidden gems: none detected this cycle")
+    return gems
+
+# ============================================================
+# AIRDROP & ICO SCANNER — from Reddit + Telegram
+# ============================================================
+AIRDROP_KEYWORDS = ['airdrop', 'free mint', 'token launch', 'ico', 'ido', 'presale', 
+                     'fair launch', 'testnet reward', 'points program', 'claim', 
+                     'eligibility', 'snapshot', 'tge', 'token generation']
+
+def scan_airdrops():
+    """Scan Reddit and Telegram messages for airdrop/ICO mentions."""
+    conn = sqlite3.connect('alphascope.db')
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS airdrops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        source TEXT,
+        source_detail TEXT,
+        keyword_matched TEXT,
+        score INTEGER,
+        fetched_at TEXT
+    )''')
+    
+    now = datetime.now().isoformat()
+    found = []
+    
+    # Scan Reddit posts
+    c.execute("SELECT title, score, subreddit FROM reddit_posts ORDER BY fetched_at DESC LIMIT 100")
+    for title, score, sub in c.fetchall():
+        title_lower = title.lower()
+        for keyword in AIRDROP_KEYWORDS:
+            if keyword in title_lower:
+                c.execute('INSERT INTO airdrops (title, source, source_detail, keyword_matched, score, fetched_at) VALUES (?, ?, ?, ?, ?, ?)',
+                          (title, 'reddit', f'r/{sub}', keyword, score, now))
+                found.append(f"[Reddit] {title[:50]}...")
+                break
+    
+    # Scan Telegram messages
+    c.execute("SELECT message, channel FROM telegram_messages ORDER BY fetched_at DESC LIMIT 100")
+    for message, channel in c.fetchall():
+        msg_lower = message.lower()
+        for keyword in AIRDROP_KEYWORDS:
+            if keyword in msg_lower:
+                c.execute('INSERT INTO airdrops (title, source, source_detail, keyword_matched, score, fetched_at) VALUES (?, ?, ?, ?, ?, ?)',
+                          (message[:200], 'telegram', f'@{channel}', keyword, 0, now))
+                found.append(f"[Telegram] {message[:50]}...")
+                break
+    
+    conn.commit()
+    conn.close()
+    
+    if found:
+        print(f"  ✓ Airdrops/ICOs: {len(found)} mentions found")
+    else:
+        print(f"  ✓ Airdrops/ICOs: no mentions this cycle")
+    return found
+
+# Also fetch from dedicated airdrop subreddits
+def fetch_airdrop_reddit():
+    """Fetch from airdrop-specific subreddits."""
+    import requests
+    headers = {'User-Agent': 'AlphaScope/1.0'}
+    
+    subs = ['CryptoAirdrop', 'airdropalert', 'CryptoAirdrops']
+    all_posts = []
+    
+    for sub in subs:
+        try:
+            res = requests.get(f'https://www.reddit.com/r/{sub}/hot.json?limit=10',
+                               headers=headers, timeout=10)
+            if res.status_code == 200:
+                posts = res.json()['data']['children']
+                conn = sqlite3.connect('alphascope.db')
+                c = conn.cursor()
+                now = datetime.now().isoformat()
+                for post in posts:
+                    d = post['data']
+                    c.execute('INSERT INTO airdrops (title, source, source_detail, keyword_matched, score, fetched_at) VALUES (?, ?, ?, ?, ?, ?)',
+                              (d.get('title'), 'reddit', f'r/{sub}', 'airdrop_sub', d.get('score', 0), now))
+                conn.commit()
+                conn.close()
+                all_posts.extend(posts)
+            time.sleep(2)
+        except:
+            continue
+    
+    if all_posts:
+        print(f"  ✓ Airdrop subs: {len(all_posts)} posts from {len(subs)} subs")
+    return all_posts
+
+
+
 def fetch_all():
     print(f"\n{'='*60}")
     print(f"  🔍 AlphaScope — Data Fetch at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -302,7 +463,12 @@ def fetch_all():
     fetch_trending()
     fetch_all_watchlist()
     fetch_reddit_and_detect_narratives()
-    fetch_cryptopanic()
+    fetch_all_telegram()
+    fetch_new_listings()
+    time.sleep(6)
+    detect_hidden_gems()
+    scan_airdrops()
+    fetch_airdrop_reddit()
     
     print(f"{'='*60}")
     print(f"  ✓ All fetches complete!")
@@ -311,3 +477,4 @@ def fetch_all():
 if __name__ == '__main__':
     init_db()
     fetch_all()
+
