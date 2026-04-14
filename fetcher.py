@@ -8,6 +8,7 @@ import sqlite3
 import time
 from datetime import datetime
 from telegram_monitor import fetch_all_telegram
+from x_sentiment import fetch_x_sentiment
 
 # ============================================================
 # YOUR WATCHLIST — Edit this anytime!
@@ -454,6 +455,120 @@ def fetch_airdrop_reddit():
 
 
 
+# ============================================================
+# X/TWITTER SENTIMENT — Via SentiCrypt (free, no API key)
+# ============================================================
+def fetch_twitter_sentiment():
+    """Fetch Bitcoin Twitter sentiment from SentiCrypt (free API)."""
+    try:
+        res = requests.get('https://api.senticrypt.com/v2/latest.json', timeout=10)
+        if res.status_code != 200:
+            print(f"  ✗ Twitter sentiment: API returned {res.status_code}")
+            return None
+        
+        data = res.json()
+        
+        conn = sqlite3.connect('alphascope.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS twitter_sentiment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            mean_sentiment REAL,
+            median_sentiment REAL,
+            std_sentiment REAL,
+            count INTEGER,
+            btc_price REAL,
+            volume REAL,
+            fetched_at TEXT
+        )''')
+        now = datetime.now().isoformat()
+        
+        if isinstance(data, list):
+            for entry in data[-7:]:  # Last 7 days
+                c.execute('''INSERT INTO twitter_sentiment 
+                    (date, mean_sentiment, median_sentiment, std_sentiment, count, btc_price, volume, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (entry.get('date'), entry.get('mean'), entry.get('median'),
+                     entry.get('std'), entry.get('count'), entry.get('btc_price'),
+                     entry.get('volume'), now))
+        elif isinstance(data, dict):
+            c.execute('''INSERT INTO twitter_sentiment 
+                (date, mean_sentiment, median_sentiment, std_sentiment, count, btc_price, volume, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (data.get('date'), data.get('mean'), data.get('median'),
+                 data.get('std'), data.get('count'), data.get('btc_price'),
+                 data.get('volume'), now))
+        
+        conn.commit()
+        conn.close()
+        
+        # Display latest
+        if isinstance(data, list) and data:
+            latest = data[-1]
+        else:
+            latest = data
+        
+        mean = latest.get('mean', 0) or 0
+        mood = "BULLISH" if mean > 0.05 else "BEARISH" if mean < -0.05 else "NEUTRAL"
+        count = latest.get('count', 0) or 0
+        print(f"  ✓ X/Twitter BTC sentiment: {mean:+.3f} ({mood}) from {count:,} tweets")
+        return data
+    except Exception as e:
+        print(f"  ✗ Twitter sentiment: {e}")
+        return None
+
+# ============================================================
+# CRYPTO NEWS SENTIMENT — Via cryptocurrency.cv (free, no key)
+# ============================================================
+def fetch_crypto_news():
+    """Fetch latest crypto news with sentiment from cryptocurrency.cv."""
+    try:
+        res = requests.get('https://cryptocurrency.cv/api/news?limit=20', timeout=10)
+        if res.status_code != 200:
+            print(f"  ✗ Crypto news: API returned {res.status_code}")
+            return None
+        
+        articles = res.json()
+        if isinstance(articles, dict):
+            articles = articles.get('articles', articles.get('data', []))
+        
+        conn = sqlite3.connect('alphascope.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS crypto_news (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            source TEXT,
+            tickers TEXT,
+            sentiment TEXT,
+            url TEXT,
+            pub_date TEXT,
+            fetched_at TEXT
+        )''')
+        now = datetime.now().isoformat()
+        
+        stored = 0
+        for article in articles[:15]:
+            title = article.get('title', '')
+            if not title:
+                continue
+            tickers = ','.join(article.get('tickers', [])) if isinstance(article.get('tickers'), list) else str(article.get('tickers', ''))
+            c.execute('''INSERT INTO crypto_news (title, source, tickers, sentiment, url, pub_date, fetched_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                      (title, article.get('source', article.get('source_key', '')),
+                       tickers, article.get('sentiment', ''),
+                       article.get('link', article.get('url', '')),
+                       article.get('pub_date', ''), now))
+            stored += 1
+        
+        conn.commit()
+        conn.close()
+        print(f"  ✓ Crypto news: {stored} articles")
+        return articles
+    except Exception as e:
+        print(f"  ✗ Crypto news: {e}")
+        return None
+
+
 def fetch_all():
     print(f"\n{'='*60}")
     print(f"  🔍 AlphaScope — Data Fetch at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -469,6 +584,8 @@ def fetch_all():
     detect_hidden_gems()
     scan_airdrops()
     fetch_airdrop_reddit()
+
+    fetch_x_sentiment()
     
     print(f"{'='*60}")
     print(f"  ✓ All fetches complete!")
@@ -477,4 +594,5 @@ def fetch_all():
 if __name__ == '__main__':
     init_db()
     fetch_all()
+
 

@@ -9,6 +9,7 @@ from dash import Dash, html, dcc
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
 from datetime import datetime
+from x_sentiment import load_x_sentiment
 import requests
 
 app = Dash(__name__)
@@ -253,7 +254,14 @@ app.layout = html.Div(style={
         ]),
     ]),
 
-    # Row 4: Telegram
+    # Row 4: X/Twitter Sentiment
+    html.Div(style=CARD, children=[
+        html.H3("🐦 X/Twitter Sentiment", style={'color': '#1da1f2', 'marginBottom': '5px'}),
+        html.P("Live sentiment from crypto Twitter cashtags", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+        html.Div(id='x-sentiment'),
+    ]),
+
+    # Row 5: Telegram
     html.Div(style=CARD, children=[
         html.H3("📡 Telegram Alpha Feed", style={'color': '#44ffcc', 'marginBottom': '5px'}),
         html.P("Whale alerts & crypto channels", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
@@ -278,7 +286,8 @@ app.layout = html.Div(style={
 @app.callback(
     [Output('fg-gauge', 'figure'), Output('fg-chart', 'figure'), Output('narratives', 'figure'),
      Output('trending', 'children'), Output('watchlist', 'children'), Output('gems', 'children'),
-     Output('airdrops', 'children'), Output('telegram', 'children'), Output('reddit', 'children'),
+     Output('airdrops', 'children'), Output('x-sentiment', 'children'),
+     Output('telegram', 'children'), Output('reddit', 'children'),
      Output('updated', 'children')],
     [Input('refresh', 'n_intervals')]
 )
@@ -353,6 +362,30 @@ def update(_):
     if not airdrop_items:
         airdrop_items = [html.P("No airdrops detected this cycle", style={'color': '#666'})]
 
+    # X/Twitter Sentiment
+    x_sent = load_x_sentiment()
+    x_items = []
+    for _, r in x_sent.iterrows():
+        score = r['sentiment_score'] or 0
+        emoji = "🟢" if score > 0.1 else "🔴" if score < -0.1 else "🟡"
+        color = '#00cc44' if score > 0.1 else '#ff4444' if score < -0.1 else '#ffdd00'
+        buzz_color = '#00cc44' if r['buzz_level'] == 'HIGH' else '#ffdd00' if r['buzz_level'] == 'MEDIUM' else '#888'
+        x_items.append(
+            html.Div(style={'display': 'flex', 'alignItems': 'center', 'padding': '10px 12px',
+                'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{emoji} {r['cashtag']}", style={'fontWeight': 'bold', 'color': color, 'width': '80px'}),
+                html.Span(f"{r['sentiment_label']}", style={'color': color, 'width': '100px', 'fontSize': '13px'}),
+                html.Span(f"({score:+.2f})", style={'color': '#888', 'width': '60px', 'fontSize': '12px'}),
+                html.Span(f"{r['tweet_count']} tweets", style={'color': '#888', 'width': '80px', 'fontSize': '12px'}),
+                html.Span(f"buzz: {r['buzz_level']}", style={'color': buzz_color, 'width': '80px', 'fontSize': '12px'}),
+                html.Div(style={'flex': '1', 'marginLeft': '10px'}, children=[
+                    html.P(str(r.get('top_tweet', ''))[:120], style={'color': '#999', 'fontSize': '11px', 'margin': '0', 'fontStyle': 'italic'}),
+                ]),
+            ])
+        )
+    if not x_items:
+        x_items = [html.P("No X sentiment data yet. Run x_sentiment.py first.", style={'color': '#666'})]
+
     # Telegram
     telegram = load_telegram()
     tg_items = [
@@ -373,7 +406,7 @@ def update(_):
     ]
 
     return (create_fg_gauge(fg_val, fg_label), create_fg_chart(fg), create_narratives_chart(load_narratives()),
-            trending_items, wl_rows, gem_items, airdrop_items, tg_items, reddit_items,
+            trending_items, wl_rows, gem_items, airdrop_items, x_items, tg_items, reddit_items,
             f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 @app.callback([Output('ai-text', 'children'), Output('ai-box', 'style')],
