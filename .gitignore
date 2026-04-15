@@ -2,3 +2,4 @@ venv/
 alphascope.db
 __pycache__/
 .env
+coin_registry.json

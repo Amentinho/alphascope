@@ -1,6 +1,6 @@
 """
-AlphaScope — Dashboard v0.5
-Full crypto alpha intelligence dashboard.
+AlphaScope v1.0 — Unified Alpha Intelligence Dashboard
+All signals from X/Twitter, Reddit, Telegram in one view.
 """
 
 import sqlite3
@@ -9,15 +9,18 @@ from dash import Dash, html, dcc
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
 from datetime import datetime
-from x_sentiment import load_x_sentiment
 import requests
+import re
 
 app = Dash(__name__)
 app.title = "AlphaScope"
 
 def get_db():
-    return sqlite3.connect('alphascope.db')
+    return sqlite3.connect('alphascope.db', timeout=30)
 
+# ============================================================
+# DATA LOADERS
+# ============================================================
 def load_fear_greed():
     conn = get_db()
     df = pd.read_sql_query("SELECT value, label, timestamp FROM fear_greed ORDER BY timestamp DESC LIMIT 30", conn)
@@ -40,21 +43,9 @@ def load_watchlist():
     conn.close()
     return df
 
-def load_reddit():
-    conn = get_db()
-    df = pd.read_sql_query("SELECT title, score, num_comments, url, subreddit FROM reddit_posts ORDER BY fetched_at DESC, score DESC LIMIT 12", conn)
-    conn.close()
-    return df
-
 def load_narratives():
     conn = get_db()
     df = pd.read_sql_query("SELECT narrative, mention_count FROM narratives ORDER BY fetched_at DESC, mention_count DESC LIMIT 10", conn)
-    conn.close()
-    return df
-
-def load_telegram():
-    conn = get_db()
-    df = pd.read_sql_query("SELECT channel, message, views FROM telegram_messages ORDER BY fetched_at DESC LIMIT 10", conn)
     conn.close()
     return df
 
@@ -64,10 +55,18 @@ def load_hidden_gems():
     conn.close()
     return df
 
-def load_airdrops():
+def load_signals(signal_type, limit=15):
     conn = get_db()
     df = pd.read_sql_query(
-        "SELECT title, source, source_detail, keyword_matched, score FROM airdrops ORDER BY fetched_at DESC, score DESC LIMIT 15", conn)
+        f"SELECT source, source_detail, title, content, coin, sentiment_score, sentiment_label, engagement, url, fetched_at FROM signals WHERE signal_type=? ORDER BY fetched_at DESC, engagement DESC LIMIT ?",
+        conn, params=(signal_type, limit))
+    conn.close()
+    return df
+
+def load_sentiment_signals():
+    conn = get_db()
+    df = pd.read_sql_query(
+        "SELECT source, source_detail, coin, sentiment_score, sentiment_label, engagement FROM signals WHERE signal_type='SENTIMENT' ORDER BY fetched_at DESC LIMIT 10", conn)
     conn.close()
     return df
 
@@ -130,49 +129,82 @@ def generate_ai_brief():
     if not api_key: return "Add OPENAI_API_KEY to .env"
 
     fg = load_fear_greed()
-    trending = load_trending()
     watchlist = load_watchlist()
     narratives = load_narratives()
-    telegram = load_telegram()
     gems = load_hidden_gems()
-    airdrops = load_airdrops()
+    sentiment = load_sentiment_signals()
+    alphas = load_signals('ALPHA', 5)
+    airdrops = load_signals('AIRDROP', 5)
+    whales = load_signals('WHALE', 5)
 
-    prompt = f"""You are AlphaScope, a crypto alpha intelligence analyst. Write a market brief (250 words max) with these sections:
+    prompt = f"""You are AlphaScope, a crypto alpha intelligence analyst. Write a market brief (300 words max):
 
 ## MARKET MOOD
 {f"Fear & Greed: {fg.iloc[0]['value']}/100 ({fg.iloc[0]['label']})" if not fg.empty else "N/A"}
 Watchlist: {chr(10).join(f"- {r['name']}: ${r['price_usd']:,.2f} ({r['change_24h']:+.1f}%)" for _,r in watchlist.iterrows()) if not watchlist.empty else "N/A"}
 
-## NARRATIVES
+## X/TWITTER SENTIMENT
+{chr(10).join(f"- {r['source_detail']}: {r['sentiment_label']} ({r['sentiment_score']:+.2f})" for _,r in sentiment.iterrows()) if not sentiment.empty else "No X data"}
+
+## NARRATIVES (from Reddit)
 {", ".join(f"{r['narrative']}({r['mention_count']})" for _,r in narratives.iterrows()) if not narratives.empty else "N/A"}
 
-## HIDDEN GEMS (low-cap coins trending)
-{chr(10).join(f"- {r['name']}({r['symbol']}) Rank #{r['market_cap_rank']}" for _,r in gems.iterrows()) if not gems.empty else "None detected"}
+## HIDDEN GEMS
+{chr(10).join(f"- {r['name']}({r['symbol']}) Rank #{r['market_cap_rank']}" for _,r in gems.iterrows()) if not gems.empty else "None"}
 
-## WHALE MOVEMENTS (Telegram)
-{chr(10).join(f"- {r['message'][:120]}" for _,r in telegram.head(3).iterrows()) if not telegram.empty else "N/A"}
+## WHALE MOVEMENTS
+{chr(10).join(f"- {r['title'][:100]}" for _,r in whales.head(3).iterrows()) if not whales.empty else "N/A"}
 
-## AIRDROPS & NEW LAUNCHES
-{chr(10).join(f"- [{r['source_detail']}] {r['title'][:100]}" for _,r in airdrops.head(5).iterrows()) if not airdrops.empty else "None found"}
+## ALPHA SIGNALS FROM X
+{chr(10).join(f"- {r['title'][:80]}: {r['content'][:100]}" for _,r in alphas.head(3).iterrows()) if not alphas.empty else "N/A"}
 
-## TRENDING
-{", ".join(f"{r['name']}({r['symbol']})" for _,r in trending.head(5).iterrows()) if not trending.empty else "N/A"}
+## AIRDROPS
+{chr(10).join(f"- [{r['source']}] {r['title'][:100]}" for _,r in airdrops.head(5).iterrows()) if not airdrops.empty else "None"}
 
-Write with these rules:
-1. Start with the single most important signal
-2. For each hidden gem, explain WHY it might be interesting
-3. Flag any airdrops that look legitimate vs suspicious
-4. End with "WATCH TODAY:" listing 2-3 specific things to monitor
-5. Be direct, no hype, include confidence levels (HIGH/MEDIUM/LOW)"""
+Rules:
+1. Start with the #1 most actionable signal
+2. For hidden gems, explain WHY they might be worth watching
+3. Flag suspicious airdrops vs legitimate ones
+4. Rate each insight: HIGH/MEDIUM/LOW confidence
+5. End with "WATCH TODAY:" — 3 specific things to monitor
+6. Be direct, no hype"""
 
     try:
         res = requests.post('https://api.openai.com/v1/chat/completions',
             headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
             json={'model': 'gpt-4o-mini', 'messages': [{'role': 'user', 'content': prompt}],
-                  'max_tokens': 500, 'temperature': 0.7}, timeout=30)
+                  'max_tokens': 600, 'temperature': 0.7}, timeout=30)
         return res.json()['choices'][0]['message']['content']
     except Exception as e:
         return f"AI brief failed: {e}"
+
+# ============================================================
+# HELPERS
+# ============================================================
+def source_icon(source):
+    return {'twitter': '🐦', 'reddit': '💬', 'telegram': '📡'}.get(source, '📌')
+
+def signal_card(row, show_source=True):
+    score = row.get('sentiment_score') or 0
+    eng = row.get('engagement') or 0
+    eng_str = f"{eng//1000}K" if eng >= 1000 else str(eng)
+    
+    children = []
+    if show_source:
+        children.append(html.Span(f"{source_icon(row['source'])} {row['source_detail']}", 
+            style={'color': '#888', 'fontSize': '11px', 'fontWeight': 'bold'}))
+        if eng > 0:
+            children.append(html.Span(f"  ⚡{eng_str}", style={'color': '#666', 'fontSize': '11px'}))
+    
+    title = row.get('title', '')
+    # Clean HTML entities
+    title = title.replace('&#036;', '$').replace('&quot;', '"').replace('&#39;', "'").replace('&amp;', '&')
+    children.append(html.P(title[:200], style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0', 'lineHeight': '1.4'}))
+    
+    if row.get('url') and row['url'].startswith('http'):
+        children.append(html.A("→ link", href=row['url'], target='_blank', style={'color': '#00d4ff', 'fontSize': '11px', 'textDecoration': 'none'}))
+    
+    return html.Div(style={'padding': '10px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=children)
 
 # ============================================================
 # LAYOUT
@@ -188,7 +220,7 @@ app.layout = html.Div(style={
     # Header
     html.Div(style={'textAlign': 'center', 'marginBottom': '30px'}, children=[
         html.H1("🔍 AlphaScope", style={'fontSize': '36px', 'marginBottom': '5px', 'color': '#00d4ff'}),
-        html.P("Crypto Alpha Intelligence Dashboard", style={'color': '#888'}),
+        html.P("Crypto Alpha Intelligence — X · Reddit · Telegram · On-Chain", style={'color': '#888'}),
         html.P(id='updated', style={'color': '#555', 'fontSize': '12px'}),
         html.Button("🤖 Generate AI Alpha Brief", id='ai-btn', n_clicks=0,
             style={'marginTop': '10px', 'padding': '10px 24px', 'backgroundColor': '#00d4ff',
@@ -204,7 +236,7 @@ app.layout = html.Div(style={
     ]),
 
     # Row 1: Fear & Greed + Narratives
-    html.Div(style={'display': 'flex', 'gap': '20px', 'marginBottom': '20px', 'flexWrap': 'wrap'}, children=[
+    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
         html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
             dcc.Graph(id='fg-gauge', config={'displayModeBar': False}),
             html.H4("30-Day Trend", style={'color': '#888', 'fontSize': '12px', 'textAlign': 'center'}),
@@ -212,34 +244,30 @@ app.layout = html.Div(style={
         ]),
         html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
             html.H3("📡 Narrative Radar", style={'color': '#ff8c00', 'marginBottom': '5px'}),
-            html.P("What crypto communities are talking about", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.P("Trending topics across crypto Reddit", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
             dcc.Graph(id='narratives', config={'displayModeBar': False}),
         ]),
     ]),
 
-    # Row 2: Hidden Gems + Airdrops
-    html.Div(style={'display': 'flex', 'gap': '20px', 'marginBottom': '20px', 'flexWrap': 'wrap'}, children=[
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0',
-                        'borderColor': '#ff6b6b'}, children=[
-            html.H3("💎 Hidden Gems", style={'color': '#ff6b6b', 'marginBottom': '5px'}),
-            html.P("Low-cap coins appearing in trending — early alpha signals", 
-                   style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='gems'),
+    # Row 2: X Sentiment + Hidden Gems
+    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#1da1f2'}, children=[
+            html.H3("🐦 X/Twitter Sentiment", style={'color': '#1da1f2', 'marginBottom': '5px'}),
+            html.P("Live cashtag sentiment from crypto Twitter", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.Div(id='x-sentiment'),
         ]),
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0',
-                        'borderColor': '#cc44ff'}, children=[
-            html.H3("🪂 Airdrops & Launches", style={'color': '#cc44ff', 'marginBottom': '5px'}),
-            html.P("Detected from Reddit & Telegram", 
-                   style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='airdrops'),
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#ff6b6b'}, children=[
+            html.H3("💎 Hidden Gems", style={'color': '#ff6b6b', 'marginBottom': '5px'}),
+            html.P("Low-cap coins appearing in trending", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.Div(id='gems'),
         ]),
     ]),
 
     # Row 3: Trending + Watchlist
-    html.Div(style={'display': 'flex', 'gap': '20px', 'marginBottom': '20px', 'flexWrap': 'wrap'}, children=[
+    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
         html.Div(style={**CARD, 'flex': '1', 'minWidth': '280px', 'marginBottom': '0'}, children=[
             html.H3("🔥 Trending", style={'color': '#ff6b6b', 'marginBottom': '5px'}),
-            html.P("CoinGecko 24h", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.P("CoinGecko 24h most searched", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
             html.Div(id='trending'),
         ]),
         html.Div(style={**CARD, 'flex': '2', 'minWidth': '400px', 'marginBottom': '0'}, children=[
@@ -254,29 +282,38 @@ app.layout = html.Div(style={
         ]),
     ]),
 
-    # Row 4: X/Twitter Sentiment
-    html.Div(style=CARD, children=[
-        html.H3("🐦 X/Twitter Sentiment", style={'color': '#1da1f2', 'marginBottom': '5px'}),
-        html.P("Live sentiment from crypto Twitter cashtags", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-        html.Div(id='x-sentiment'),
+    # Row 4: Alpha Signals + Airdrops
+    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#00d4ff'}, children=[
+            html.H3("🔍 Alpha Signals", style={'color': '#00d4ff', 'marginBottom': '5px'}),
+            html.P("High-engagement alpha from X/Twitter", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.Div(id='alphas'),
+        ]),
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#cc44ff'}, children=[
+            html.H3("🪂 Airdrops & Launches", style={'color': '#cc44ff', 'marginBottom': '5px'}),
+            html.P("From X, Reddit & Telegram", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.Div(id='airdrops'),
+        ]),
     ]),
 
-    # Row 5: Telegram
-    html.Div(style=CARD, children=[
-        html.H3("📡 Telegram Alpha Feed", style={'color': '#44ffcc', 'marginBottom': '5px'}),
-        html.P("Whale alerts & crypto channels", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-        html.Div(id='telegram'),
-    ]),
-
-    # Row 5: Reddit
-    html.Div(style=CARD, children=[
-        html.H3("💬 Reddit Hot", style={'color': '#ff8c00', 'marginBottom': '10px'}),
-        html.Div(id='reddit'),
+    # Row 5: Whale Alerts + News
+    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#44ffcc'}, children=[
+            html.H3("🐋 Whale Movements", style={'color': '#44ffcc', 'marginBottom': '5px'}),
+            html.P("Large transactions from Telegram whale alerts", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.Div(id='whales'),
+        ]),
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
+            html.H3("📰 News Feed", style={'color': '#ff8c00', 'marginBottom': '5px'}),
+            html.P("From Reddit & Telegram channels", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
+            html.Div(id='news'),
+        ]),
     ]),
 
     # Footer
     html.Div(style={'textAlign': 'center', 'padding': '20px', 'color': '#444', 'fontSize': '12px'}, children=[
-        html.P("AlphaScope v0.5 — Built by Amentinho 🚀"),
+        html.P("AlphaScope v1.0 — Built by Amentinho 🚀"),
+        html.P("Sources: X/Twitter · Reddit · Telegram · CoinGecko · Alternative.me", style={'fontSize': '10px'}),
     ]),
 ])
 
@@ -285,9 +322,10 @@ app.layout = html.Div(style={
 # ============================================================
 @app.callback(
     [Output('fg-gauge', 'figure'), Output('fg-chart', 'figure'), Output('narratives', 'figure'),
-     Output('trending', 'children'), Output('watchlist', 'children'), Output('gems', 'children'),
-     Output('airdrops', 'children'), Output('x-sentiment', 'children'),
-     Output('telegram', 'children'), Output('reddit', 'children'),
+     Output('x-sentiment', 'children'), Output('gems', 'children'),
+     Output('trending', 'children'), Output('watchlist', 'children'),
+     Output('alphas', 'children'), Output('airdrops', 'children'),
+     Output('whales', 'children'), Output('news', 'children'),
      Output('updated', 'children')],
     [Input('refresh', 'n_intervals')]
 )
@@ -295,6 +333,36 @@ def update(_):
     fg = load_fear_greed()
     fg_val = int(fg.iloc[0]['value']) if not fg.empty else 50
     fg_label = fg.iloc[0]['label'] if not fg.empty else "N/A"
+
+    # X/Twitter Sentiment
+    sentiment = load_sentiment_signals()
+    x_items = []
+    for _, r in sentiment.iterrows():
+        score = r['sentiment_score'] or 0
+        emoji = "🟢" if score > 0.1 else "🔴" if score < -0.1 else "🟡"
+        color = '#00cc44' if score > 0.1 else '#ff4444' if score < -0.1 else '#ffdd00'
+        x_items.append(
+            html.Div(style={'display': 'flex', 'alignItems': 'center', 'padding': '8px 12px',
+                'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{emoji} {r['source_detail']}", style={'fontWeight': 'bold', 'color': color, 'width': '80px'}),
+                html.Span(f"{r['sentiment_label']}", style={'color': color, 'width': '90px', 'fontSize': '13px'}),
+                html.Span(f"({score:+.2f})", style={'color': '#888', 'width': '60px', 'fontSize': '12px'}),
+                html.Span(f"⚡{r['engagement']}", style={'color': '#666', 'fontSize': '12px'}),
+            ])
+        )
+    if not x_items:
+        x_items = [html.P("No X sentiment data yet", style={'color': '#666'})]
+
+    # Hidden Gems
+    gems = load_hidden_gems()
+    gem_items = [
+        html.Div(style={'padding': '10px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
+            html.Span(f"💎 {r['name']} ", style={'fontWeight': 'bold', 'color': '#ff6b6b'}),
+            html.Span(f"({r['symbol']})", style={'color': '#888'}),
+            html.Span(f"  Rank #{int(r['market_cap_rank'])}", style={'color': '#ffdd00', 'fontSize': '12px', 'marginLeft': '8px'}),
+            html.P(r['signal_detail'], style={'color': '#999', 'fontSize': '12px', 'marginTop': '4px', 'marginBottom': '0'}),
+        ]) for _, r in gems.iterrows()
+    ] if not gems.empty else [html.P("No hidden gems detected", style={'color': '#666'})]
 
     # Trending
     trending = load_trending()
@@ -329,85 +397,91 @@ def update(_):
             html.Span(mood, style={'flex': '1', 'textAlign': 'right'}),
         ]))
 
-    # Hidden Gems
-    gems = load_hidden_gems()
-    gem_items = [
-        html.Div(style={'padding': '10px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Div(children=[
-                html.Span(f"💎 {r['name']} ", style={'fontWeight': 'bold', 'color': '#ff6b6b'}),
-                html.Span(f"({r['symbol']})", style={'color': '#888'}),
-                html.Span(f"  Rank #{int(r['market_cap_rank'])}", style={'color': '#ffdd00', 'fontSize': '12px', 'marginLeft': '8px'}),
-            ]),
-            html.P(r['signal_detail'], style={'color': '#999', 'fontSize': '12px', 'marginTop': '4px', 'marginBottom': '0'}),
-        ]) for _, r in gems.iterrows()
-    ] if not gems.empty else [html.P("No hidden gems detected this cycle", style={'color': '#666'})]
+    # Alpha Signals
+    alphas = load_signals('ALPHA', 10)
+    alpha_items = []
+    seen = set()
+    for _, r in alphas.iterrows():
+        content = (r.get('content') or r.get('title') or '')[:150]
+        content = content.replace('&#036;', '$').replace('&quot;', '"').replace('&#39;', "'")
+        if content[:50] in seen: continue
+        seen.add(content[:50])
+        eng = r['engagement'] or 0
+        eng_str = f"⚡{eng//1000}K" if eng >= 1000 else f"⚡{eng}" if eng > 0 else ""
+        alpha_items.append(
+            html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{source_icon(r['source'])} {r['source_detail']}", style={'color': '#888', 'fontSize': '11px'}),
+                html.Span(f"  {eng_str}", style={'color': '#ffdd00', 'fontSize': '11px'}) if eng_str else html.Span(""),
+                html.P(content, style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
+            ])
+        )
+        if len(alpha_items) >= 8: break
+    if not alpha_items:
+        alpha_items = [html.P("No alpha signals yet", style={'color': '#666'})]
 
     # Airdrops
-    airdrops = load_airdrops()
+    airdrops = load_signals('AIRDROP', 15)
     airdrop_items = []
-    seen = set()
+    seen_ad = set()
     for _, r in airdrops.iterrows():
-        title = r['title'][:120]
-        if title in seen: continue
-        seen.add(title)
-        badge_color = '#44ffcc' if r['source'] == 'telegram' else '#ff8c00'
+        title = (r.get('title') or '')[:120]
+        title = title.replace('&#036;', '$').replace('&quot;', '"').replace('&#39;', "'")
+        if title[:40] in seen_ad: continue
+        seen_ad.add(title[:40])
         airdrop_items.append(
             html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-                html.Span(r['source_detail'], style={'color': badge_color, 'fontWeight': 'bold', 'fontSize': '11px'}),
-                html.Span(f"  🏷 {r['keyword_matched']}", style={'color': '#666', 'fontSize': '11px'}),
+                html.Span(f"{source_icon(r['source'])} {r['source_detail']}", style={'color': '#cc44ff', 'fontSize': '11px', 'fontWeight': 'bold'}),
                 html.P(title, style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
             ])
         )
-        if len(airdrop_items) >= 10: break
+        if len(airdrop_items) >= 8: break
     if not airdrop_items:
-        airdrop_items = [html.P("No airdrops detected this cycle", style={'color': '#666'})]
+        airdrop_items = [html.P("No airdrops detected", style={'color': '#666'})]
 
-    # X/Twitter Sentiment
-    x_sent = load_x_sentiment()
-    x_items = []
-    for _, r in x_sent.iterrows():
-        score = r['sentiment_score'] or 0
-        emoji = "🟢" if score > 0.1 else "🔴" if score < -0.1 else "🟡"
-        color = '#00cc44' if score > 0.1 else '#ff4444' if score < -0.1 else '#ffdd00'
-        buzz_color = '#00cc44' if r['buzz_level'] == 'HIGH' else '#ffdd00' if r['buzz_level'] == 'MEDIUM' else '#888'
-        x_items.append(
-            html.Div(style={'display': 'flex', 'alignItems': 'center', 'padding': '10px 12px',
-                'borderBottom': '1px solid #2a2a4a'}, children=[
-                html.Span(f"{emoji} {r['cashtag']}", style={'fontWeight': 'bold', 'color': color, 'width': '80px'}),
-                html.Span(f"{r['sentiment_label']}", style={'color': color, 'width': '100px', 'fontSize': '13px'}),
-                html.Span(f"({score:+.2f})", style={'color': '#888', 'width': '60px', 'fontSize': '12px'}),
-                html.Span(f"{r['tweet_count']} tweets", style={'color': '#888', 'width': '80px', 'fontSize': '12px'}),
-                html.Span(f"buzz: {r['buzz_level']}", style={'color': buzz_color, 'width': '80px', 'fontSize': '12px'}),
-                html.Div(style={'flex': '1', 'marginLeft': '10px'}, children=[
-                    html.P(str(r.get('top_tweet', ''))[:120], style={'color': '#999', 'fontSize': '11px', 'margin': '0', 'fontStyle': 'italic'}),
-                ]),
+    # Whales
+    whales = load_signals('WHALE', 8)
+    whale_items = []
+    for _, r in whales.iterrows():
+        title = (r.get('title') or '')[:200]
+        title = title.replace('&#036;', '$').replace('&quot;', '"').replace('&#39;', "'")
+        eng = r['engagement'] or 0
+        eng_str = f"👁{eng//1000}K" if eng >= 1000 else ""
+        whale_items.append(
+            html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"📡 @{r['source_detail']}", style={'color': '#44ffcc', 'fontSize': '11px'}),
+                html.Span(f"  {eng_str}", style={'color': '#666', 'fontSize': '11px'}) if eng_str else html.Span(""),
+                html.P(title, style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
             ])
         )
-    if not x_items:
-        x_items = [html.P("No X sentiment data yet. Run x_sentiment.py first.", style={'color': '#666'})]
+    if not whale_items:
+        whale_items = [html.P("No whale movements detected", style={'color': '#666'})]
 
-    # Telegram
-    telegram = load_telegram()
-    tg_items = [
-        html.Div(style={'padding': '10px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Span(f"@{r['channel']}", style={'color': '#44ffcc', 'fontWeight': 'bold', 'fontSize': '12px'}),
-            html.Span(f"  👁 {r['views']//1000}K" if (r['views'] or 0) >= 1000 else "", style={'color': '#666', 'fontSize': '11px'}),
-            html.P(r['message'][:250], style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0', 'lineHeight': '1.4'}),
-        ]) for _, r in telegram.iterrows()
-    ]
-
-    # Reddit
-    reddit = load_reddit()
-    reddit_items = [
-        html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.A(r['title'], href=r['url'], target='_blank', style={'color': '#ddd', 'textDecoration': 'none', 'fontSize': '14px'}),
-            html.Span(f"  r/{r['subreddit']}  ⬆{r['score']}  💬{r['num_comments']}", style={'color': '#666', 'fontSize': '11px', 'marginLeft': '10px'}),
-        ]) for _, r in reddit.iterrows()
-    ]
+    # News
+    news = load_signals('NEWS', 10)
+    news_items = []
+    seen_n = set()
+    for _, r in news.iterrows():
+        title = (r.get('title') or '')[:150]
+        title = title.replace('&#036;', '$').replace('&quot;', '"').replace('&#39;', "'")
+        if title[:40] in seen_n: continue
+        seen_n.add(title[:40])
+        eng = r['engagement'] or 0
+        news_items.append(
+            html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{source_icon(r['source'])} {r['source_detail']}", style={'color': '#888', 'fontSize': '11px'}),
+                html.Span(f"  ⬆{eng}" if r['source'] == 'reddit' and eng > 0 else
+                          f"  👁{eng//1000}K" if eng >= 1000 else "", style={'color': '#666', 'fontSize': '11px'}),
+                html.P(title, style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
+                html.A("→ link", href=r['url'], target='_blank', style={'color': '#00d4ff', 'fontSize': '11px', 'textDecoration': 'none'}) if r.get('url') and str(r['url']).startswith('http') else html.Span(""),
+            ])
+        )
+        if len(news_items) >= 8: break
+    if not news_items:
+        news_items = [html.P("No news yet", style={'color': '#666'})]
 
     return (create_fg_gauge(fg_val, fg_label), create_fg_chart(fg), create_narratives_chart(load_narratives()),
-            trending_items, wl_rows, gem_items, airdrop_items, x_items, tg_items, reddit_items,
-            f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            x_items, gem_items, trending_items, wl_rows, alpha_items, airdrop_items,
+            whale_items, news_items, f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 @app.callback([Output('ai-text', 'children'), Output('ai-box', 'style')],
     [Input('ai-btn', 'n_clicks')], prevent_initial_call=True)
@@ -416,6 +490,6 @@ def brief(n):
     return "", {**CARD, 'display': 'none'}
 
 if __name__ == '__main__':
-    print("\n🔍 AlphaScope v0.5 — Alpha Intelligence Dashboard")
+    print("\n🔍 AlphaScope v1.0 — Alpha Intelligence Dashboard")
     print("   http://localhost:8050\n")
     app.run(debug=True, port=8050)

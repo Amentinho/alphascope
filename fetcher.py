@@ -1,11 +1,12 @@
 """
-AlphaScope v1.0 — Unified Data Fetcher
+AlphaScope v2.0 — Unified Data Fetcher
 All data sources feed into one signal engine.
 Sources: X/Twitter, Reddit, Telegram, CoinGecko
 Purpose: Find alphas, track airdrops, measure sentiment
 """
 
 import requests
+from coin_registry import registry
 import sqlite3
 import time
 import re
@@ -14,13 +15,13 @@ from datetime import datetime
 # ============================================================
 # CONFIG — Edit these to customize your AlphaScope
 # ============================================================
-WATCHLIST = ['bitcoin', 'ethereum', 'solana', 'chainlink', 'arbitrum', 'sui', 'ondo-finance']
+# WATCHLIST is now dynamic — fetches prices for buzzing coins only
 
 CASHTAGS = ['$BTC', '$ETH', '$SOL', '$LINK', '$ARB', '$SUI', '$DOGE', '$AVAX']
 
-TELEGRAM_CHANNELS = ['whale_alert_io', 'crypto', 'blockchain']
+TELEGRAM_CHANNELS = ['whale_alert_io', 'crypto', 'blockchain', 'CoinTelegraph', 'AirdropOfficial', 'FatPigSignals']
 
-REDDIT_SUBS = ['cryptocurrency', 'bitcoin', 'ethtrader', 'altcoin']
+REDDIT_SUBS = ['cryptocurrency', 'bitcoin', 'ethereum', 'solana', 'CryptoMarkets', 'ethtrader', 'SatoshiStreetBets', 'CryptoMoonShots', 'altcoin', 'defi', 'cosmosnetwork', 'algorand', 'cardano']
 AIRDROP_SUBS = ['CryptoAirdrop', 'airdropalert', 'CryptoAirdrops']
 
 TWITTER_API_KEY = "new1_1597ef833361479ba82c88ff32b2fb8c"
@@ -91,6 +92,10 @@ def init_db():
         name TEXT, symbol TEXT, market_cap_rank INTEGER,
         signal_type TEXT, signal_detail TEXT, fetched_at TEXT)''')
 
+    c.execute("""CREATE TABLE IF NOT EXISTS coin_buzz (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        coin TEXT, mention_count INTEGER, total_engagement INTEGER,
+        avg_sentiment REAL, sources TEXT, fetched_at TEXT)""")
     conn.commit()
     conn.close()
     print("✓ Database ready")
@@ -130,9 +135,22 @@ def fetch_trending():
     except Exception as e:
         print(f"  ✗ Trending: {e}")
 
-def fetch_watchlist():
-    print("  Fetching watchlist...")
-    for coin_id in WATCHLIST:
+def fetch_buzzing_prices():
+    """Fetch prices ONLY for coins that are buzzing across sources."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT coin, mention_count FROM coin_buzz ORDER BY fetched_at DESC, mention_count DESC LIMIT 15")
+    buzzing = c.fetchall()
+    conn.close()
+    
+    must_fetch = {'BTC', 'ETH', 'SOL'}
+    coins_to_fetch = must_fetch | {coin for coin, _ in buzzing if coin in registry.coingecko_map}
+    
+    print(f"  Fetching prices for {len(coins_to_fetch)} buzzing coins...")
+    for ticker in coins_to_fetch:
+        coin_id = registry.coingecko_map.get(ticker)
+        if not coin_id:
+            continue
         try:
             data = requests.get(f'https://api.coingecko.com/api/v3/coins/{coin_id}',
                 params={'localization': 'false', 'tickers': 'false', 'community_data': 'true', 'developer_data': 'false'},
@@ -261,6 +279,7 @@ def fetch_reddit_data():
     headers = {'User-Agent': 'AlphaScope/1.0'}
     now = datetime.now().isoformat()
     all_titles = []
+    coin_mentions = {}
 
     # Main crypto subs
     for sub in REDDIT_SUBS:
@@ -273,7 +292,16 @@ def fetch_reddit_data():
                 d = post['data']
                 title = d.get('title', '')
                 all_titles.append(title)
-                score = d.get('score', 0)
+                score = d.get("score", 0)
+                comments = d.get("num_comments", 0)
+                selftext = d.get("selftext", "")[:300]
+                coins = detect_coins(title + " " + selftext, f"reddit:{sub}")
+                for coin in coins:
+                    if coin not in coin_mentions:
+                        coin_mentions[coin] = {"count": 0, "engagement": 0, "sentiment_sum": 0, "subs": set()}
+                    coin_mentions[coin]["count"] += 1
+                    coin_mentions[coin]["engagement"] += score + comments
+                    coin_mentions[coin]["subs"].add(sub)
 
                 # Classify signal type
                 title_lower = title.lower()
@@ -293,7 +321,7 @@ def fetch_reddit_data():
                              sentiment_score, sentiment_label, engagement, url, fetched_at)
                              VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                     ('reddit', f'r/{sub}', signal_type, title, '',
-                     '', sent_score, sent_label, score, d.get('url', ''), now))
+                     ','.join(coins) if coins else '', sent_score, sent_label, score + comments, d.get('url', ''), now))
             conn.commit()
             conn.close()
             time.sleep(1)
@@ -320,6 +348,20 @@ def fetch_reddit_data():
         except:
             continue
 
+    # Store coin buzz rankings
+    conn = get_db()
+    c = conn.cursor()
+    for coin, data in sorted(coin_mentions.items(), key=lambda x: -x[1]['count']):
+        avg_sent = data['sentiment_sum'] / max(data['count'], 1)
+        subs_list = ','.join(list(data['subs'])[:5])
+        c.execute('INSERT INTO coin_buzz (coin, mention_count, total_engagement, avg_sentiment, sources, fetched_at) VALUES (?,?,?,?,?,?)',
+            (coin, data['count'], data['engagement'], round(avg_sent, 2), f"reddit:{subs_list}", now))
+    conn.commit()
+    conn.close()
+    if coin_mentions:
+        top_coins = sorted(coin_mentions.items(), key=lambda x: -x[1]['count'])[:5]
+        buzz_str = ", ".join(str(c) + "(" + str(d["count"]) + ")" for c,d in top_coins)
+        print(f"  ✓ Coin buzz: {buzz_str}")
     # Detect narratives
     conn = get_db()
     c = conn.cursor()
@@ -421,19 +463,21 @@ def detect_hidden_gems():
 # ============================================================
 def fetch_all():
     print(f"\n{'='*60}")
-    print(f"  🔍 AlphaScope v1.0 — Data Fetch at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  🔍 AlphaScope v2.0 — Data Fetch at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}")
 
     fetch_fear_greed()
     fetch_trending()
-    fetch_watchlist()
     fetch_reddit_data()
     fetch_telegram_data()
-    fetch_x_data()
     detect_hidden_gems()
+    fetch_buzzing_prices()
 
     print(f"{'='*60}")
-    print(f"  ✓ All sources fetched!")
+    registry.save()
+    stats = registry.get_stats()
+    print(f"  📊 Registry: {stats['total_known']} known, {stats['graduated']} learned, {stats['pending']} pending")
+    print("All sources fetched!")
     print(f"{'='*60}\n")
 
 if __name__ == '__main__':
