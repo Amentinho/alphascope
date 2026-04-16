@@ -1,31 +1,48 @@
 """
-AlphaScope v2.0 — Dynamic Alpha Discovery
+AlphaScope v2.1 — Full Dynamic Alpha Discovery
 No static watchlists. System discovers what matters.
-Sources: X/Twitter, Reddit, Telegram, CoinGecko
+
+Sources:
+  - 13 Reddit subs (with comment-depth tracking)
+  - 6 Telegram channels  
+  - 10 multilingual news sources (EN/CN/JP/RU/ES/BR)
+  - 14 exchange listing feeds (Tier 1-4)
+  - DeFi Llama (TVL + yields)
+  - CoinGecko (trending + prices)
+  - Fear & Greed Index
+  - X/Twitter (optional, toggle in .env)
+
+Intelligence:
+  - Cross-source coin buzz detection
+  - Auto-learning ticker registry
+  - AI-powered airdrop qualification analysis
+  - Exchange listing priority scoring
+  - Narrative trend detection
 """
 
 import requests
 import sqlite3
 import time
 import re
-import json
+import os
 from datetime import datetime
 from coin_registry import registry
 
 # ============================================================
-# CONFIG
+# CONFIG — Sources only, no fixed coins
 # ============================================================
-CASHTAGS = ['$BTC', '$ETH', '$SOL', '$LINK', '$ARB', '$SUI', '$DOGE', '$AVAX']
+TELEGRAM_CHANNELS = ['whale_alert_io', 'crypto', 'blockchain',
+                     'CoinTelegraph', 'AirdropOfficial', 'FatPigSignals']
 
-TELEGRAM_CHANNELS = ['whale_alert_io', 'crypto', 'blockchain', 'CoinTelegraph', 'AirdropOfficial', 'FatPigSignals']
-
-REDDIT_SUBS = ['cryptocurrency', 'bitcoin', 'ethereum', 'solana', 'CryptoMarkets',
-               'ethtrader', 'SatoshiStreetBets', 'CryptoMoonShots', 'altcoin', 'defi',
+REDDIT_SUBS = ['cryptocurrency', 'bitcoin', 'ethereum', 'solana',
+               'CryptoMarkets', 'ethfinance', 'SatoshiStreetBets',
+               'CryptoMoonShots', 'altcoin', 'defi',
                'cosmosnetwork', 'algorand', 'cardano']
 
-AIRDROP_SUBS = ['CryptoAirdrop', 'airdropalert', 'CryptoAirdrops']
+AIRDROP_SUBS = ['airdropalert', 'CryptoAirdrops', 'cosmosnetwork']
 
 TWITTER_API_KEY = "new1_1597ef833361479ba82c88ff32b2fb8c"
+CASHTAGS = ['$BTC', '$ETH', '$SOL', '$LINK', '$ARB', '$SUI', '$DOGE', '$AVAX']
 
 NARRATIVE_KEYWORDS = {
     'AI': ['ai ', 'artificial intelligence', 'machine learning', 'gpu', 'compute', 'render', 'bittensor'],
@@ -41,9 +58,9 @@ NARRATIVE_KEYWORDS = {
     'Solana': ['solana', 'sol', 'jupiter', 'raydium'],
 }
 
-AIRDROP_KEYWORDS = ['airdrop', 'free mint', 'token launch', 'ico', 'ido', 'presale',
-                     'fair launch', 'testnet reward', 'points program', 'claim',
-                     'eligibility', 'snapshot', 'tge', 'whitelist']
+AIRDROP_KEYWORDS = ['airdrop', 'free mint', 'token launch', 'ido', 'presale',
+                     'fair launch', 'testnet reward', 'points program',
+                     'eligibility check', 'snapshot date', 'tge date', 'token generation']
 
 POSITIVE_WORDS = ['bull', 'moon', 'pump', 'buy', 'long', 'breakout', 'surge', 'rally',
                   'green', 'ath', 'accumulate', 'bullish', 'alpha', 'gem', 'undervalued']
@@ -90,10 +107,28 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         coin TEXT, mention_count INTEGER, total_engagement INTEGER,
         avg_sentiment REAL, sources TEXT, fetched_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS exchange_listings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exchange TEXT, exchange_tier INTEGER,
+        coin TEXT, title TEXT, listing_date TEXT,
+        status TEXT, url TEXT, fetched_at TEXT,
+        UNIQUE(exchange, title))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS airdrop_projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_name TEXT, category TEXT, website TEXT, twitter TEXT,
+        qualification_steps TEXT, effort_level TEXT, cost_estimate TEXT,
+        time_required TEXT, reward_estimate TEXT, deadline TEXT,
+        legitimacy_score INTEGER, legitimacy_reasons TEXT,
+        status TEXT, user_notes TEXT, progress TEXT, sources TEXT,
+        created_at TEXT, updated_at TEXT,
+        UNIQUE(project_name))''')
     conn.commit()
     conn.close()
     print("Database ready")
 
+# ============================================================
+# HELPERS
+# ============================================================
 def detect_coins(text, source='unknown'):
     text_lower = text.lower()
     found = set()
@@ -106,8 +141,9 @@ def detect_coins(text, source='unknown'):
             found.add(ticker)
             registry.record_ticker(ticker, source)
     for keyword, ticker in registry.tickers.items():
-        if f' {keyword} ' in f' {text_lower} ' or f' {keyword}.' in f' {text_lower}':
-            found.add(ticker)
+        if len(keyword) >= 3:
+            if f' {keyword} ' in f' {text_lower} ' or f' {keyword}.' in f' {text_lower}':
+                found.add(ticker)
     return list(found)
 
 def calc_sentiment(text):
@@ -162,10 +198,8 @@ def fetch_buzzing_prices():
     c.execute("SELECT coin, mention_count FROM coin_buzz ORDER BY fetched_at DESC, mention_count DESC LIMIT 15")
     buzzing = c.fetchall()
     conn.close()
-
     must_fetch = {'BTC', 'ETH', 'SOL'}
     coins_to_fetch = must_fetch | {coin for coin, _ in buzzing if coin in registry.coingecko_map}
-
     print(f"  Fetching prices for {len(coins_to_fetch)} buzzing coins...")
     for ticker in coins_to_fetch:
         coin_id = registry.coingecko_map.get(ticker)
@@ -199,11 +233,11 @@ def fetch_buzzing_prices():
         time.sleep(6)
 
 # ============================================================
-# REDDIT
+# REDDIT — Wide scan + coin detection + buzz tracking
 # ============================================================
 def fetch_reddit_data():
     print("  Fetching Reddit...")
-    headers = {'User-Agent': 'AlphaScope/2.0'}
+    headers = {'User-Agent': 'AlphaScope/2.1'}
     now = datetime.now().isoformat()
     all_titles = []
     coin_mentions = {}
@@ -225,10 +259,8 @@ def fetch_reddit_data():
                 all_titles.append(title)
                 score = d.get('score', 0)
                 comments = d.get('num_comments', 0)
-
                 coins = detect_coins(title + ' ' + selftext, f'reddit:{sub}')
                 sent_score, sent_label = calc_sentiment(title + ' ' + selftext)
-
                 for coin in coins:
                     if coin not in coin_mentions:
                         coin_mentions[coin] = {'count': 0, 'engagement': 0, 'sentiment_sum': 0, 'subs': set()}
@@ -236,7 +268,6 @@ def fetch_reddit_data():
                     coin_mentions[coin]['engagement'] += score + comments
                     coin_mentions[coin]['sentiment_sum'] += sent_score
                     coin_mentions[coin]['subs'].add(sub)
-
                 title_lower = title.lower()
                 signal_type = 'NEWS'
                 for kw in AIRDROP_KEYWORDS:
@@ -245,7 +276,6 @@ def fetch_reddit_data():
                         break
                 if comments >= 50 and signal_type == 'NEWS':
                     signal_type = 'ALPHA'
-
                 c.execute('''INSERT INTO signals (source, source_detail, signal_type, title, content, coin,
                              sentiment_score, sentiment_label, engagement, url, fetched_at)
                              VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
@@ -279,6 +309,7 @@ def fetch_reddit_data():
         except:
             pass
 
+    # Store coin buzz
     conn = get_db()
     c = conn.cursor()
     for coin, data in sorted(coin_mentions.items(), key=lambda x: -x[1]['count']):
@@ -286,7 +317,7 @@ def fetch_reddit_data():
         subs_list = ','.join(list(data['subs'])[:5])
         c.execute('INSERT INTO coin_buzz (coin, mention_count, total_engagement, avg_sentiment, sources, fetched_at) VALUES (?,?,?,?,?,?)',
             (coin, data['count'], data['engagement'], round(avg_sent, 2), f"reddit:{subs_list}", now))
-
+    # Narratives
     narrative_counts = {}
     for title in all_titles:
         tl = title.lower()
@@ -309,7 +340,6 @@ def fetch_reddit_data():
         top_coins = sorted(coin_mentions.items(), key=lambda x: -x[1]['count'])[:5]
         buzz_str = ', '.join(f"{c}({d['count']})" for c, d in top_coins)
         print(f"  Coin buzz: {buzz_str}")
-
 
 # ============================================================
 # TELEGRAM
@@ -348,37 +378,199 @@ def fetch_telegram_data():
             print(f"    @{channel}: {e}")
         time.sleep(2)
 
+# ============================================================
+# X/TWITTER — Optional, toggle via .env
+# ============================================================
+def fetch_x_data():
+    enable = os.environ.get('ENABLE_TWITTER_FETCH', '')
+    if not enable:
+        try:
+            with open('.env') as f:
+                for line in f:
+                    if line.startswith('ENABLE_TWITTER_FETCH='):
+                        enable = line.strip().split('=', 1)[1]
+        except:
+            pass
+    if enable.lower() != 'true':
+        return
+
+    print("  Fetching X/Twitter...")
+    now = datetime.now().isoformat()
+    for cashtag in CASHTAGS:
+        try:
+            res = requests.get("https://api.twitterapi.io/twitter/tweet/advanced_search",
+                headers={"X-API-Key": TWITTER_API_KEY},
+                params={"query": cashtag, "queryType": "Latest", "cursor": ""}, timeout=15)
+            if res.status_code == 429:
+                print(f"    {cashtag}: rate limited")
+                time.sleep(3)
+                continue
+            if res.status_code != 200:
+                continue
+            tweets = res.json().get("tweets", [])[:20]
+            if not tweets:
+                continue
+            conn = get_db()
+            c = conn.cursor()
+            pos = sum(1 for t in tweets if any(w in t.get('text', '').lower() for w in POSITIVE_WORDS))
+            neg = sum(1 for t in tweets if any(w in t.get('text', '').lower() for w in NEGATIVE_WORDS))
+            score = (pos - neg) / len(tweets)
+            label = "BULLISH" if score > 0.15 else "BEARISH" if score < -0.15 else "NEUTRAL"
+            engagement = sum(t.get('likeCount', 0) + t.get('retweetCount', 0) for t in tweets)
+            top = max(tweets, key=lambda t: t.get('likeCount', 0) + t.get('retweetCount', 0))
+            c.execute('''INSERT INTO signals (source, source_detail, signal_type, title, content, coin,
+                         sentiment_score, sentiment_label, engagement, url, fetched_at)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                ('twitter', cashtag, 'SENTIMENT', f'{cashtag} sentiment: {label}',
+                 top.get('text', '')[:300], cashtag.replace('$', ''),
+                 score, label, engagement, '', now))
+            conn.commit()
+            conn.close()
+            emoji = "🟢" if score > 0.1 else "🔴" if score < -0.1 else "🟡"
+            print(f"    {emoji} {cashtag}: {label} ({score:+.2f}) | {len(tweets)} tweets")
+        except Exception as e:
+            print(f"    {cashtag}: {e}")
+        time.sleep(2)
+
+# ============================================================
+# HIDDEN GEMS — Cross-source validation
+# ============================================================
+def fetch_x_airdrops():
+    """Search X for airdrop-specific signals."""
+    import os
+    enable = os.environ.get('ENABLE_TWITTER_FETCH', '')
+    if not enable:
+        try:
+            with open('.env') as f:
+                for line in f:
+                    if line.startswith('ENABLE_TWITTER_FETCH='):
+                        enable = line.strip().split('=', 1)[1]
+        except:
+            pass
+    if enable.lower() != 'true':
+        return
+    
+    print("  Fetching X airdrop signals...")
+    now = datetime.now().isoformat()
+    queries = ['crypto airdrop confirmed', 'airdrop live now', 'free airdrop crypto', 'testnet airdrop']
+    
+    for query in queries:
+        try:
+            res = requests.get("https://api.twitterapi.io/twitter/tweet/advanced_search",
+                headers={"X-API-Key": TWITTER_API_KEY},
+                params={"query": query, "queryType": "Top", "cursor": ""}, timeout=15)
+            if res.status_code != 200:
+                continue
+            tweets = res.json().get("tweets", [])[:10]
+            conn = get_db()
+            c = conn.cursor()
+            for t in tweets:
+                eng = t.get('likeCount', 0) + t.get('retweetCount', 0)
+                if eng >= 3:
+                    coins = detect_coins(t.get('text', ''), 'twitter:airdrop')
+                    c.execute('''INSERT INTO signals (source, source_detail, signal_type, title, content, coin,
+                                 sentiment_score, sentiment_label, engagement, url, fetched_at)
+                                 VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                        ('twitter', f"@{t.get('author',{}).get('userName','')}", 'AIRDROP',
+                         t.get('text', '')[:200], t.get('text', '')[:500],
+                         ','.join(coins), 0, 'N/A', eng, '', now))
+            conn.commit()
+            conn.close()
+            print(f"    '{query}': {len(tweets)} tweets")
+        except:
+            pass
+        time.sleep(2)
+
 def detect_hidden_gems():
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT name, symbol, market_cap_rank FROM trending ORDER BY fetched_at DESC LIMIT 10")
-    trending = c.fetchall()
     now = datetime.now().isoformat()
     gems = []
-    for name, symbol, rank in trending:
+
+    # Method 1: Trending on CoinGecko but outside top 50
+    c.execute("SELECT name, symbol, market_cap_rank FROM trending ORDER BY fetched_at DESC LIMIT 10")
+    for name, symbol, rank in c.fetchall():
         if rank and rank > 50:
             c.execute('INSERT INTO hidden_gems (name, symbol, market_cap_rank, signal_type, signal_detail, fetched_at) VALUES (?,?,?,?,?,?)',
-                (name, symbol, rank, 'LOW_CAP_TRENDING', f'Rank #{rank} but trending', now))
+                (name, symbol, rank, 'LOW_CAP_TRENDING', f'Rank #{rank} but trending on CoinGecko', now))
             gems.append(f"{symbol}(#{rank})")
+
+    # Method 2: High buzz coins outside majors
+    c.execute("""SELECT coin, mention_count, total_engagement FROM coin_buzz 
+                 WHERE fetched_at >= datetime('now', '-2 hours') AND mention_count >= 3
+                 ORDER BY mention_count DESC LIMIT 10""")
+    majors = {'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'DOT'}
+    for coin, mentions, engagement in c.fetchall():
+        if coin not in majors and coin not in [g.split('(')[0] for g in gems]:
+            c.execute('INSERT INTO hidden_gems (name, symbol, market_cap_rank, signal_type, signal_detail, fetched_at) VALUES (?,?,?,?,?,?)',
+                (coin, coin, None, 'HIGH_BUZZ', f'{mentions} mentions, {engagement} engagement across Reddit/Telegram', now))
+            gems.append(f"{coin}(buzz:{mentions})")
+
     conn.commit()
     conn.close()
     if gems:
         print(f"  Hidden gems: {', '.join(gems)}")
 
+# ============================================================
+# FETCH ALL — The main orchestrator
+# ============================================================
 def fetch_all():
     print(f"\n{'='*60}")
-    print(f"  AlphaScope v2.0 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  AlphaScope v2.1 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}")
+
+    # Phase 1: Market pulse
     fetch_fear_greed()
     fetch_trending()
+
+    # Phase 2: Social signals
     fetch_reddit_data()
     fetch_telegram_data()
+
+    # Phase 3: News & DeFi (imported modules)
+    try:
+        from news_sources import fetch_news_sources, fetch_defi_data
+        fetch_news_sources()
+        fetch_defi_data()
+    except ImportError:
+        print("  news_sources.py not found — skipping news/DeFi")
+    except Exception as e:
+        print(f"  News/DeFi failed: {e}")
+
+    # Phase 4: Exchange listings (imported module)
+    try:
+        from exchange_feeds import fetch_exchange_listings
+        fetch_exchange_listings()
+    except ImportError:
+        print("  exchange_feeds.py not found — skipping exchange listings")
+    except Exception as e:
+        print(f"  Exchange listings failed: {e}")
+
+    # Phase 5: X/Twitter (optional)
+    fetch_x_data()
+
+    # Phase 6: Intelligence
+    fetch_x_airdrops()
     detect_hidden_gems()
+
+    # Phase 7: AI Airdrop Analysis (imported module)
+    try:
+        from airdrop_intel import process_new_airdrops
+        process_new_airdrops()
+    except ImportError:
+        print("  airdrop_intel.py not found — skipping airdrop AI")
+    except Exception as e:
+        print(f"  Airdrop AI failed: {e}")
+
+    # Phase 8: Dynamic price fetching (only buzzing coins)
     fetch_buzzing_prices()
+
+    # Phase 9: Save registry
     registry.save()
     stats = registry.get_stats()
     print(f"  Registry: {stats['total_known']} known, {stats['graduated']} learned, {stats['pending']} pending")
     print(f"{'='*60}\n")
+
 
 if __name__ == '__main__':
     init_db()
