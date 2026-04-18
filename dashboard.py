@@ -1,18 +1,18 @@
 """
-AlphaScope v2.1 — Alpha Intelligence Dashboard
-Three dynamic watchlists: Alpha Radar, Airdrop Tracker, Investment Radar
-All data auto-populated from unified signals table.
+AlphaScope v2.2 — Executive Dashboard
+Clean, actionable. Three boxes + alerts. Details one click away.
 """
 
 import sqlite3
 import pandas as pd
-from dash import Dash, html, dcc
+from dash import Dash, html, dcc, callback_context
 from dash.dependencies import Input, Output, State
 import plotly.graph_objects as go
 from datetime import datetime
 import requests
+import json
 
-app = Dash(__name__)
+app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "AlphaScope"
 
 def get_db():
@@ -27,30 +27,16 @@ def load_fear_greed():
     conn.close()
     return df
 
-def load_trending():
-    conn = get_db()
-    df = pd.read_sql_query("SELECT name, symbol, market_cap_rank FROM trending ORDER BY fetched_at DESC LIMIT 10", conn)
-    conn.close()
-    return df
-
-def load_narratives():
-    conn = get_db()
-    df = pd.read_sql_query("SELECT narrative, mention_count FROM narratives ORDER BY fetched_at DESC, mention_count DESC LIMIT 10", conn)
-    conn.close()
-    return df
-
 def load_coin_buzz():
     conn = get_db()
-    df = pd.read_sql_query(
-        "SELECT coin, mention_count, total_engagement, avg_sentiment, sources FROM coin_buzz ORDER BY fetched_at DESC, mention_count DESC LIMIT 20", conn)
+    df = pd.read_sql_query("SELECT coin, mention_count, total_engagement, avg_sentiment, sources FROM coin_buzz ORDER BY fetched_at DESC, mention_count DESC LIMIT 20", conn)
     conn.close()
     return df
 
-def load_investment_radar():
+def load_prices():
     conn = get_db()
     df = pd.read_sql_query(
-        """SELECT coin_id, name, symbol, price_usd, change_24h, change_7d, change_30d,
-                  market_cap, volume_24h, sentiment_up, sentiment_down
+        """SELECT coin_id, name, symbol, price_usd, change_24h, change_7d, market_cap
            FROM token_data WHERE fetched_at >= (SELECT datetime(MAX(fetched_at), '-5 minutes') FROM token_data)
            AND name IS NOT NULL ORDER BY market_cap DESC""", conn)
     conn.close()
@@ -62,10 +48,37 @@ def load_hidden_gems():
     conn.close()
     return df
 
-def load_signals(signal_type, limit=15):
+def load_narratives():
+    conn = get_db()
+    df = pd.read_sql_query("SELECT narrative, mention_count FROM narratives ORDER BY fetched_at DESC, mention_count DESC LIMIT 10", conn)
+    conn.close()
+    return df
+
+def load_trending():
+    conn = get_db()
+    df = pd.read_sql_query("SELECT name, symbol, market_cap_rank FROM trending ORDER BY fetched_at DESC LIMIT 10", conn)
+    conn.close()
+    return df
+
+def load_airdrops():
+    try:
+        conn = get_db()
+        df = pd.read_sql_query(
+            """SELECT project_name, category, qualification_steps, effort_level, cost_estimate,
+                      time_required, reward_estimate, deadline, legitimacy_score, legitimacy_reasons, status
+               FROM airdrop_projects WHERE status IN ('AI_SUGGESTED','USER_APPROVED','ACTIVE')
+               ORDER BY CASE effort_level WHEN 'FREE_EASY' THEN 1 WHEN 'LOW_COST' THEN 2
+               WHEN 'MEDIUM_COST' THEN 3 WHEN 'HIGH_COST' THEN 4 ELSE 5 END,
+               legitimacy_score DESC""", conn)
+        conn.close()
+        return df
+    except:
+        return pd.DataFrame()
+
+def load_signals(signal_type, limit=10):
     conn = get_db()
     df = pd.read_sql_query(
-        "SELECT source, source_detail, title, content, coin, sentiment_score, sentiment_label, engagement, url, fetched_at FROM signals WHERE signal_type=? ORDER BY fetched_at DESC, engagement DESC LIMIT ?",
+        "SELECT source, source_detail, title, content, coin, sentiment_score, sentiment_label, engagement, url FROM signals WHERE signal_type=? ORDER BY fetched_at DESC, engagement DESC LIMIT ?",
         conn, params=(signal_type, limit))
     conn.close()
     return df
@@ -73,96 +86,44 @@ def load_signals(signal_type, limit=15):
 def load_exchange_listings():
     try:
         conn = get_db()
-        df = pd.read_sql_query(
-            "SELECT exchange, exchange_tier, coin, title, url, fetched_at FROM exchange_listings ORDER BY fetched_at DESC LIMIT 15", conn)
+        df = pd.read_sql_query("SELECT exchange, exchange_tier, coin, title, url FROM exchange_listings ORDER BY fetched_at DESC LIMIT 15", conn)
         conn.close()
         return df
     except:
         return pd.DataFrame()
 
-def load_airdrop_projects():
+def load_macro_summary():
+    try:
+        from macro_calendar import load_macro_summary as lms
+        return lms()
+    except:
+        return ""
+
+def load_macro_indicators():
+    try:
+        conn = get_db()
+        df = pd.read_sql_query("SELECT indicator, value, change_pct, date FROM macro_indicators ORDER BY fetched_at DESC", conn)
+        conn.close()
+        return df.drop_duplicates(subset=['indicator'], keep='first')
+    except:
+        return pd.DataFrame()
+
+def load_macro_events():
     try:
         conn = get_db()
         df = pd.read_sql_query(
-            """SELECT project_name, category, qualification_steps, effort_level, cost_estimate,
-                      time_required, reward_estimate, deadline, legitimacy_score, legitimacy_reasons, status
-               FROM airdrop_projects
-               WHERE status IN ('AI_SUGGESTED', 'USER_APPROVED', 'ACTIVE')
-               ORDER BY
-                   CASE effort_level
-                       WHEN 'FREE_EASY' THEN 1 WHEN 'LOW_COST' THEN 2
-                       WHEN 'MEDIUM_COST' THEN 3 WHEN 'HIGH_COST' THEN 4
-                       WHEN 'INVITE_ONLY' THEN 5 ELSE 6 END,
-                   legitimacy_score DESC""", conn)
+            "SELECT event_name, category, impact, crypto_impact, actual FROM macro_events ORDER BY CASE impact WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END", conn)
         conn.close()
-        return df
+        return df.drop_duplicates(subset=['event_name'], keep='first')
     except:
         return pd.DataFrame()
 
-def load_sentiment_signals():
+def load_sentiment():
     conn = get_db()
     df = pd.read_sql_query(
-        "SELECT source, source_detail, coin, sentiment_score, sentiment_label, engagement FROM signals WHERE signal_type='SENTIMENT' ORDER BY fetched_at DESC LIMIT 10", conn)
+        "SELECT source_detail, coin, sentiment_score, sentiment_label FROM signals WHERE signal_type='SENTIMENT' ORDER BY fetched_at DESC LIMIT 10", conn)
     conn.close()
     return df
-
-# ============================================================
-# CHARTS
-# ============================================================
-def create_fg_gauge(value, label):
-    color = "#ff4444"
-    for t, c in [(25, "#ff8c00"), (45, "#ffdd00"), (55, "#88cc00"), (75, "#00cc44")]:
-        if value >= t: color = c
-    fig = go.Figure(go.Indicator(mode="gauge+number", value=value,
-        title={'text': f"Fear & Greed: {label}", 'font': {'size': 18, 'color': '#fff'}},
-        number={'font': {'size': 44, 'color': '#fff'}},
-        gauge={'axis': {'range': [0, 100], 'tickcolor': '#666'}, 'bar': {'color': color}, 'bgcolor': '#1a1a2e',
-               'steps': [{'range': [0,25], 'color': '#3d0000'}, {'range': [25,45], 'color': '#3d2600'},
-                         {'range': [45,55], 'color': '#3d3d00'}, {'range': [55,75], 'color': '#1a3d00'},
-                         {'range': [75,100], 'color': '#003d1a'}]}))
-    fig.update_layout(paper_bgcolor='#0f0f23', plot_bgcolor='#0f0f23', height=250, margin=dict(t=50,b=10,l=20,r=20))
-    return fig
-
-def create_fg_chart(df):
-    if df.empty: return go.Figure()
-    d = df.sort_values('timestamp')
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=d['timestamp'], y=d['value'], mode='lines+markers',
-        line=dict(color='#00d4ff', width=2), marker=dict(size=4),
-        fill='tozeroy', fillcolor='rgba(0,212,255,0.1)'))
-    fig.add_hrect(y0=0, y1=25, fillcolor="rgba(255,68,68,0.1)", line_width=0)
-    fig.add_hrect(y0=75, y1=100, fillcolor="rgba(0,204,68,0.1)", line_width=0)
-    fig.add_hline(y=25, line_dash="dash", line_color="#ff4444", opacity=0.3)
-    fig.add_hline(y=75, line_dash="dash", line_color="#00cc44", opacity=0.3)
-    fig.update_layout(paper_bgcolor='#0f0f23', plot_bgcolor='#1a1a2e', height=200,
-        margin=dict(t=10,b=30,l=40,r=10), xaxis=dict(showgrid=False, color='#666', tickformat='%b %d'),
-        yaxis=dict(showgrid=True, gridcolor='#2a2a4a', color='#666', range=[0,100]), showlegend=False)
-    return fig
-
-def create_narratives_chart(df):
-    if df.empty: return go.Figure()
-    colors = {'Bitcoin':'#f7931a','Ethereum':'#627eea','AI':'#00d4ff','DeFi':'#88cc00',
-              'L2':'#ff6b6b','RWA':'#ff8c00','Memecoins':'#ffdd00','Regulation':'#ff4444',
-              'Gaming':'#cc44ff','DePIN':'#44ffcc','Solana':'#9945ff'}
-    fig = go.Figure(go.Bar(x=df['mention_count'], y=df['narrative'], orientation='h',
-        marker_color=[colors.get(n,'#888') for n in df['narrative']],
-        text=df['mention_count'], textposition='outside', textfont=dict(color='#fff', size=12)))
-    fig.update_layout(paper_bgcolor='#0f0f23', plot_bgcolor='#1a1a2e', height=280,
-        margin=dict(t=10,b=10,l=80,r=40), xaxis=dict(showgrid=False, showticklabels=False),
-        yaxis=dict(color='#fff', autorange='reversed'), bargap=0.3)
-    return fig
-
-def create_buzz_chart(df):
-    if df.empty: return go.Figure()
-    df_top = df.head(10)
-    colors = ['#00d4ff' if s >= 0 else '#ff4444' for s in df_top['avg_sentiment']]
-    fig = go.Figure(go.Bar(x=df_top['mention_count'], y=df_top['coin'], orientation='h',
-        marker_color=colors, text=df_top['mention_count'], textposition='outside',
-        textfont=dict(color='#fff', size=12)))
-    fig.update_layout(paper_bgcolor='#0f0f23', plot_bgcolor='#1a1a2e', height=300,
-        margin=dict(t=10,b=10,l=60,r=40), xaxis=dict(showgrid=False, showticklabels=False),
-        yaxis=dict(color='#fff', autorange='reversed'), bargap=0.3)
-    return fig
 
 # ============================================================
 # AI BRIEF
@@ -177,44 +138,46 @@ def generate_ai_brief():
     if not api_key: return "Add OPENAI_API_KEY to .env"
 
     fg = load_fear_greed()
-    radar = load_investment_radar()
-    narratives = load_narratives()
-    gems = load_hidden_gems()
+    prices = load_prices()
     buzz = load_coin_buzz()
-    sentiment = load_sentiment_signals()
-    alphas = load_signals('ALPHA', 5)
+    gems = load_hidden_gems()
+    airdrops = load_airdrops()
     whales = load_signals('WHALE', 3)
     listings = load_exchange_listings()
-    airdrops = load_airdrop_projects()
+    macro = load_macro_indicators()
+    events = load_macro_events()
+    narratives = load_narratives()
 
-    prompt = f"""You are AlphaScope, a crypto alpha intelligence analyst. Write a market brief (350 words max):
+    prompt = f"""You are AlphaScope, a crypto alpha intelligence analyst. Give me a concise brief (300 words max).
 
-MARKET: {f"Fear & Greed: {fg.iloc[0]['value']}/100 ({fg.iloc[0]['label']})" if not fg.empty else "N/A"}
+MARKET: {f"Crypto Fear & Greed: {fg.iloc[0]['value']}/100 ({fg.iloc[0]['label']})" if not fg.empty else "N/A"}
 
-TOP BUZZING COINS (by social mentions):
-{chr(10).join(f"- {r['coin']}: {r['mention_count']} mentions, sentiment {r['avg_sentiment']:+.2f}" for _,r in buzz.head(8).iterrows()) if not buzz.empty else "N/A"}
+MACRO: {chr(10).join(f"- {r['indicator']}: {r['value']:.2f}" for _,r in macro.iterrows()) if not macro.empty else "N/A"}
 
-PRICE DATA:
-{chr(10).join(f"- {r['name']}: ${r['price_usd']:,.2f} ({r['change_24h']:+.1f}% 24h, {r['change_7d']:+.1f}% 7d)" for _,r in radar.iterrows()) if not radar.empty else "N/A"}
+UPCOMING EVENTS: {', '.join(f"{r['event_name']}({r['impact']})" for _,r in events.head(3).iterrows()) if not events.empty else "N/A"}
 
-NARRATIVES: {", ".join(f"{r['narrative']}({r['mention_count']})" for _,r in narratives.iterrows()) if not narratives.empty else "N/A"}
+COIN BUZZ (social mentions): {', '.join(f"{r['coin']}({r['mention_count']}, sent:{r['avg_sentiment']:+.2f})" for _,r in buzz.head(8).iterrows()) if not buzz.empty else "N/A"}
 
-HIDDEN GEMS: {chr(10).join(f"- {r['name']}({r['symbol']}) — {r['signal_detail']}" for _,r in gems.head(5).iterrows()) if not gems.empty else "None"}
+PRICES: {chr(10).join(f"- {r['symbol']}: ${r['price_usd']:,.2f} ({r['change_24h']:+.1f}%)" for _,r in prices.iterrows()) if not prices.empty else "N/A"}
 
-EXCHANGE LISTINGS: {chr(10).join(f"- {r['exchange']}: {r['title'][:80]}" for _,r in listings.head(3).iterrows()) if not listings.empty else "None"}
+NARRATIVES: {', '.join(f"{r['narrative']}({r['mention_count']})" for _,r in narratives.iterrows()) if not narratives.empty else "N/A"}
 
-WHALE MOVES: {chr(10).join(f"- {r['title'][:100]}" for _,r in whales.head(3).iterrows()) if not whales.empty else "N/A"}
+HIDDEN GEMS: {chr(10).join(f"- {r['symbol']} — {r['signal_detail']}" for _,r in gems.head(5).iterrows()) if not gems.empty else "None"}
 
-AIRDROPS ({len(airdrops)} tracked): {chr(10).join(f"- {r['project_name']} ({r['effort_level']}, {r['legitimacy_score']}/10)" for _,r in airdrops.head(3).iterrows()) if not airdrops.empty else "None"}
+EXCHANGE LISTINGS: {chr(10).join(f"- {r['exchange']}: {r['title'][:60]}" for _,r in listings.head(3).iterrows()) if not listings.empty else "None"}
 
-Rules:
-1. Start with the #1 most actionable signal right now
-2. For hidden gems, explain WHY — what narrative, what catalyst
-3. Flag any price/sentiment divergences (price up but sentiment down = warning)
-4. For airdrops, only mention FREE_EASY or LOW_COST ones
-5. Rate each insight: HIGH/MEDIUM/LOW confidence
-6. End with "ACTION ITEMS:" — 3 specific things to do today
-7. Be direct, no hype, data-driven"""
+WHALES: {chr(10).join(f"- {r['title'][:80]}" for _,r in whales.iterrows()) if not whales.empty else "N/A"}
+
+AIRDROPS: {chr(10).join(f"- {r['project_name']} ({r['effort_level']}, {r['legitimacy_score']}/10)" for _,r in airdrops.head(3).iterrows()) if not airdrops.empty else "None"}
+
+Output exactly:
+## TOP 3 ALPHA PICKS (coins to watch for gains)
+## TOP 3 AIRDROPS (actionable, free/low-cost only)  
+## TOP 3 INVESTMENT SIGNALS (what to buy/sell right now)
+## MACRO WARNING (if any upcoming events could move markets)
+## ACTION ITEMS (3 specific things to do today)
+
+Be brutally direct. Confidence levels for each pick. No fluff."""
 
     try:
         res = requests.post('https://api.openai.com/v1/chat/completions',
@@ -228,397 +191,444 @@ Rules:
 # ============================================================
 # HELPERS
 # ============================================================
-def source_icon(source):
-    return {'twitter': '🐦', 'reddit': '💬', 'telegram': '📡', 'news': '📰', 'exchange': '🏦', 'defi': '🔗'}.get(source, '📌')
-
 def clean_html(text):
     if not text: return ''
-    return text.replace('&#036;', '$').replace('&quot;', '"').replace('&#39;', "'").replace('&amp;', '&')
+    return str(text).replace('&#036;', '$').replace('&quot;', '"').replace('&#39;', "'").replace('&amp;', '&')
 
 def effort_badge(level):
-    badges = {
-        'FREE_EASY': ('🟢', '#00cc44', 'Free'),
-        'LOW_COST': ('🟡', '#ffdd00', '$5-20'),
-        'MEDIUM_COST': ('🟠', '#ff8c00', '$100+'),
-        'HIGH_COST': ('🔴', '#ff4444', '$1K+'),
-        'INVITE_ONLY': ('🔒', '#888', 'Invite'),
-    }
-    emoji, color, label = badges.get(level, ('❓', '#888', level))
-    return html.Span(f"{emoji} {label}", style={'color': color, 'fontSize': '11px', 'fontWeight': 'bold',
-        'padding': '2px 8px', 'borderRadius': '4px', 'backgroundColor': f'{color}22'})
+    m = {'FREE_EASY': ('🟢', '#00cc44'), 'LOW_COST': ('🟡', '#ffdd00'),
+         'MEDIUM_COST': ('🟠', '#ff8c00'), 'HIGH_COST': ('🔴', '#ff4444'),
+         'INVITE_ONLY': ('🔒', '#888')}
+    emoji, color = m.get(level, ('❓', '#888'))
+    return html.Span(f"{emoji} {level}", style={'color': color, 'fontSize': '11px', 'fontWeight': 'bold'})
 
 # ============================================================
-# LAYOUT
+# LAYOUT — Clean executive view
 # ============================================================
 CARD = {'backgroundColor': '#1a1a2e', 'borderRadius': '12px', 'padding': '20px',
-        'border': '1px solid #2a2a4a', 'marginBottom': '20px'}
-ACCENT_CARD = lambda color: {**CARD, 'borderColor': color, 'borderWidth': '2px'}
+        'border': '1px solid #2a2a4a', 'marginBottom': '0'}
 
 app.layout = html.Div(style={
-    'backgroundColor': '#0f0f23', 'minHeight': '100vh', 'padding': '20px',
-    'fontFamily': '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif',
-    'color': '#fff', 'maxWidth': '1400px', 'margin': '0 auto'
+    'backgroundColor': '#0f0f23', 'minHeight': '100vh', 'padding': '20px 20px 40px',
+    'fontFamily': "'JetBrains Mono', 'SF Mono', 'Fira Code', monospace",
+    'color': '#fff', 'maxWidth': '1200px', 'margin': '0 auto'
 }, children=[
 
     # ── HEADER ──
-    html.Div(style={'textAlign': 'center', 'marginBottom': '30px'}, children=[
-        html.H1("🔍 AlphaScope", style={'fontSize': '36px', 'marginBottom': '5px', 'color': '#00d4ff'}),
-        html.P("Crypto Alpha Intelligence — Reddit · Telegram · News · Exchanges · DeFi · X", style={'color': '#888'}),
-        html.P(id='updated', style={'color': '#555', 'fontSize': '12px'}),
-        html.Button("🤖 Generate AI Alpha Brief", id='ai-btn', n_clicks=0,
-            style={'marginTop': '10px', 'padding': '10px 24px', 'backgroundColor': '#00d4ff',
-                   'border': 'none', 'borderRadius': '8px', 'color': '#0f0f23',
-                   'fontWeight': 'bold', 'cursor': 'pointer', 'fontSize': '14px'}),
+    html.Div(style={'textAlign': 'center', 'marginBottom': '15px'}, children=[
+        html.H1("ALPHASCOPE", style={'fontSize': '28px', 'letterSpacing': '6px', 'color': '#00d4ff',
+                                      'marginBottom': '5px', 'fontWeight': '300'}),
+        html.P(id='macro-bar', style={'color': '#888', 'fontSize': '12px', 'letterSpacing': '1px'}),
+        html.P(id='updated', style={'color': '#444', 'fontSize': '10px'}),
     ]),
+
+    # ── MARKET PULSE BAR ──
+    html.Div(id='pulse-bar', style={'display': 'flex', 'gap': '10px', 'marginBottom': '15px',
+        'justifyContent': 'center', 'flexWrap': 'wrap'}),
+
+    # ── AI BRIEF BUTTON ──
+    html.Div(style={'textAlign': 'center', 'marginBottom': '20px'}, children=[
+        html.Button("🤖 AI ALPHA BRIEF", id='ai-btn', n_clicks=0,
+            style={'padding': '8px 20px', 'backgroundColor': 'transparent', 'border': '1px solid #00d4ff',
+                   'borderRadius': '4px', 'color': '#00d4ff', 'cursor': 'pointer', 'fontSize': '12px',
+                   'letterSpacing': '2px', 'fontFamily': 'inherit'}),
+    ]),
+    html.Div(id='ai-box', style={**CARD, 'display': 'none', 'marginBottom': '20px', 'borderColor': '#00d4ff'}, children=[
+        dcc.Markdown(id='ai-text', style={'color': '#ccc', 'lineHeight': '1.6', 'fontSize': '13px'}),
+    ]),
+
     dcc.Interval(id='refresh', interval=1800*1000, n_intervals=0),
 
-    # ── AI BRIEF ──
-    html.Div(id='ai-box', style={**CARD, 'display': 'none'}, children=[
-        html.H3("🤖 AI Alpha Brief", style={'color': '#00d4ff', 'marginBottom': '10px'}),
-        dcc.Markdown(id='ai-text', style={'color': '#ccc', 'lineHeight': '1.6', 'fontSize': '14px'}),
+    # ══════════════════════════════════════════════════════════
+    # THREE MAIN BOXES
+    # ══════════════════════════════════════════════════════════
+    html.Div(style={'display': 'flex', 'gap': '15px', 'marginBottom': '20px', 'flexWrap': 'wrap'}, children=[
+
+        # ── BOX 1: ALPHA PICKS ──
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'borderColor': '#00d4ff', 'borderWidth': '2px'}, children=[
+            html.H3("🎯 ALPHA PICKS", style={'color': '#00d4ff', 'fontSize': '14px', 'letterSpacing': '2px', 'marginBottom': '12px'}),
+            html.P("Rising buzz + positive sentiment + catalysts", style={'color': '#555', 'fontSize': '10px', 'marginBottom': '12px'}),
+            html.Div(id='box-alpha'),
+        ]),
+
+        # ── BOX 2: AIRDROPS ──
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'borderColor': '#cc44ff', 'borderWidth': '2px'}, children=[
+            html.H3("🪂 AIRDROPS", style={'color': '#cc44ff', 'fontSize': '14px', 'letterSpacing': '2px', 'marginBottom': '12px'}),
+            html.P("AI-analyzed, sorted by effort. Free first.", style={'color': '#555', 'fontSize': '10px', 'marginBottom': '12px'}),
+            html.Div(id='box-airdrops'),
+        ]),
+
+        # ── BOX 3: INVEST NOW ──
+        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'borderColor': '#88cc00', 'borderWidth': '2px'}, children=[
+            html.H3("📈 INVEST NOW", style={'color': '#88cc00', 'fontSize': '14px', 'letterSpacing': '2px', 'marginBottom': '12px'}),
+            html.P("Momentum + macro alignment + buzz", style={'color': '#555', 'fontSize': '10px', 'marginBottom': '12px'}),
+            html.Div(id='box-invest'),
+        ]),
     ]),
 
-    # ── ROW 1: Fear & Greed + Narratives ──
-    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
-            dcc.Graph(id='fg-gauge', config={'displayModeBar': False}),
-            html.H4("30-Day Trend", style={'color': '#888', 'fontSize': '12px', 'textAlign': 'center'}),
-            dcc.Graph(id='fg-chart', config={'displayModeBar': False}),
-        ]),
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
-            html.H3("📡 Narrative Radar", style={'color': '#ff8c00', 'marginBottom': '5px'}),
-            html.P("What crypto is talking about across all sources", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            dcc.Graph(id='narratives', config={'displayModeBar': False}),
-        ]),
-    ]),
-
-    # ── ROW 2: Coin Buzz + Hidden Gems ──
-    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
-            html.H3("🔥 Coin Buzz", style={'color': '#ff6b6b', 'marginBottom': '5px'}),
-            html.P("Most mentioned coins across Reddit + Telegram + News", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            dcc.Graph(id='buzz-chart', config={'displayModeBar': False}),
-        ]),
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#ff6b6b'}, children=[
-            html.H3("💎 Hidden Gems", style={'color': '#ff6b6b', 'marginBottom': '5px'}),
-            html.P("Cross-source validated: trending + buzz + outside top 50", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='gems'),
-        ]),
-    ]),
+    # ── ALERTS BAR ──
+    html.Div(id='alerts-bar', style={**CARD, 'marginBottom': '20px', 'borderColor': '#ff8c00',
+        'padding': '12px 20px'}),
 
     # ══════════════════════════════════════════════════════════
-    # THREE DYNAMIC WATCHLISTS
+    # DETAIL SECTIONS (collapsible)
     # ══════════════════════════════════════════════════════════
-
-    html.H2("Dynamic Watchlists", style={'color': '#00d4ff', 'textAlign': 'center',
-        'marginTop': '30px', 'marginBottom': '20px', 'fontSize': '24px'}),
-
-    # ── WATCHLIST 1: ALPHA RADAR ──
-    html.Div(style=ACCENT_CARD('#00d4ff'), children=[
-        html.H3("🎯 Alpha Radar", style={'color': '#00d4ff', 'marginBottom': '5px'}),
-        html.P("Coins with rising buzz, positive sentiment, and catalysts. Auto-populated from all sources.", 
-               style={'color': '#666', 'fontSize': '12px', 'marginBottom': '15px'}),
-        html.Div(style={'display': 'flex', 'padding': '8px 12px', 'borderBottom': '2px solid #2a2a4a',
-            'fontSize': '11px', 'color': '#666', 'textTransform': 'uppercase', 'letterSpacing': '1px'}, children=[
-            html.Span("Token", style={'flex': '2'}), html.Span("Price", style={'flex': '1', 'textAlign': 'right'}),
-            html.Span("24h", style={'flex': '1', 'textAlign': 'right'}), html.Span("7d", style={'flex': '1', 'textAlign': 'right'}),
-            html.Span("MCap", style={'flex': '1', 'textAlign': 'right'}), html.Span("Buzz", style={'flex': '1', 'textAlign': 'right'}),
-            html.Span("Mood", style={'flex': '1', 'textAlign': 'right'}),
-        ]),
-        html.Div(id='alpha-radar'),
+    html.Div(style={'display': 'flex', 'gap': '8px', 'marginBottom': '15px', 'flexWrap': 'wrap', 'justifyContent': 'center'}, children=[
+        html.Button(label, id=f'tab-{tab}', n_clicks=0,
+            style={'padding': '6px 14px', 'backgroundColor': 'transparent', 'border': '1px solid #2a2a4a',
+                   'borderRadius': '4px', 'color': '#888', 'cursor': 'pointer', 'fontSize': '11px',
+                   'fontFamily': 'inherit'})
+        for tab, label in [
+            ('buzz', '🔥 Coin Buzz'), ('gems', '💎 Gems'), ('narratives', '📡 Narratives'),
+            ('listings', '🏦 Listings'), ('whales', '🐋 Whales'), ('news', '📰 News'),
+            ('macro', '🏦 Macro'), ('reddit', '💬 Reddit'), ('x', '🐦 X/Twitter'),
+        ]
     ]),
 
-    # ── WATCHLIST 2: AIRDROP TRACKER ──
-    html.Div(style=ACCENT_CARD('#cc44ff'), children=[
-        html.H3("🪂 Airdrop Tracker", style={'color': '#cc44ff', 'marginBottom': '5px'}),
-        html.P("AI-analyzed airdrops sorted by effort level. Free/Easy first. Review and approve to track.",
-               style={'color': '#666', 'fontSize': '12px', 'marginBottom': '15px'}),
-        html.Div(id='airdrop-tracker'),
-    ]),
-
-    # ── WATCHLIST 3: INVESTMENT RADAR ──
-    html.Div(style=ACCENT_CARD('#88cc00'), children=[
-        html.H3("📈 Investment Radar", style={'color': '#88cc00', 'marginBottom': '5px'}),
-        html.P("Momentum shifts detected: price movement + sentiment + narrative alignment.",
-               style={'color': '#666', 'fontSize': '12px', 'marginBottom': '15px'}),
-        html.Div(style={'display': 'flex', 'padding': '8px 12px', 'borderBottom': '2px solid #2a2a4a',
-            'fontSize': '11px', 'color': '#666', 'textTransform': 'uppercase', 'letterSpacing': '1px'}, children=[
-            html.Span("Token", style={'flex': '2'}), html.Span("Price", style={'flex': '1', 'textAlign': 'right'}),
-            html.Span("24h", style={'flex': '1', 'textAlign': 'right'}), html.Span("7d", style={'flex': '1', 'textAlign': 'right'}),
-            html.Span("MCap", style={'flex': '1', 'textAlign': 'right'}), html.Span("CoinGecko Mood", style={'flex': '1', 'textAlign': 'right'}),
-        ]),
-        html.Div(id='investment-radar'),
-    ]),
-
-    # ══════════════════════════════════════════════════════════
-    # SIGNAL FEEDS
-    # ══════════════════════════════════════════════════════════
-
-    html.H2("Signal Feeds", style={'color': '#888', 'textAlign': 'center',
-        'marginTop': '30px', 'marginBottom': '20px', 'fontSize': '20px'}),
-
-    # ── Exchange Listings + Whale Alerts ──
-    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#ffdd00'}, children=[
-            html.H3("🏦 Exchange Listings", style={'color': '#ffdd00', 'marginBottom': '5px'}),
-            html.P("New listings from 14 exchanges — Tier 2 = highest alpha", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='listings'),
-        ]),
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0', 'borderColor': '#44ffcc'}, children=[
-            html.H3("🐋 Whale Movements", style={'color': '#44ffcc', 'marginBottom': '5px'}),
-            html.P("Large transactions from Telegram whale alerts", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='whales'),
-        ]),
-    ]),
-
-    # ── Alpha Signals + News ──
-    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
-            html.H3("🔍 Alpha Signals", style={'color': '#00d4ff', 'marginBottom': '5px'}),
-            html.P("High-engagement signals from all sources", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='alphas'),
-        ]),
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '300px', 'marginBottom': '0'}, children=[
-            html.H3("📰 News Feed", style={'color': '#ff8c00', 'marginBottom': '5px'}),
-            html.P("Multilingual crypto news — EN/CN/JP/RU/ES/BR", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='news'),
-        ]),
-    ]),
-
-    # ── Trending + X Sentiment ──
-    html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'marginBottom': '20px'}, children=[
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '280px', 'marginBottom': '0'}, children=[
-            html.H3("🔥 CoinGecko Trending", style={'color': '#ff6b6b', 'marginBottom': '5px'}),
-            html.Div(id='trending'),
-        ]),
-        html.Div(style={**CARD, 'flex': '1', 'minWidth': '280px', 'marginBottom': '0', 'borderColor': '#1da1f2'}, children=[
-            html.H3("🐦 X/Twitter Sentiment", style={'color': '#1da1f2', 'marginBottom': '5px'}),
-            html.P("Enable in .env: ENABLE_TWITTER_FETCH=true", style={'color': '#666', 'fontSize': '12px', 'marginBottom': '10px'}),
-            html.Div(id='x-sentiment'),
-        ]),
-    ]),
+    html.Div(id='detail-panel', style={**CARD, 'marginBottom': '20px', 'display': 'none'}),
 
     # Footer
-    html.Div(style={'textAlign': 'center', 'padding': '20px', 'color': '#444', 'fontSize': '12px'}, children=[
-        html.P("AlphaScope v2.1 — Built by Amentinho"),
-        html.P("Sources: Reddit · Telegram · CoinGecko · DeFi Llama · 14 Exchanges · 10 News Sources · X/Twitter",
-               style={'fontSize': '10px'}),
+    html.Div(style={'textAlign': 'center', 'color': '#333', 'fontSize': '10px', 'letterSpacing': '2px'}, children=[
+        html.P("ALPHASCOPE v2.2 — AMENTINHO"),
     ]),
 ])
 
 # ============================================================
-# MAIN CALLBACK
+# MAIN CALLBACK — Three boxes + alerts
 # ============================================================
 @app.callback(
-    [Output('fg-gauge', 'figure'), Output('fg-chart', 'figure'),
-     Output('narratives', 'figure'), Output('buzz-chart', 'figure'),
-     Output('gems', 'children'),
-     Output('alpha-radar', 'children'), Output('airdrop-tracker', 'children'),
-     Output('investment-radar', 'children'),
-     Output('listings', 'children'), Output('whales', 'children'),
-     Output('alphas', 'children'), Output('news', 'children'),
-     Output('trending', 'children'), Output('x-sentiment', 'children'),
+    [Output('pulse-bar', 'children'), Output('macro-bar', 'children'),
+     Output('box-alpha', 'children'), Output('box-airdrops', 'children'),
+     Output('box-invest', 'children'), Output('alerts-bar', 'children'),
      Output('updated', 'children')],
     [Input('refresh', 'n_intervals')]
 )
-def update(_):
+def update_main(_):
     fg = load_fear_greed()
     fg_val = int(fg.iloc[0]['value']) if not fg.empty else 50
     fg_label = fg.iloc[0]['label'] if not fg.empty else "N/A"
+    fg_color = '#ff4444' if fg_val < 25 else '#ff8c00' if fg_val < 45 else '#ffdd00' if fg_val < 55 else '#88cc00' if fg_val < 75 else '#00cc44'
 
-    # ── HIDDEN GEMS ──
-    gems = load_hidden_gems()
-    gem_items = []
-    for _, r in gems.iterrows():
-        gem_items.append(html.Div(style={'padding': '10px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Span(f"💎 {r['name']} ", style={'fontWeight': 'bold', 'color': '#ff6b6b'}),
-            html.Span(f"({r['symbol']})", style={'color': '#888'}),
-            html.Span(f"  #{int(r['market_cap_rank'])}" if pd.notna(r['market_cap_rank']) else "", 
-                      style={'color': '#ffdd00', 'fontSize': '12px', 'marginLeft': '8px'}),
-            html.P(r['signal_detail'], style={'color': '#999', 'fontSize': '12px', 'marginTop': '4px', 'marginBottom': '0'}),
-        ]))
-    if not gem_items: gem_items = [html.P("No hidden gems detected", style={'color': '#666'})]
+    # ── PULSE BAR ──
+    pulse = [
+        html.Span(f"F&G: {fg_val}", style={'color': fg_color, 'fontSize': '13px', 'fontWeight': 'bold',
+            'padding': '4px 10px', 'border': f'1px solid {fg_color}', 'borderRadius': '4px'}),
+    ]
+    prices = load_prices()
+    for _, r in prices.head(5).iterrows():
+        c = r['change_24h'] or 0
+        col = '#00cc44' if c >= 0 else '#ff4444'
+        pulse.append(html.Span(f"{r['symbol']} ${r['price_usd']:,.0f} {c:+.1f}%",
+            style={'color': col, 'fontSize': '11px', 'padding': '4px 8px', 'border': f'1px solid #2a2a4a', 'borderRadius': '4px'}))
 
-    # ── ALPHA RADAR (dynamic watchlist 1) ──
-    radar = load_investment_radar()
+    # ── MACRO BAR ──
+    macro_text = load_macro_summary()
+
+    # ── BOX 1: ALPHA PICKS ──
     buzz = load_coin_buzz()
-    buzz_map = {r['coin']: dict(r) for _, r in buzz.iterrows()} if not buzz.empty else {}
+    gems = load_hidden_gems()
+    price_map = {r['symbol']: dict(r) for _, r in prices.iterrows()} if not prices.empty else {}
     
-    alpha_rows = []
-    for _, r in radar.iterrows():
-        if r['name'] is None: continue
-        c24 = r['change_24h'] or 0
-        c7 = r['change_7d'] or 0
-        mcap = r['market_cap'] or 0
-        mcap_s = f"${mcap/1e9:.1f}B" if mcap >= 1e9 else f"${mcap/1e6:.0f}M" if mcap >= 1e6 else "N/A"
-        sym = r['symbol'] or ''
-        b = buzz_map.get(sym, {})
-        buzz_count = int(b['mention_count']) if isinstance(b, dict) and 'mention_count' in b else 0
-        mood = ""
-        if pd.notna(r.get('sentiment_up')) and r['sentiment_up'] > 0:
-            e = "🟢" if r['sentiment_up'] >= 60 else "🟡" if r['sentiment_up'] >= 40 else "🔴"
-            mood = f"{e} {r['sentiment_up']:.0f}%"
-        alpha_rows.append(html.Div(style={'display': 'flex', 'alignItems': 'center', 'padding': '10px 12px',
-            'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Div(style={'flex': '2'}, children=[html.Span(f"{r['name']} ", style={'fontWeight': 'bold'}),
-                html.Span(f"({sym})", style={'color': '#888', 'fontSize': '12px'})]),
-            html.Span(f"${r['price_usd']:,.2f}", style={'flex': '1', 'textAlign': 'right'}),
-            html.Span(f"{c24:+.1f}%", style={'flex': '1', 'textAlign': 'right', 'color': '#00cc44' if c24>=0 else '#ff4444', 'fontWeight': 'bold'}),
-            html.Span(f"{c7:+.1f}%", style={'flex': '1', 'textAlign': 'right', 'color': '#00cc44' if c7>=0 else '#ff4444'}),
-            html.Span(mcap_s, style={'flex': '1', 'textAlign': 'right', 'color': '#888'}),
-            html.Span(f"🔥{buzz_count}" if buzz_count else "", style={'flex': '1', 'textAlign': 'right', 'color': '#ff6b6b'}),
-            html.Span(mood, style={'flex': '1', 'textAlign': 'right'}),
-        ]))
-    if not alpha_rows: alpha_rows = [html.P("Run fetcher to populate", style={'color': '#666'})]
-
-    # ── AIRDROP TRACKER (dynamic watchlist 2) ──
-    airdrops = load_airdrop_projects()
-    airdrop_items = []
-    for _, r in airdrops.iterrows():
-        score = r['legitimacy_score'] or 5
-        legit_emoji = '✅' if score >= 7 else '⚠️' if score >= 4 else '🚫'
-        status_color = {'AI_SUGGESTED': '#888', 'USER_APPROVED': '#00d4ff', 'ACTIVE': '#00cc44'}.get(r['status'], '#888')
-        
-        airdrop_items.append(html.Div(style={'padding': '12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Div(style={'display': 'flex', 'alignItems': 'center', 'gap': '10px', 'marginBottom': '6px'}, children=[
-                html.Span(f"{legit_emoji} {r['project_name']}", style={'fontWeight': 'bold', 'color': '#cc44ff', 'fontSize': '15px'}),
-                effort_badge(r.get('effort_level', '')),
-                html.Span(f"{score}/10", style={'color': '#ffdd00', 'fontSize': '12px'}),
-                html.Span(f"[{r['status']}]", style={'color': status_color, 'fontSize': '11px'}),
-            ]),
-            html.Div(style={'display': 'flex', 'gap': '15px', 'fontSize': '12px', 'color': '#888', 'marginBottom': '4px'}, children=[
-                html.Span(f"💰 {r.get('cost_estimate', '?')}"),
-                html.Span(f"⏱ {r.get('time_required', '?')}"),
-                html.Span(f"🎁 {r.get('reward_estimate', '?')}"),
-                html.Span(f"📅 {r.get('deadline', '?')}"),
-            ]),
-            html.P(r.get('qualification_steps', 'No steps yet')[:200],
-                   style={'color': '#aaa', 'fontSize': '12px', 'marginTop': '4px', 'marginBottom': '2px', 'lineHeight': '1.4'}),
-            html.P(r.get('legitimacy_reasons', '')[:120],
-                   style={'color': '#666', 'fontSize': '11px', 'fontStyle': 'italic', 'marginBottom': '0'}),
-        ]))
-    if not airdrop_items:
-        airdrop_items = [html.P("No airdrops detected yet. Run fetcher + airdrop_intel.py", style={'color': '#666'})]
-
-    # ── INVESTMENT RADAR (dynamic watchlist 3) ──
-    inv_rows = []
-    for _, r in radar.iterrows():
-        if r['name'] is None: continue
-        c24 = r['change_24h'] or 0
-        c7 = r['change_7d'] or 0
-        mcap = r['market_cap'] or 0
-        mcap_s = f"${mcap/1e9:.1f}B" if mcap >= 1e9 else f"${mcap/1e6:.0f}M" if mcap >= 1e6 else "N/A"
-        mood = ""
-        if pd.notna(r.get('sentiment_up')) and r['sentiment_up'] > 0:
-            e = "🟢" if r['sentiment_up'] >= 60 else "🟡" if r['sentiment_up'] >= 40 else "🔴"
-            mood = f"{e} {r['sentiment_up']:.0f}%"
-        inv_rows.append(html.Div(style={'display': 'flex', 'alignItems': 'center', 'padding': '10px 12px',
-            'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Div(style={'flex': '2'}, children=[html.Span(f"{r['name']} ", style={'fontWeight': 'bold'}),
-                html.Span(f"({r['symbol']})", style={'color': '#888', 'fontSize': '12px'})]),
-            html.Span(f"${r['price_usd']:,.2f}", style={'flex': '1', 'textAlign': 'right'}),
-            html.Span(f"{c24:+.1f}%", style={'flex': '1', 'textAlign': 'right', 'color': '#00cc44' if c24>=0 else '#ff4444', 'fontWeight': 'bold'}),
-            html.Span(f"{c7:+.1f}%", style={'flex': '1', 'textAlign': 'right', 'color': '#00cc44' if c7>=0 else '#ff4444'}),
-            html.Span(mcap_s, style={'flex': '1', 'textAlign': 'right', 'color': '#888'}),
-            html.Span(mood, style={'flex': '1', 'textAlign': 'right'}),
-        ]))
-    if not inv_rows: inv_rows = [html.P("Run fetcher to populate", style={'color': '#666'})]
-
-    # ── EXCHANGE LISTINGS ──
-    listings = load_exchange_listings()
-    listing_items = []
-    for _, r in listings.iterrows():
-        tier = r.get('exchange_tier', 4) if 'exchange_tier' in r else 4
-        tier_label = ['', '🥇', '🥈', '🥉', '4️⃣'][min(tier, 4)]
-        listing_items.append(html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Span(f"{tier_label} {r['exchange']}", style={'color': '#ffdd00', 'fontWeight': 'bold', 'fontSize': '12px'}),
-            html.Span(f"  {r.get('coin', '')}", style={'color': '#00d4ff', 'fontSize': '12px', 'marginLeft': '8px'}),
-            html.P(clean_html(r['title'][:150]), style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
-        ]))
-    if not listing_items: listing_items = [html.P("No listings detected. Add exchange_feeds.py", style={'color': '#666'})]
-
-    # ── WHALES ──
-    whales = load_signals('WHALE', 8)
-    whale_items = [
-        html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Span(f"📡 {r['source_detail']}", style={'color': '#44ffcc', 'fontSize': '11px'}),
-            html.P(clean_html(r['title'][:200]), style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
-        ]) for _, r in whales.iterrows()
-    ] if not whales.empty else [html.P("No whale movements", style={'color': '#666'})]
-
-    # ── ALPHA SIGNALS ──
-    alphas = load_signals('ALPHA', 10)
     alpha_items = []
-    seen = set()
-    for _, r in alphas.iterrows():
-        content = clean_html((r.get('content') or r.get('title') or '')[:150])
-        if content[:40] in seen: continue
-        seen.add(content[:40])
-        eng = r['engagement'] or 0
-        alpha_items.append(html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Span(f"{source_icon(r['source'])} {r['source_detail']}", style={'color': '#888', 'fontSize': '11px'}),
-            html.Span(f"  ⚡{eng//1000}K" if eng >= 1000 else f"  ⚡{eng}" if eng > 0 else "", style={'color': '#ffdd00', 'fontSize': '11px'}),
-            html.P(content, style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
+    seen_alpha = set()
+    
+    # Hidden gems first (highest alpha potential)
+    for _, r in gems.iterrows():
+        sym = r['symbol']
+        if sym in seen_alpha: continue
+        seen_alpha.add(sym)
+        p = price_map.get(sym, {})
+        price_str = f"${p.get('price_usd', 0):,.2f}" if p.get('price_usd') else ""
+        change = p.get('change_24h', 0) or 0
+        change_col = '#00cc44' if change >= 0 else '#ff4444'
+        
+        alpha_items.append(html.Div(style={'padding': '8px 0', 'borderBottom': '1px solid #1a1a3e'}, children=[
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center'}, children=[
+                html.Span(f"💎 {sym}", style={'color': '#ff6b6b', 'fontWeight': 'bold', 'fontSize': '14px'}),
+                html.Span(price_str, style={'color': '#fff', 'fontSize': '13px'}) if price_str else html.Span(""),
+            ]),
+            html.P(r['signal_detail'][:80], style={'color': '#666', 'fontSize': '10px', 'margin': '2px 0 0'}),
+        ]))
+        if len(alpha_items) >= 5: break
+    
+    # Then buzzing non-major coins
+    majors = {'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE'}
+    for _, r in buzz.iterrows():
+        coin = r['coin']
+        if coin in seen_alpha or coin in majors: continue
+        seen_alpha.add(coin)
+        p = price_map.get(coin, {})
+        price_str = f"${p.get('price_usd', 0):,.2f}" if p.get('price_usd') else ""
+        sent = r['avg_sentiment'] or 0
+        sent_emoji = '🟢' if sent > 0.1 else '🔴' if sent < -0.1 else '🟡'
+        
+        alpha_items.append(html.Div(style={'padding': '8px 0', 'borderBottom': '1px solid #1a1a3e'}, children=[
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between'}, children=[
+                html.Span(f"{sent_emoji} {coin}", style={'color': '#00d4ff', 'fontWeight': 'bold', 'fontSize': '14px'}),
+                html.Span(f"{r['mention_count']} mentions", style={'color': '#888', 'fontSize': '11px'}),
+            ]),
+            html.P(f"Buzz across {r['sources'][:30]}" if r.get('sources') else "", style={'color': '#666', 'fontSize': '10px', 'margin': '2px 0 0'}),
         ]))
         if len(alpha_items) >= 8: break
-    if not alpha_items: alpha_items = [html.P("No alpha signals", style={'color': '#666'})]
+    
+    if not alpha_items:
+        alpha_items = [html.P("Scanning for alpha...", style={'color': '#555', 'fontSize': '12px'})]
 
-    # ── NEWS ──
-    news = load_signals('NEWS', 12)
-    news_items = []
-    seen_n = set()
-    for _, r in news.iterrows():
-        title = clean_html((r.get('title') or '')[:150])
-        if title[:40] in seen_n: continue
-        seen_n.add(title[:40])
-        news_items.append(html.Div(style={'padding': '8px 12px', 'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Span(f"{source_icon(r['source'])} {r['source_detail']}", style={'color': '#888', 'fontSize': '11px'}),
-            html.P(title, style={'color': '#ccc', 'fontSize': '13px', 'marginTop': '4px', 'marginBottom': '0'}),
-            html.A("→ link", href=r['url'], target='_blank', style={'color': '#00d4ff', 'fontSize': '11px', 'textDecoration': 'none'}) if r.get('url') and str(r['url']).startswith('http') else html.Span(""),
+    # ── BOX 2: AIRDROPS ──
+    airdrops = load_airdrops()
+    airdrop_items = []
+    for _, r in airdrops.iterrows():
+        score = r.get('legitimacy_score', 5) or 5
+        legit = '✅' if score >= 7 else '⚠️' if score >= 4 else '🚫'
+        
+        airdrop_items.append(html.Div(style={'padding': '8px 0', 'borderBottom': '1px solid #1a1a3e'}, children=[
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center'}, children=[
+                html.Span(f"{legit} {r['project_name']}", style={'color': '#cc44ff', 'fontWeight': 'bold', 'fontSize': '13px'}),
+                effort_badge(r.get('effort_level', '')),
+            ]),
+            html.Div(style={'display': 'flex', 'gap': '10px', 'fontSize': '10px', 'color': '#666', 'marginTop': '3px'}, children=[
+                html.Span(f"💰{r.get('cost_estimate', '?')}"),
+                html.Span(f"⏱{r.get('time_required', '?')}"),
+                html.Span(f"🎁{r.get('reward_estimate', '?')}"),
+                html.Span(f"{score}/10", style={'color': '#ffdd00'}),
+            ]),
+            html.Details(style={'marginTop': '4px'}, children=[
+                html.Summary("Steps →", style={'color': '#888', 'fontSize': '10px', 'cursor': 'pointer'}),
+                html.P(r.get('qualification_steps', 'Check project website')[:200],
+                       style={'color': '#aaa', 'fontSize': '11px', 'marginTop': '4px', 'lineHeight': '1.4'}),
+            ]),
         ]))
-        if len(news_items) >= 8: break
-    if not news_items: news_items = [html.P("No news yet", style={'color': '#666'})]
+        if len(airdrop_items) >= 5: break
+    
+    if not airdrop_items:
+        airdrop_items = [html.P("No airdrops detected yet", style={'color': '#555', 'fontSize': '12px'})]
 
-    # ── TRENDING ──
-    trending = load_trending()
-    trending_items = [
-        html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'padding': '8px 12px',
-            'borderBottom': '1px solid #2a2a4a', 'fontSize': '14px'}, children=[
-            html.Span(f"{i+1}. {r['name']} ({r['symbol']})", style={'color': '#ddd'}),
-            html.Span(f"#{int(r['market_cap_rank'])}" if pd.notna(r['market_cap_rank']) else "New", style={'color': '#888'}),
-        ]) for i, r in trending.iterrows()
-    ]
-
-    # ── X SENTIMENT ──
-    sentiment = load_sentiment_signals()
-    x_items = []
+    # ── BOX 3: INVEST NOW ──
+    invest_items = []
+    sentiment = load_sentiment()
+    sent_map = {}
     for _, r in sentiment.iterrows():
-        score = r['sentiment_score'] or 0
-        emoji = "🟢" if score > 0.1 else "🔴" if score < -0.1 else "🟡"
-        color = '#00cc44' if score > 0.1 else '#ff4444' if score < -0.1 else '#ffdd00'
-        x_items.append(html.Div(style={'display': 'flex', 'alignItems': 'center', 'padding': '8px 12px',
-            'borderBottom': '1px solid #2a2a4a'}, children=[
-            html.Span(f"{emoji} {r['source_detail']}", style={'fontWeight': 'bold', 'color': color, 'width': '80px'}),
-            html.Span(f"{r['sentiment_label']}", style={'color': color, 'width': '90px', 'fontSize': '13px'}),
-            html.Span(f"({score:+.2f})", style={'color': '#888', 'fontSize': '12px'}),
+        coin = r.get('coin', '')
+        if coin:
+            sent_map[coin] = r
+
+    for _, r in prices.iterrows():
+        if r['name'] is None: continue
+        sym = r['symbol'] or ''
+        c24 = r['change_24h'] or 0
+        c7 = r['change_7d'] or 0
+        mcap = r['market_cap'] or 0
+        mcap_s = f"${mcap/1e9:.0f}B" if mcap >= 1e9 else f"${mcap/1e6:.0f}M" if mcap >= 1e6 else ""
+        
+        # Sentiment from X
+        s = sent_map.get(sym, {})
+        x_sent = ''
+        if isinstance(s, dict) and s.get('sentiment_label'):
+            x_sent = s['sentiment_label']
+        elif hasattr(s, 'get') and s.get('sentiment_label'):
+            x_sent = s['sentiment_label']
+
+        # Buzz count
+        b = buzz[buzz['coin'] == sym] if not buzz.empty else pd.DataFrame()
+        buzz_n = int(b.iloc[0]['mention_count']) if not b.empty else 0
+
+        c24_col = '#00cc44' if c24 >= 0 else '#ff4444'
+        
+        invest_items.append(html.Div(style={'padding': '8px 0', 'borderBottom': '1px solid #1a1a3e'}, children=[
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center'}, children=[
+                html.Span(f"{sym}", style={'color': '#88cc00', 'fontWeight': 'bold', 'fontSize': '14px'}),
+                html.Span(f"${r['price_usd']:,.2f}", style={'color': '#fff', 'fontSize': '13px'}),
+            ]),
+            html.Div(style={'display': 'flex', 'gap': '10px', 'fontSize': '11px', 'marginTop': '2px'}, children=[
+                html.Span(f"24h: {c24:+.1f}%", style={'color': c24_col}),
+                html.Span(f"7d: {c7:+.1f}%", style={'color': '#00cc44' if c7 >= 0 else '#ff4444'}),
+                html.Span(mcap_s, style={'color': '#666'}),
+                html.Span(f"🔥{buzz_n}", style={'color': '#ff6b6b'}) if buzz_n else html.Span(""),
+                html.Span(x_sent, style={'color': '#1da1f2', 'fontSize': '10px'}) if x_sent else html.Span(""),
+            ]),
         ]))
-    if not x_items: x_items = [html.P("Enable: ENABLE_TWITTER_FETCH=true in .env", style={'color': '#666'})]
+    
+    if not invest_items:
+        invest_items = [html.P("Fetching prices...", style={'color': '#555', 'fontSize': '12px'})]
 
-    return (create_fg_gauge(fg_val, fg_label), create_fg_chart(fg),
-            create_narratives_chart(load_narratives()), create_buzz_chart(load_coin_buzz()),
-            gem_items, alpha_rows, airdrop_items, inv_rows,
-            listing_items, whale_items, alpha_items, news_items,
-            trending_items, x_items,
-            f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    # ── ALERTS BAR ──
+    alerts = []
+    
+    # Whale alerts
+    whales = load_signals('WHALE', 3)
+    for _, r in whales.head(2).iterrows():
+        alerts.append(html.Span(f"🐋 {clean_html(r['title'][:80])}", style={'fontSize': '11px', 'color': '#44ffcc'}))
+        alerts.append(html.Br())
+    
+    # Exchange listings
+    listings = load_exchange_listings()
+    for _, r in listings.head(2).iterrows():
+        alerts.append(html.Span(f"🏦 {r['exchange']}: {clean_html(r['title'][:60])}", style={'fontSize': '11px', 'color': '#ffdd00'}))
+        alerts.append(html.Br())
+    
+    # Macro events
+    events = load_macro_events()
+    high_impact = events[events['impact'] == 'HIGH'] if not events.empty else pd.DataFrame()
+    for _, r in high_impact.head(1).iterrows():
+        alerts.append(html.Span(f"🔴 MACRO: {r['event_name']} — {r['crypto_impact'][:60]}", style={'fontSize': '11px', 'color': '#ff8c00'}))
+    
+    # Geo risk
+    geo = events[events['category'] == 'GEOPOLITICAL'] if not events.empty else pd.DataFrame()
+    for _, r in geo.head(1).iterrows():
+        alerts.append(html.Span(f"⚠️ {clean_html(r['event_name'][:80])}", style={'fontSize': '11px', 'color': '#ff4444'}))
+    
+    if not alerts:
+        alerts = [html.Span("No critical alerts", style={'color': '#555', 'fontSize': '11px'})]
 
-# ── AI BRIEF CALLBACK ──
+    return (pulse, macro_text or "Loading macro data...",
+            alpha_items, airdrop_items, invest_items, alerts,
+            f"Updated: {datetime.now().strftime('%H:%M')}")
+
+# ============================================================
+# DETAIL PANEL CALLBACK
+# ============================================================
+@app.callback(
+    [Output('detail-panel', 'children'), Output('detail-panel', 'style')],
+    [Input(f'tab-{t}', 'n_clicks') for t in ['buzz','gems','narratives','listings','whales','news','macro','reddit','x']],
+    prevent_initial_call=True
+)
+def show_detail(*clicks):
+    ctx = callback_context
+    if not ctx.triggered:
+        return [], {**CARD, 'display': 'none'}
+    
+    tab = ctx.triggered[0]['prop_id'].split('.')[0].replace('tab-', '')
+    style = {**CARD, 'display': 'block', 'marginBottom': '20px'}
+    
+    if tab == 'buzz':
+        buzz = load_coin_buzz()
+        items = [html.H3("🔥 Coin Buzz Rankings", style={'color': '#ff6b6b', 'marginBottom': '10px'})]
+        for _, r in buzz.iterrows():
+            sent = r['avg_sentiment'] or 0
+            col = '#00cc44' if sent > 0.1 else '#ff4444' if sent < -0.1 else '#ffdd00'
+            items.append(html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'padding': '6px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(r['coin'], style={'color': '#fff', 'fontWeight': 'bold'}),
+                html.Span(f"{r['mention_count']} mentions", style={'color': '#888'}),
+                html.Span(f"sent: {sent:+.2f}", style={'color': col}),
+            ]))
+        return items, style
+    
+    elif tab == 'gems':
+        gems = load_hidden_gems()
+        items = [html.H3("💎 Hidden Gems", style={'color': '#ff6b6b', 'marginBottom': '10px'})]
+        for _, r in gems.iterrows():
+            items.append(html.Div(style={'padding': '8px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{r['name']} ({r['symbol']})", style={'color': '#ff6b6b', 'fontWeight': 'bold'}),
+                html.Span(f" #{int(r['market_cap_rank'])}" if pd.notna(r['market_cap_rank']) else "", style={'color': '#ffdd00', 'fontSize': '12px'}),
+                html.P(r['signal_detail'], style={'color': '#888', 'fontSize': '12px', 'margin': '2px 0 0'}),
+            ]))
+        return items, style
+    
+    elif tab == 'narratives':
+        narr = load_narratives()
+        items = [html.H3("📡 Narrative Radar", style={'color': '#ff8c00', 'marginBottom': '10px'})]
+        colors = {'Bitcoin':'#f7931a','Ethereum':'#627eea','AI':'#00d4ff','DeFi':'#88cc00','L2':'#ff6b6b','Memecoins':'#ffdd00','Regulation':'#ff4444','Solana':'#9945ff'}
+        for _, r in narr.iterrows():
+            col = colors.get(r['narrative'], '#888')
+            items.append(html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'padding': '6px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(r['narrative'], style={'color': col, 'fontWeight': 'bold'}),
+                html.Span(f"{r['mention_count']} mentions", style={'color': '#888'}),
+            ]))
+        return items, style
+    
+    elif tab == 'listings':
+        listings = load_exchange_listings()
+        items = [html.H3("🏦 Exchange Listings", style={'color': '#ffdd00', 'marginBottom': '10px'})]
+        for _, r in listings.iterrows():
+            tier = r.get('exchange_tier', 4)
+            emoji = ['', '🥇', '🥈', '🥉', '4️⃣'][min(tier, 4)]
+            items.append(html.Div(style={'padding': '6px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{emoji} {r['exchange']}", style={'color': '#ffdd00', 'fontWeight': 'bold', 'fontSize': '12px'}),
+                html.Span(f" {r.get('coin', '')}", style={'color': '#00d4ff', 'fontSize': '12px'}),
+                html.P(clean_html(r['title'][:120]), style={'color': '#ccc', 'fontSize': '12px', 'margin': '2px 0 0'}),
+            ]))
+        return items, style
+    
+    elif tab == 'whales':
+        whales = load_signals('WHALE', 10)
+        items = [html.H3("🐋 Whale Movements", style={'color': '#44ffcc', 'marginBottom': '10px'})]
+        for _, r in whales.iterrows():
+            items.append(html.P(f"📡 {r['source_detail']}: {clean_html(r['title'][:150])}",
+                style={'color': '#ccc', 'fontSize': '12px', 'borderBottom': '1px solid #2a2a4a', 'padding': '6px 0'}))
+        return items, style
+    
+    elif tab == 'news':
+        news = load_signals('NEWS', 15)
+        items = [html.H3("📰 News Feed", style={'color': '#ff8c00', 'marginBottom': '10px'})]
+        seen = set()
+        for _, r in news.iterrows():
+            title = clean_html(r['title'][:120])
+            if title[:30] in seen: continue
+            seen.add(title[:30])
+            items.append(html.Div(style={'padding': '6px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{r['source_detail']}", style={'color': '#888', 'fontSize': '10px'}),
+                html.P(title, style={'color': '#ccc', 'fontSize': '12px', 'margin': '2px 0 0'}),
+                html.A("→", href=r.get('url', ''), target='_blank', style={'color': '#00d4ff', 'fontSize': '10px', 'textDecoration': 'none'}) if r.get('url') and str(r['url']).startswith('http') else html.Span(""),
+            ]))
+            if len(items) > 12: break
+        return items, style
+    
+    elif tab == 'macro':
+        indicators = load_macro_indicators()
+        events = load_macro_events()
+        items = [html.H3("🏦 Macro & Geopolitical", style={'color': '#ffdd00', 'marginBottom': '10px'})]
+        items.append(html.H4("Indicators", style={'color': '#888', 'fontSize': '12px', 'marginTop': '10px'}))
+        for _, r in indicators.iterrows():
+            items.append(html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'padding': '4px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(r['indicator'], style={'color': '#ccc', 'fontSize': '12px'}),
+                html.Span(f"{r['value']:.2f}", style={'color': '#fff', 'fontWeight': 'bold', 'fontSize': '13px'}),
+            ]))
+        items.append(html.H4("Events", style={'color': '#888', 'fontSize': '12px', 'marginTop': '15px'}))
+        for _, r in events.iterrows():
+            emoji = {'HIGH': '🔴', 'MEDIUM': '🟡', 'LOW': '🟢'}.get(r.get('impact', ''), '⚪')
+            items.append(html.Div(style={'padding': '6px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{emoji} {r['event_name']}", style={'color': '#ccc', 'fontSize': '12px', 'fontWeight': 'bold'}),
+                html.P(r.get('crypto_impact', '')[:100], style={'color': '#666', 'fontSize': '11px', 'margin': '2px 0 0'}),
+            ]))
+        return items, style
+    
+    elif tab == 'reddit':
+        reddit = load_signals('NEWS', 15)
+        reddit = reddit[reddit['source'] == 'reddit'] if not reddit.empty else pd.DataFrame()
+        alphas = load_signals('ALPHA', 10)
+        items = [html.H3("💬 Reddit Signals", style={'color': '#ff8c00', 'marginBottom': '10px'})]
+        for _, r in pd.concat([alphas, reddit]).head(12).iterrows():
+            if r['source'] != 'reddit': continue
+            items.append(html.Div(style={'padding': '6px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(f"{r['source_detail']} ⬆{r['engagement']}", style={'color': '#888', 'fontSize': '10px'}),
+                html.P(clean_html(r['title'][:120]), style={'color': '#ccc', 'fontSize': '12px', 'margin': '2px 0 0'}),
+            ]))
+        return items, style
+    
+    elif tab == 'x':
+        sent = load_sentiment()
+        items = [html.H3("🐦 X/Twitter Sentiment", style={'color': '#1da1f2', 'marginBottom': '10px'})]
+        if sent.empty:
+            items.append(html.P("Enable: ENABLE_TWITTER_FETCH=true in .env", style={'color': '#666'}))
+        for _, r in sent.iterrows():
+            score = r['sentiment_score'] or 0
+            col = '#00cc44' if score > 0.1 else '#ff4444' if score < -0.1 else '#ffdd00'
+            items.append(html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'padding': '6px 0', 'borderBottom': '1px solid #2a2a4a'}, children=[
+                html.Span(r['source_detail'], style={'color': col, 'fontWeight': 'bold'}),
+                html.Span(f"{r['sentiment_label']} ({score:+.2f})", style={'color': col}),
+            ]))
+        return items, style
+    
+    return [], {**CARD, 'display': 'none'}
+
+# ── AI BRIEF ──
 @app.callback([Output('ai-text', 'children'), Output('ai-box', 'style')],
     [Input('ai-btn', 'n_clicks')], prevent_initial_call=True)
 def brief(n):
-    if n > 0: return generate_ai_brief(), {**CARD, 'display': 'block', 'borderColor': '#00d4ff'}
+    if n > 0: return generate_ai_brief(), {**CARD, 'display': 'block', 'marginBottom': '20px', 'borderColor': '#00d4ff'}
     return "", {**CARD, 'display': 'none'}
 
 if __name__ == '__main__':
-    print("\n  AlphaScope v2.1 — Alpha Intelligence Dashboard")
+    print("\n  ALPHASCOPE v2.2")
     print("  http://localhost:8050\n")
     app.run(debug=True, port=8050)

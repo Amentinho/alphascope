@@ -23,16 +23,16 @@ EXCHANGE_FEEDS = [
     ('Gate.io', 'https://www.gate.com/api/v3/announcement_html/list?type=newlistings&page=1&limit=20', 'json_gate'),
     ('MEXC', 'https://www.mexc.com/api/operateactivity/article/list?page=1&pageSize=20&type=2', 'json_mexc'),
     ('OKX', 'https://www.okx.com/api/v5/support/announcements?annType=announcements-new-listings&page=1', 'json_okx'),
-    ('Bitget', 'https://www.bitget.com/v1/cms/helpCenter/content/section/articles?firstSectionId=27&secondarySectionId=148&language=en_US&pageNo=1&pageSize=20', 'json_bitget'),
-    ('Bybit', 'https://api2.bybit.com/announcements/api/search/v1/index/announcement-result?category=new_crypto&page_no=1&page_size=20&locale=en-US', 'json_bybit'),
+    # ('Bitget', 'https://www.bitget.com/v1/cms/helpCenter/content/section/articles?firstSectionId=27&secondarySectionId=148&language=en_US&pageNo=1&pageSize=20', 'json_bitget'),
+    # ('Bybit', 'https://api2.bybit.com/announcements/api/search/v1/index/announcement-result?category=new_crypto&page_no=1&page_size=20&locale=en-US', 'json_bybit'),
     
     # Tier 3 — Asia-first (very early signals)
-    ('Upbit KR', 'https://api-manager.upbit.com/api/v1/announcements?os=web&per_page=20&category=trade', 'json_upbit'),
-    ('Bithumb KR', 'https://feed.bithumb.com/notice', 'rss'),
-    ('BingX', 'https://bingx.com/en-us/support/notice-center/articles/feed.xml', 'rss'),
+    # ('Upbit KR', 'https://api-manager.upbit.com/api/v1/announcements?os=web&per_page=20&category=trade', 'json_upbit'),
+    # ('Bithumb KR', 'https://feed.bithumb.com/notice', 'rss'),
+    # ('BingX', 'https://bingx.com/en-us/support/notice-center/articles/feed.xml', 'rss'),
     
     # Tier 4 — Specialty  
-    ('LBank', 'https://www.lbank.com/cms-api/v1/articles?categoryCode=announcement&pageNum=1&pageSize=20', 'json_lbank'),
+    # ('LBank', 'https://www.lbank.com/cms-api/v1/articles?categoryCode=announcement&pageNum=1&pageSize=20', 'json_lbank'),
 ]
 
 LISTING_KEYWORDS = ['list', 'listing', 'new trading pair', 'launches', 'adds support',

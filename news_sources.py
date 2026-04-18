@@ -23,7 +23,7 @@ NEWS_SOURCES = [
     ('Bitcoin Magazine', 'https://bitcoinmagazine.com/.rss/full/', 'EN', 'rss'),
     
     # Chinese — Moves markets early
-    ('8btc', 'https://www.8btc.com/feed', 'CN', 'rss'),
+    # ('8btc', 'https://www.8btc.com/feed', 'CN', 'rss'),  # DNS dead
     
     # Japanese
     ('CoinPost JP', 'https://coinpost.jp/?feed=rss2', 'JP', 'rss'),
@@ -32,10 +32,10 @@ NEWS_SOURCES = [
     ('Forklog', 'https://forklog.com/feed/', 'RU', 'rss'),
     
     # Spanish
-    ('CoinTelegraph ES', 'https://es.cointelegraph.com/rss', 'ES', 'rss'),
+    # ('CoinTelegraph ES', 'https://es.cointelegraph.com/rss', 'ES', 'rss'),  # HTTP 410
     
     # Portuguese (Brazil — large crypto market)
-    ('CoinTelegraph BR', 'https://br.cointelegraph.com/rss', 'BR', 'rss'),
+    # ('CoinTelegraph BR', 'https://br.cointelegraph.com/rss', 'BR', 'rss'),  # HTTP 410
 ]
 
 # DeFi-specific data sources (JSON APIs, no key needed)

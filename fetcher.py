@@ -200,37 +200,64 @@ def fetch_buzzing_prices():
     conn.close()
     must_fetch = {'BTC', 'ETH', 'SOL'}
     coins_to_fetch = must_fetch | {coin for coin, _ in buzzing if coin in registry.coingecko_map}
-    print(f"  Fetching prices for {len(coins_to_fetch)} buzzing coins...")
+    
+    # Build list of CoinGecko IDs
+    cg_ids = []
+    ticker_map = {}
     for ticker in coins_to_fetch:
         coin_id = registry.coingecko_map.get(ticker)
-        if not coin_id:
-            continue
-        try:
-            data = requests.get(f'https://api.coingecko.com/api/v3/coins/{coin_id}',
-                params={'localization': 'false', 'tickers': 'false', 'community_data': 'true', 'developer_data': 'false'},
-                timeout=10).json()
-            md = data.get('market_data', {})
-            cd = data.get('community_data', {})
-            conn = get_db()
-            c = conn.cursor()
+        if coin_id:
+            cg_ids.append(coin_id)
+            ticker_map[coin_id] = ticker
+    
+    if not cg_ids:
+        print("  No coins to fetch prices for")
+        return
+    
+    print(f"  Fetching prices for {len(cg_ids)} buzzing coins...")
+    
+    # Use simple/price endpoint — fast, reliable, one call for all coins
+    try:
+        ids_str = ','.join(cg_ids)
+        res = requests.get(
+            f'https://api.coingecko.com/api/v3/simple/price',
+            params={'ids': ids_str, 'vs_currencies': 'usd',
+                    'include_24hr_change': 'true', 'include_7d_change': 'true',
+                    'include_30d_change': 'true', 'include_market_cap': 'true',
+                    'include_24hr_vol': 'true'},
+            timeout=15)
+        
+        if res.status_code != 200:
+            print(f"    Simple price API: HTTP {res.status_code}")
+            return
+        
+        prices = res.json()
+        conn = get_db()
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        
+        for coin_id, data in prices.items():
+            ticker = ticker_map.get(coin_id, coin_id.upper())
+            price = data.get('usd', 0)
+            c24 = data.get('usd_24h_change', 0) or 0
+            c7 = data.get('usd_7d_change', 0) or 0
+            c30 = data.get('usd_30d_change', 0) or 0
+            mcap = data.get('usd_market_cap', 0) or 0
+            vol = data.get('usd_24h_vol', 0) or 0
+            
             c.execute('''INSERT INTO token_data (coin_id, name, symbol, price_usd, change_24h, change_7d, change_30d,
                          market_cap, volume_24h, sentiment_up, sentiment_down, twitter_followers, reddit_subscribers, fetched_at)
                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (coin_id, data.get('name'), data.get('symbol', '').upper(),
-                 md.get('current_price', {}).get('usd'), md.get('price_change_percentage_24h'),
-                 md.get('price_change_percentage_7d'), md.get('price_change_percentage_30d'),
-                 md.get('market_cap', {}).get('usd'), md.get('total_volume', {}).get('usd'),
-                 data.get('sentiment_votes_up_percentage'), data.get('sentiment_votes_down_percentage'),
-                 cd.get('twitter_followers'), cd.get('reddit_subscribers'),
-                 datetime.now().isoformat()))
-            conn.commit()
-            conn.close()
-            price = md.get('current_price', {}).get('usd', 0)
-            change = md.get('price_change_percentage_24h', 0) or 0
-            print(f"    {data.get('name')}: ${price:,.2f} ({change:+.1f}%)")
-        except Exception as e:
-            print(f"    {ticker} failed: {e}")
-        time.sleep(6)
+                (coin_id, coin_id.replace('-', ' ').title(), ticker,
+                 price, c24, c7, c30, mcap, vol,
+                 None, None, None, None, now))
+            
+            print(f"    {ticker}: ${price:,.2f} ({c24:+.1f}%)")
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"    Price fetch failed: {e}")
 
 # ============================================================
 # REDDIT — Wide scan + coin detection + buzz tracking
@@ -549,11 +576,29 @@ def fetch_all():
     # Phase 5: X/Twitter (optional)
     fetch_x_data()
 
-    # Phase 6: Intelligence
+    # Phase 5.5: Macroeconomic data
+    try:
+        from macro_calendar import fetch_macro_data
+        fetch_macro_data()
+    except ImportError:
+        print("  macro_calendar.py not found — skipping macro")
+    except Exception as e:
+        print(f"  Macro data failed: {e}")
+
+    # Phase 6: Pre-launch gem scanning
+    try:
+        from gem_scanner import fetch_pre_launch_gems
+        fetch_pre_launch_gems()
+    except ImportError:
+        print("  gem_scanner.py not found — skipping pre-launch scanning")
+    except Exception as e:
+        print(f"  Gem scanner failed: {e}")
+
+    # Phase 7: Intelligence
     fetch_x_airdrops()
     detect_hidden_gems()
 
-    # Phase 7: AI Airdrop Analysis (imported module)
+    # Phase 8: AI Airdrop Analysis (imported module)
     try:
         from airdrop_intel import process_new_airdrops
         process_new_airdrops()
@@ -562,10 +607,10 @@ def fetch_all():
     except Exception as e:
         print(f"  Airdrop AI failed: {e}")
 
-    # Phase 8: Dynamic price fetching (only buzzing coins)
+    # Phase 9: Dynamic price fetching (only buzzing coins)
     fetch_buzzing_prices()
 
-    # Phase 9: Save registry
+    # Phase 10: Save registry
     registry.save()
     stats = registry.get_stats()
     print(f"  Registry: {stats['total_known']} known, {stats['graduated']} learned, {stats['pending']} pending")
