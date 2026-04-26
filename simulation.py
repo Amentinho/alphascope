@@ -305,19 +305,21 @@ class SimPortfolio:
     def print_status(self):
         tv = self._trading_value()
         rv = self._real_value()
-        cost = self._real_cost_basis()
+        t0_rv = sum(self.t0_prices.get(pos['symbol'], 0) * pos['amount']
+                    for positions in REAL_PORTFOLIO.values() for pos in positions
+                    if self.t0_prices.get(pos['symbol'], 0) > 0)
+        rv_delta = rv - t0_rv  # change vs T=0 (start of this session)
         tp = tv - self.starting_trading
-        rp = rv - cost  # PnL vs original purchase cost
         sells = [t for t in self.trades if t['action'] == 'SELL']
-        wins = sum(1 for t in sells if t.get('pnl', 0) > 0)
+        wins   = sum(1 for t in sells if t.get('pnl', 0) > 0)
         losses = sum(1 for t in sells if t.get('pnl', 0) <= 0)
-        best = max(sells, key=lambda t: t.get('pnl_pct', 0), default=None)
+        best  = max(sells, key=lambda t: t.get('pnl_pct', 0), default=None)
         worst = min(sells, key=lambda t: t.get('pnl_pct', 0), default=None)
-        best_str = f"{best['symbol']} {best['pnl_pct']:+.0f}%" if best else 'none'
+        best_str  = f"{best['symbol']} {best['pnl_pct']:+.0f}%"  if best  else 'none'
         worst_str = f"{worst['symbol']} {worst['pnl_pct']:+.0f}%" if worst else 'none'
         print(f"\n  {'='*52}")
         print(f"  {self.sim_id} | {datetime.now().strftime('%H:%M:%S')}")
-        print(f"  Real portfolio:   ${rv:>10,.2f}  (cost: ${cost:,.2f} | pnl: {rp:+.2f})")
+        print(f"  Real portfolio:   ${rv:>10,.2f}  ({rv_delta:+.2f} this session)")
         print(f"  Trading capital:  ${tv:>10,.2f}  ({tp:+.2f} | {tp/max(self.starting_trading,1)*100:+.1f}%)")
         print(f"  Trades: {len(self.trades)} | W:{wins} L:{losses} | Best: {best_str} | Worst: {worst_str}")
         cash_str = ' | '.join(f"{c}:${v:.0f}" for c, v in self.cash.items() if v > 0)

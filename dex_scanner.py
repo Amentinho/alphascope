@@ -443,8 +443,13 @@ def fetch_dex_gems():
     conn.commit()
     conn.close()
 
-    # Print top gems
-    top = scored[:8]
+    # Print top gems — dedup by symbol (keep highest liquidity per symbol)
+    seen_syms = {}
+    for p in scored:
+        sym = p['symbol'].upper()
+        if sym not in seen_syms or p['liquidity_usd'] > seen_syms[sym]['liquidity_usd']:
+            seen_syms[sym] = p
+    top = sorted(seen_syms.values(), key=lambda x: -x['cross_score'])[:8]
     for p in top:
         if p['cross_score'] >= 2:
             age_str = f"{p['age_hours']:.0f}h" if p['age_hours'] < 48 else f"{p['age_hours']/24:.1f}d"
