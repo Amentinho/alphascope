@@ -1,0 +1,668 @@
+"""
+AlphaScope — Trade Simulator v1.0
+Simulates the agent with $100 native per chain for 24 hours.
+No real money. Tracks what would have been bought/sold and actual P&L.
+
+Flow:
+1. Start with virtual portfolio: $100 ETH, $100 SOL, $100 BNB
+2. Agent runs every 30 min on historical data (or live in real-time mode)
+3. Each BUY uses portion of native reserve, each SELL returns it
+4. After 24h: report total P&L, best/worst picks, win rate
+
+Two modes:
+  --live    : runs in real-time, polls every 30 min for 24h
+  --backtest: uses last 24h of stored dex_gems + prices to simulate
+"""
+
+import sqlite3
+import json
+import time
+import argparse
+from datetime import datetime, timezone, timedelta
+
+STARTING_BALANCE_USD = 200.0  # per chain ($200 native tokens)
+# Chains with trading capital (native tokens)
+# ETH is excluded — we use real portfolio positions there, no extra cash
+CHAINS = ['solana', 'bsc', 'base', 'arbitrum']
+NATIVE_TOKENS = {
+    'solana':   ('SOL',  'solana'),
+    'bsc':      ('BNB',  'binancecoin'),
+    'base':     ('ETH',  'ethereum'),
+    'arbitrum': ('ETH',  'ethereum'),
+}
+# Real portfolio positions on ETH — signals only, no new cash
+REAL_PORTFOLIO = {
+    'ethereum': [
+        {'symbol': 'LINK', 'coin_id': 'chainlink', 'amount': 90.9252,
+         'entry_price': 9.33, 'chain': 'ethereum'},
+        {'symbol': 'ETH',  'coin_id': 'ethereum',  'amount': 0.0338,
+         'entry_price': 2333.18, 'chain': 'ethereum'},
+    ],
+    'bitcoin': [
+        {'symbol': 'BTC', 'coin_id': 'bitcoin', 'amount': 0.1,
+         'entry_price': 75000, 'chain': 'bitcoin'},
+    ],
+    'solana': [
+        {'symbol': 'SOL', 'coin_id': 'solana', 'amount': 20,
+         'entry_price': 85, 'chain': 'solana'},
+    ],
+    'arbitrum': [
+        {'symbol': 'HYPE', 'coin_id': 'hyperliquid', 'amount': 10,
+         'entry_price': 38, 'chain': 'arbitrum'},
+    ],
+}
+
+
+def get_db():
+    conn = sqlite3.connect('alphascope.db', timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+
+def init_sim_tables():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS sim_portfolio (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sim_id TEXT,
+        symbol TEXT,
+        chain TEXT,
+        amount_tokens REAL,
+        buy_price_usd REAL,
+        buy_time TEXT,
+        sell_price_usd REAL,
+        sell_time TEXT,
+        pnl_usd REAL,
+        pnl_pct REAL,
+        status TEXT DEFAULT 'HOLDING',
+        signal_source TEXT,
+        notes TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sim_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sim_id TEXT UNIQUE,
+        mode TEXT,
+        start_time TEXT,
+        end_time TEXT,
+        starting_usd REAL,
+        ending_usd REAL,
+        total_pnl_usd REAL,
+        total_pnl_pct REAL,
+        trades_total INTEGER,
+        trades_won INTEGER,
+        trades_lost INTEGER,
+        best_trade TEXT,
+        worst_trade TEXT,
+        summary TEXT)''')
+    conn.commit()
+    conn.close()
+
+
+MAJORS_SET = {'BTC','ETH','SOL','BNB','XRP','ADA','DOGE','LINK','AAVE','HYPE',
+              'bitcoin','ethereum','solana','binancecoin','chainlink','hyperliquid'}
+
+def get_current_price(coin_id_or_symbol):
+    """Fetch current price — DB for majors, DexScreener for DEX tokens."""
+    sym_upper = coin_id_or_symbol.upper()
+    is_major = coin_id_or_symbol.lower() in MAJORS_SET or sym_upper in MAJORS_SET
+
+    # Majors: try DB first (kept fresh by fetcher)
+    if is_major:
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute("""SELECT price_usd FROM token_data
+                         WHERE (coin_id = ? OR UPPER(symbol) = UPPER(?))
+                         AND fetched_at >= datetime('now', '-35 minutes')
+                         ORDER BY fetched_at DESC LIMIT 1""",
+                      (coin_id_or_symbol, coin_id_or_symbol))
+            row = c.fetchone()
+            conn.close()
+            if row and row[0]:
+                return float(row[0])
+        except Exception:
+            pass
+
+    # DEX tokens: always fetch live from DexScreener
+    if not is_major:
+        try:
+            import requests as _req
+            # Try by symbol search first
+            res = _req.get(
+                f'https://api.dexscreener.com/latest/dex/search?q={coin_id_or_symbol}',
+                timeout=6)
+            if res.status_code == 200:
+                pairs = res.json().get('pairs', [])
+                # Filter to exact symbol match to avoid wrong token
+                exact = [p for p in pairs
+                         if p.get('baseToken',{}).get('symbol','').upper()
+                         == coin_id_or_symbol.upper()]
+                use_pairs = exact if exact else pairs
+                if use_pairs:
+                    # Prefer highest liquidity match
+                    best = max(use_pairs,
+                               key=lambda p: float(p.get('liquidity',{}).get('usd',0) or 0))
+                    price = float(best.get('priceUsd', 0) or 0)
+                    if price > 0:
+                        return price
+        except Exception:
+            pass
+        # Fallback: try as contract address
+        if len(coin_id_or_symbol) > 20:
+            try:
+                import requests as _req2
+                res2 = _req2.get(
+                    f'https://api.dexscreener.com/latest/dex/tokens/{coin_id_or_symbol}',
+                    timeout=6)
+                if res2.status_code == 200:
+                    pairs2 = res2.json().get('pairs', [])
+                    if pairs2:
+                        return float(pairs2[0].get('priceUsd', 0) or 0)
+            except Exception:
+                pass
+
+    # Try DexScreener for DEX tokens
+    try:
+        import requests
+        res = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{coin_id_or_symbol}',
+            timeout=8,
+        )
+        if res.status_code == 200:
+            pairs = res.json().get('pairs', [])
+            if pairs:
+                return float(pairs[0].get('priceUsd', 0) or 0)
+    except Exception:
+        pass
+
+    # Try CoinGecko
+    try:
+        import requests
+        res = requests.get(
+            'https://api.coingecko.com/api/v3/simple/price',
+            params={'ids': coin_id_or_symbol, 'vs_currencies': 'usd'},
+            timeout=8,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if coin_id_or_symbol in data:
+                return float(data[coin_id_or_symbol]['usd'])
+    except Exception:
+        pass
+
+    return 0.0
+
+
+class SimPortfolio:
+    """Virtual portfolio for simulation."""
+
+    def __init__(self, sim_id, starting_usd=STARTING_BALANCE_USD):
+        self.sim_id = sim_id
+        # Trading capital — native tokens on each chain
+        self.cash = {chain: starting_usd for chain in CHAINS}
+        # ETH chain: no trading cash, only real portfolio
+        self.cash['ethereum'] = 0
+        self.holdings = {}  # symbol -> {amount, buy_price, chain, buy_time, source}
+        self.trades = []
+        # Seed real portfolio positions (tracked but not counted as cash)
+        self._seed_real_portfolio()
+        # Starting total = trading capital + real portfolio value
+        real_value = self._get_real_portfolio_value()
+        self.starting_total = starting_usd * len(CHAINS) + real_value
+        self.starting_real_value = real_value
+        self.starting_trading_capital = starting_usd * len(CHAINS)
+
+    def _seed_real_portfolio(self):
+        """Seed holdings with real portfolio positions for signal tracking."""
+        for chain, positions in REAL_PORTFOLIO.items():
+            for pos in positions:
+                key = f"{pos['symbol']}_{pos['chain']}"
+                self.holdings[key] = {
+                    'symbol': pos['symbol'],
+                    'chain': pos['chain'],
+                    'amount': pos['amount'],
+                    'buy_price': pos['entry_price'],
+                    'buy_time': 'real_portfolio',
+                    'usd_spent': pos['amount'] * pos['entry_price'],
+                    'source': 'real_portfolio',
+                    'is_real': True,  # flag — don't count as sim trade
+                }
+
+    def _get_real_portfolio_value(self):
+        """Get current value of real portfolio positions."""
+        total = 0
+        for chain, positions in REAL_PORTFOLIO.items():
+            for pos in positions:
+                price = get_current_price(pos['symbol']) or pos['entry_price']
+                total += pos['amount'] * price
+        return total
+
+    def can_buy(self, chain, usd_amount):
+        return self.cash.get(chain, 0) >= usd_amount
+
+    def buy(self, symbol, chain, usd_amount, price, source='agent'):
+        if not self.can_buy(chain, usd_amount):
+            return False, f"insufficient {chain} balance (${self.cash.get(chain,0):.2f})"
+        if price <= 0:
+            return False, "price is zero"
+
+        tokens = usd_amount / price
+        self.cash[chain] = self.cash.get(chain, 0) - usd_amount
+
+        key = f"{symbol}_{chain}"
+        if key in self.holdings:
+            # Average in
+            existing = self.holdings[key]
+            total_tokens = existing['amount'] + tokens
+            total_cost = existing['amount'] * existing['buy_price'] + usd_amount
+            self.holdings[key]['amount'] = total_tokens
+            self.holdings[key]['buy_price'] = total_cost / total_tokens
+        else:
+            self.holdings[key] = {
+                'symbol': symbol, 'chain': chain, 'amount': tokens,
+                'buy_price': price, 'buy_time': datetime.now().isoformat(),
+                'usd_spent': usd_amount, 'source': source,
+            }
+
+        self.trades.append({
+            'action': 'BUY', 'symbol': symbol, 'chain': chain,
+            'usd': usd_amount, 'price': price, 'tokens': tokens,
+            'time': datetime.now().isoformat(), 'source': source,
+        })
+        return True, f"bought {tokens:.4f} {symbol} @ ${price:.6f} = ${usd_amount:.2f}"
+
+    def sell(self, symbol, chain, price, reason='signal'):
+        key = f"{symbol}_{chain}"
+        if key not in self.holdings:
+            return False, "not holding"
+
+        pos = self.holdings[key]
+        tokens = pos['amount']
+        sell_value = tokens * price
+        buy_value = tokens * pos['buy_price']
+        pnl = sell_value - buy_value
+        pnl_pct = (pnl / buy_value * 100) if buy_value > 0 else 0
+
+        self.cash[chain] = self.cash.get(chain, 0) + sell_value
+        del self.holdings[key]
+
+        self.trades.append({
+            'action': 'SELL', 'symbol': symbol, 'chain': chain,
+            'usd': sell_value, 'price': price, 'tokens': tokens,
+            'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason,
+            'time': datetime.now().isoformat(),
+        })
+        return True, f"sold {tokens:.4f} {symbol} @ ${price:.6f} = ${sell_value:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
+
+    def get_total_value(self, prices=None):
+        """Calculate total portfolio value (trading capital + real portfolio)."""
+        total = sum(self.cash.values())
+        for key, pos in self.holdings.items():
+            symbol = pos['symbol']
+            price = get_current_price(symbol) or pos['buy_price']
+            total += pos['amount'] * price
+        return total
+
+    def get_trading_value(self):
+        """Trading capital only — excludes real portfolio."""
+        total = sum(self.cash.values())
+        for key, pos in self.holdings.items():
+            if pos.get('is_real'):
+                continue
+            price = get_current_price(pos['symbol']) or pos['buy_price']
+            total += pos['amount'] * price
+        return total
+
+    def get_summary(self, prices=None):
+        total_value = self.get_total_value(prices)
+        pnl = total_value - self.starting_total
+        pnl_pct = (pnl / self.starting_total * 100) if self.starting_total > 0 else 0
+
+        sells = [t for t in self.trades if t['action'] == 'SELL']
+        wins = [t for t in sells if t.get('pnl', 0) > 0]
+        losses = [t for t in sells if t.get('pnl', 0) <= 0]
+
+        best = max(sells, key=lambda t: t.get('pnl_pct', 0), default=None)
+        worst = min(sells, key=lambda t: t.get('pnl_pct', 0), default=None)
+
+        open_positions = []
+        for key, pos in self.holdings.items():
+            current = get_current_price(pos['symbol']) or pos['buy_price']
+            pos_pnl = (current - pos['buy_price']) / pos['buy_price'] * 100
+            open_positions.append({
+                'symbol': pos['symbol'], 'chain': pos['chain'],
+                'buy_price': pos['buy_price'], 'current_price': current,
+                'pnl_pct': pos_pnl, 'value_usd': pos['amount'] * current,
+            })
+
+        return {
+            'sim_id': self.sim_id,
+            'starting_usd': self.starting_total,
+            'current_value': total_value,
+            'pnl_usd': pnl,
+            'pnl_pct': pnl_pct,
+            'cash_by_chain': dict(self.cash),
+            'open_positions': open_positions,
+            'total_trades': len(self.trades),
+            'wins': len(wins),
+            'losses': len(losses),
+            'win_rate': len(wins) / max(len(sells), 1) * 100,
+            'best_trade': f"{best['symbol']} +{best['pnl_pct']:.1f}%" if best else 'none',
+            'worst_trade': f"{worst['symbol']} {worst['pnl_pct']:.1f}%" if worst else 'none',
+        }
+
+    def print_status(self, prices=None):
+        s = self.get_summary(prices)
+        pnl_emoji = '🟢' if s['pnl_usd'] >= 0 else '🔴'
+        trading_val = self.get_trading_value()
+        trading_pnl = trading_val - self.starting_trading_capital
+        real_val = self._get_real_portfolio_value()
+        real_pnl = real_val - self.starting_real_value
+        print(f"\n  {'='*50}")
+        print(f"  SIM {self.sim_id} | {datetime.now().strftime('%H:%M:%S')}")
+        print(f"  Real portfolio: ${real_val:,.2f} ({real_pnl:+.2f} since start)")
+        print(f"  Trading capital: ${trading_val:.2f} | Start: ${self.starting_trading_capital:.2f}")
+        print(f"  {pnl_emoji} Trading P&L: ${trading_pnl:+.2f} ({trading_pnl/max(self.starting_trading_capital,1)*100:+.1f}%)")
+        print(f"  Trades: {s['total_trades']} | W:{s['wins']} L:{s['losses']} | Win rate: {s['win_rate']:.0f}%")
+        print(f"  Best: {s['best_trade']} | Worst: {s['worst_trade']}")
+        print(f"  Cash: " + " | ".join(f"{c}:${v:.2f}" for c, v in s['cash_by_chain'].items()))
+        if s['open_positions']:
+            print(f"  Open positions:")
+            for p in s['open_positions']:
+                pnl_e = '🟢' if p['pnl_pct'] >= 0 else '🔴'
+                print(f"    {pnl_e} {p['symbol']} ({p['chain']}) "
+                      f"${p['value_usd']:.2f} | {p['pnl_pct']:+.1f}%")
+        print(f"  {'='*50}")
+
+
+def run_agent_cycle(portfolio, cycle_num=0, stop_loss_pct=-30, take_profit_pct=150):
+    """Run one agent cycle against the sim portfolio."""
+    import sys
+    sys.path.insert(0, '.')
+
+    try:
+        from wallet_agent import _load_all_candidates, evaluate_signals
+        candidates = _load_all_candidates()
+    except Exception as e:
+        print(f"    Agent load failed: {e}")
+        return 0
+
+    actions_taken = 0
+
+    # Check stop-loss and take-profit on open positions
+    for key in list(portfolio.holdings.keys()):
+        pos = portfolio.holdings[key]
+        symbol = pos['symbol']
+        chain = pos['chain']
+        current_price = get_current_price(symbol)
+        if current_price <= 0:
+            current_price = pos['buy_price']
+
+        pnl_pct = (current_price - pos['buy_price']) / pos['buy_price'] * 100
+
+        if pnl_pct <= stop_loss_pct:
+            ok, msg = portfolio.sell(symbol, chain, current_price, reason='stop_loss')
+            if ok:
+                print(f"    🛑 STOP-LOSS {symbol}: {pnl_pct:.1f}% | {msg}")
+                actions_taken += 1
+        elif pnl_pct >= take_profit_pct:
+            ok, msg = portfolio.sell(symbol, chain, current_price, reason='take_profit')
+            if ok:
+                print(f"    💰 TAKE-PROFIT {symbol}: +{pnl_pct:.1f}% | {msg}")
+                actions_taken += 1
+
+    # Get agent proposals and execute in sim
+    try:
+        proposals = evaluate_signals()
+    except Exception as e:
+        print(f"    evaluate_signals failed: {e}")
+        return actions_taken
+
+    for p in proposals:
+        action = p.get('action')
+        symbol = p.get('symbol', '')
+        chain = p.get('chain', 'solana')
+        trade_usd = p.get('trade_usd', 0)
+
+        if action == 'SKIP' or not symbol or trade_usd <= 0:
+            continue
+
+        # Get current price — always fetch live for DEX tokens
+        price = get_current_price(symbol)
+        if price <= 0:
+            # Try coin_id as fallback
+            price = get_current_price(p.get('coin_id', symbol))
+        if price <= 0:
+            continue  # skip if no price available
+
+        # Cap trade size for simulation
+        sim_trade_usd = min(trade_usd, 50)  # max $50 per trade in sim
+
+        if action in ('BUY', 'ACCUMULATE'):
+            key = f"{symbol}_{chain}"
+            if key in portfolio.holdings:
+                existing = portfolio.holdings[key]
+                if existing.get('is_real'):
+                    pass  # real position — allow accumulate signal but skip sim buy
+                continue  # already holding
+            # Don't buy on ETH chain — no trading cash there
+            if chain == 'ethereum' and p.get('category') == 'DEX_GEM':
+                continue  # ETH chain reserved for real portfolio management
+            # Store contract address for later price lookup
+            p['_contract'] = p.get('coin_id', '') if len(p.get('coin_id','')) > 20 else ''
+            # Max 2 open DEX gem positions per chain
+            chain_positions = [k for k in portfolio.holdings
+                               if k.endswith(f'_{chain}')]
+            if len(chain_positions) >= 2:
+                continue  # chain full
+            # Don't re-buy tokens that were stop-lossed this sim
+            closed = [t for t in portfolio.trades
+                      if t['action'] == 'SELL'
+                      and t['symbol'] == symbol
+                      and t.get('reason') == 'stop_loss']
+            if closed:
+                continue  # stop-lossed — don't re-enter
+            ok, msg = portfolio.buy(symbol, chain, sim_trade_usd, price,
+                                   source=p.get('sources', 'agent'))
+            if ok:
+                print(f"    🟢 SIM BUY {symbol} ${sim_trade_usd:.0f} @ ${price:.6f} | {p.get('reasons','')[:50]}")
+                actions_taken += 1
+
+        elif action in ('SELL', 'REDUCE') and f"{symbol}_{chain}" in portfolio.holdings:
+            ok, msg = portfolio.sell(symbol, chain, price, reason=action.lower())
+            if ok:
+                print(f"    🔴 SIM SELL {symbol} | {msg}")
+                actions_taken += 1
+
+    return actions_taken
+
+
+def save_sim_results(portfolio):
+    """Save simulation results to DB."""
+    summary = portfolio.get_summary()
+    conn = get_db()
+    c = conn.cursor()
+
+    # Save trades
+    # Only insert trades not already saved
+    c.execute('SELECT COUNT(*) FROM sim_portfolio WHERE sim_id=?', (portfolio.sim_id,))
+    already_saved = c.fetchone()[0]
+    new_trades = portfolio.trades[already_saved:]
+
+    for t in new_trades:
+        pnl = t.get('pnl', 0)
+        pnl_pct = t.get('pnl_pct', 0)
+        if t['action'] == 'BUY':
+            key = f"{t['symbol']}_{t['chain']}"
+            buy_price = t['price']
+            sell_price = 0
+            status = 'HOLDING'
+        else:
+            buy_price = 0
+            sell_price = t['price']
+            status = 'CLOSED'
+
+        try:
+            c.execute('''INSERT INTO sim_portfolio
+                (sim_id, symbol, chain, amount_tokens, buy_price_usd, buy_time,
+                 sell_price_usd, sell_time, pnl_usd, pnl_pct, status, signal_source)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (portfolio.sim_id, t['symbol'], t['chain'], t.get('tokens', 0),
+                 buy_price if t['action'] == 'BUY' else 0,
+                 t['time'] if t['action'] == 'BUY' else None,
+                 sell_price if t['action'] == 'SELL' else 0,
+                 t['time'] if t['action'] == 'SELL' else None,
+                 pnl, pnl_pct, status, t.get('source', '')))
+        except Exception:
+            pass
+
+    # Save run summary
+    try:
+        c.execute('''INSERT OR REPLACE INTO sim_runs
+            (sim_id, mode, start_time, end_time, starting_usd, ending_usd,
+             total_pnl_usd, total_pnl_pct, trades_total, trades_won, trades_lost,
+             best_trade, worst_trade, summary)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (portfolio.sim_id, 'LIVE', portfolio.trades[0]['time'] if portfolio.trades else datetime.now().isoformat(),
+             datetime.now().isoformat(), summary['starting_usd'], summary['current_value'],
+             summary['pnl_usd'], summary['pnl_pct'], summary['total_trades'],
+             summary['wins'], summary['losses'], summary['best_trade'],
+             summary['worst_trade'], json.dumps(summary)))
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+
+
+def run_live_simulation(duration_hours=24, cycle_minutes=30,
+                        stop_loss_pct=-30, take_profit_pct=150):
+    """
+    Run live simulation for specified duration.
+    Polls agent every cycle_minutes, tracks real price movements.
+    """
+    init_sim_tables()
+    sim_id = f"SIM_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    portfolio = SimPortfolio(sim_id, STARTING_BALANCE_USD)
+
+    total_cycles = int(duration_hours * 60 / cycle_minutes)
+    end_time = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
+
+    print(f"\n{'='*60}")
+    print(f"  AlphaScope Trade Simulation")
+    print(f"  Sim ID: {sim_id}")
+    print(f"  Starting capital: ${STARTING_BALANCE_USD * len(CHAINS):.0f} "
+          f"(${STARTING_BALANCE_USD} × {len(CHAINS)} chains)")
+    print(f"  Duration: {duration_hours}h | Cycle: {cycle_minutes}min")
+    print(f"  Stop-loss: {stop_loss_pct}% | Take-profit: +{take_profit_pct}%")
+    print(f"  End time: {end_time.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"{'='*60}\n")
+
+    cycle = 0
+    while datetime.now(timezone.utc) < end_time:
+        cycle += 1
+        elapsed_h = (cycle * cycle_minutes) / 60
+        print(f"\n  --- Cycle {cycle}/{total_cycles} | +{elapsed_h:.1f}h ---")
+
+        # Fast refresh for short cycles, full fetch for long cycles
+        try:
+            if cycle_minutes <= 10:
+                # Fast path: only refresh DEX gems + social signals
+                print("  Fast refresh (DEX + social)...")
+                try:
+                    from dex_scanner import fetch_dex_gems
+                    fetch_dex_gems()
+                except Exception as e:
+                    print(f"  DEX refresh failed: {e}")
+                try:
+                    from social_monitor import run_social_monitoring
+                    run_social_monitoring()
+                except Exception as e:
+                    print(f"  Social refresh failed: {e}")
+                try:
+                    from portfolio import run_portfolio_signals
+                    run_portfolio_signals()
+                except Exception as e:
+                    print(f"  Portfolio refresh failed: {e}")
+            else:
+                # Full fetch for 30-min cycles
+                import subprocess
+                print("  Fetching fresh data...")
+                result = subprocess.run(
+                    ['python3', 'fetcher.py'],
+                    capture_output=True, text=True, timeout=300
+                )
+                for line in result.stdout.split('\n'):
+                    if any(x in line for x in ['Coin buzz', 'DEX gems', 'Social', 'Security', 'Portfolio']):
+                        print(f"  {line.strip()}")
+        except Exception as e:
+            print(f"  Fetch skipped: {e}")
+
+        # Run agent cycle
+        print(f"  Running agent...")
+        actions = run_agent_cycle(portfolio, cycle, stop_loss_pct, take_profit_pct)
+        print(f"  Actions taken: {actions}")
+
+        # Print portfolio status
+        portfolio.print_status()
+
+        # Save progress
+        save_sim_results(portfolio)
+
+        # Wait for next cycle
+        if datetime.now(timezone.utc) < end_time:
+            wait_seconds = cycle_minutes * 60
+            print(f"\n  Next cycle in {cycle_minutes} min... (Ctrl+C to stop)")
+            try:
+                time.sleep(wait_seconds)
+            except KeyboardInterrupt:
+                print("\n  Simulation interrupted by user")
+                break
+
+    # Final report
+    print(f"\n{'='*60}")
+    print(f"  SIMULATION COMPLETE — {sim_id}")
+    portfolio.print_status()
+    summary = portfolio.get_summary()
+    print(f"\n  FINAL SUMMARY:")
+    print(f"  Started with: ${summary['starting_usd']:.2f}")
+    print(f"  Ended with:   ${summary['current_value']:.2f}")
+    pnl_emoji = '🟢' if summary['pnl_usd'] >= 0 else '🔴'
+    print(f"  {pnl_emoji} Total P&L: ${summary['pnl_usd']:+.2f} ({summary['pnl_pct']:+.1f}%)")
+    print(f"  Win rate: {summary['win_rate']:.0f}% ({summary['wins']}W / {summary['losses']}L)")
+    print(f"  Best: {summary['best_trade']}")
+    print(f"  Worst: {summary['worst_trade']}")
+    print(f"{'='*60}")
+
+    save_sim_results(portfolio)
+    return summary
+
+
+def run_quick_test(cycles=3, cycle_minutes=1):
+    """Quick test mode — runs 3 cycles 1 min apart to verify everything works."""
+    print("Running quick test (3 cycles, 1 min apart)...")
+    return run_live_simulation(
+        duration_hours=cycles/60,
+        cycle_minutes=cycle_minutes,
+        stop_loss_pct=-30,
+        take_profit_pct=150,
+    )
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='AlphaScope Trade Simulator')
+    parser.add_argument('--hours', type=float, default=24, help='Simulation duration in hours')
+    parser.add_argument('--cycle', type=int, default=30, help='Cycle interval in minutes')
+    parser.add_argument('--stop-loss', type=float, default=-30, help='Stop-loss pct')
+    parser.add_argument('--take-profit', type=float, default=150, help='Take-profit pct')
+    parser.add_argument('--test', action='store_true', help='Quick 3-cycle test')
+    args = parser.parse_args()
+
+    if args.test:
+        run_quick_test()
+    else:
+        run_live_simulation(
+            duration_hours=args.hours,
+            cycle_minutes=args.cycle,
+            stop_loss_pct=args.stop_loss,
+            take_profit_pct=args.take_profit,
+        )
