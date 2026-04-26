@@ -515,6 +515,13 @@ def evaluate_signals():
     # Sort by alpha_score descending
     sorted_candidates = sorted(candidates.values(), key=lambda x: -x['alpha_score'])
 
+    # Debug: log SOL/BSC candidates before filtering
+    sol_cands = [c for c in sorted_candidates if c.get('chain') in ('solana','bsc')]
+    if sol_cands:
+        print("    [agent] SOL/BSC: " + ", ".join(
+            f"{c['symbol']}(a:{c['alpha_score']},s:{c['signal']},c:{c['confidence']})"
+            for c in sol_cands[:6]))
+
     proposals = []
     seen_symbols = set()
 
@@ -535,6 +542,8 @@ def evaluate_signals():
 
         # Skip low confidence
         if confidence < min_conf and signal not in ('SELL',):
+            if chain in ('solana', 'bsc'):
+                print(f"    [agent] SKIP {sym}({chain}): conf {confidence} < {min_conf}")
             continue
 
         # Skip AVOID signals (hacked non-holdings)

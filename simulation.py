@@ -56,11 +56,12 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
     """Fetch live price. Returns 0.0 if unavailable."""
     sym = symbol.upper()
     cache_key = f"{sym}_{chain}"
-    
-    # Cache for 90 seconds to avoid hammering APIs
+
+    # Cache for 4 minutes — long enough to avoid hammering within a cycle,
+    # short enough to get fresh prices each 5-min sim cycle
     if use_cache and cache_key in _price_cache:
         cached_price, cached_time = _price_cache[cache_key]
-        if time.time() - cached_time < 90 and cached_price > 0:
+        if time.time() - cached_time < 240 and cached_price > 0:
             return cached_price
 
     price = 0.0
@@ -602,11 +603,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if not portfolio.can_buy(chain, trade_usd):
             continue
 
-        # Use stored price from proposal as fast-path, then verify with live fetch
-        price = p.get('price_usd', 0) or 0
-        live_price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain, use_cache=False)
-        if live_price and live_price > 0:
-            price = live_price
+        # Always fetch live price — never trust stale DB price_usd
+        price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain, use_cache=False)
         if not price or price <= 0:
             print(f"    SKIP {sym} -- price unavailable on {chain}")
             continue
@@ -653,6 +651,9 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
         cycle += 1
         elapsed = cycle * cycle_min / 60
         print(f"\n  --- Cycle {cycle}/{total_cycles} | +{elapsed:.1f}h ---")
+
+        # Clear price cache each cycle — forces fresh API fetch for all prices
+        _price_cache.clear()
 
         try:
             if cycle_min <= 10:
