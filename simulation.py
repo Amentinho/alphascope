@@ -258,7 +258,8 @@ class SimPortfolio:
             else:
                 pos['_zero_count'] = 0
             pnl_pct = (price - pos['buy_price']) / pos['buy_price'] * 100
-            if pnl_pct <= stop_loss:
+            effective_stop = -20 if chain in ('solana', 'bsc') else stop_loss
+            if pnl_pct <= effective_stop:
                 ok, msg = self.sell(sym, chain, price, 'stop_loss')
                 if ok:
                     print(f"    STOP-LOSS {sym}: {pnl_pct:.1f}% | {msg}")
@@ -381,7 +382,8 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                 else:
                     pos['_zero_count'] = 0
                 pnl_pct = (price - pos['buy_price']) / pos['buy_price'] * 100
-                if pnl_pct <= stop_loss:
+                effective_stop = -20 if chain in ('solana', 'bsc') else stop_loss
+                if pnl_pct <= effective_stop:
                     ok, msg = portfolio.sell(sym, chain, price, 'stop_loss')
                     if ok:
                         print(f"\n    [MONITOR] STOP-LOSS {sym}: {pnl_pct:.1f}%")
