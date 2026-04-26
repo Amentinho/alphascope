@@ -553,7 +553,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         print(f"    DB proposals empty — using live fallback signals")
         proposals = _fallback_signals()
     else:
-        print(f"    wallet_agent: {len(actionable)} actionable proposals")
+        print(f"    wallet_agent: {len(actionable)} proposals — "
+              + " | ".join(f"{p['action']} {p['symbol']}({p.get('chain','?')[:3]})" for p in actionable[:8]))
 
     stop_lossed = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
                    if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
@@ -601,12 +602,16 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if not portfolio.can_buy(chain, trade_usd):
             continue
 
-        price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain, use_cache=False)
+        # Use stored price from proposal as fast-path, then verify with live fetch
+        price = p.get('price_usd', 0) or 0
+        live_price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain, use_cache=False)
+        if live_price and live_price > 0:
+            price = live_price
         if not price or price <= 0:
             print(f"    SKIP {sym} -- price unavailable on {chain}")
             continue
-        if price < 1e-9:
-            print(f'    SKIP {sym} -- price too low (${price:.2e})')
+        if price < 1e-6:
+            print(f'    SKIP {sym} -- price dust (${price:.2e})')
             continue
 
         ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'))

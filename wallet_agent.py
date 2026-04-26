@@ -95,7 +95,7 @@ def init_agent_tables():
         ('max_gas_usd', str(MAX_GAS_USD)),
         ('max_slippage_pct', str(MAX_SLIPPAGE_PCT)),
         ('daily_loss_limit_usd', str(DAILY_LOSS_LIMIT_USD)),
-        ('min_signal_confidence', str(MIN_SIGNAL_CONFIDENCE)),
+        ('min_signal_confidence', '60'),
         ('enabled', 'false'),
         ('wallet_address', ''),
     ]
@@ -293,8 +293,8 @@ def _load_all_candidates():
                       social_buzz, pre_launch_match, dex_url, contract_address
                FROM dex_gems
                WHERE fetched_at >= datetime('now', '-24 hours')
-               AND cross_score >= 5
-               ORDER BY cross_score DESC, liquidity_usd DESC LIMIT 25""", conn)
+               AND cross_score >= 4
+               ORDER BY cross_score DESC, liquidity_usd DESC LIMIT 30""", conn)
         for _, r in dex.iterrows():
             sym = r['symbol'].upper()
             if sym in MAJORS:
