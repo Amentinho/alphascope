@@ -125,6 +125,81 @@ def load_sentiment():
     conn.close()
     return df
 
+
+def load_sim_portfolio():
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT sim_id FROM sim_runs ORDER BY start_time DESC LIMIT 1").fetchone()
+        if not row:
+            conn.close()
+            return pd.DataFrame(), None
+        sim_id = row[0]
+        df = pd.read_sql_query(
+            """SELECT symbol, chain, buy_price_usd, sell_price_usd, amount_tokens,
+                      pnl_usd, pnl_pct, status, signal_source, buy_time
+               FROM sim_portfolio WHERE sim_id=? AND buy_price_usd > 0
+               GROUP BY symbol, chain HAVING MAX(id)
+               ORDER BY CASE status WHEN 'HOLDING' THEN 0 ELSE 1 END, pnl_pct DESC""",
+            conn, params=(sim_id,))
+        run = pd.read_sql_query("SELECT * FROM sim_runs WHERE sim_id=?", conn, params=(sim_id,))
+        conn.close()
+        return df, run.iloc[0] if not run.empty else None
+    except Exception:
+        return pd.DataFrame(), None
+
+def load_agent_trades():
+    try:
+        conn = get_db()
+        df = pd.read_sql_query(
+            """SELECT symbol, chain, action, amount_usd, price_usd, signal_confidence,
+                      mode, status, pnl_usd, notes, created_at
+               FROM agent_trades ORDER BY created_at DESC LIMIT 30""", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def load_watchlist():
+    try:
+        conn = get_db()
+        df = pd.read_sql_query(
+            """SELECT symbol, name, chain, current_price, price_change_24h,
+                      alert_type, alert_detail, dex_launched, presale_found,
+                      listing_found, updated_at
+               FROM project_watchlist ORDER BY updated_at DESC LIMIT 30""", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def load_dex_gems():
+    try:
+        conn = get_db()
+        df = pd.read_sql_query(
+            """SELECT symbol, name, chain, dex, price_usd, liquidity_usd,
+                      volume_24h, price_change_24h, age_hours, cross_score,
+                      social_buzz, dex_url
+               FROM dex_gems
+               WHERE fetched_at >= datetime('now', '-24 hours')
+               AND cross_score >= 3
+               ORDER BY cross_score DESC, liquidity_usd DESC LIMIT 25""", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def load_token_validations():
+    try:
+        conn = get_db()
+        df = pd.read_sql_query(
+            """SELECT symbol, chain, verdict, total_score, is_honeypot,
+                      sell_tax_pct, lp_burned, top10_holders_pct, cached_at
+               FROM token_validation ORDER BY cached_at DESC LIMIT 20""", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
 # ============================================================
 # AI BRIEF
 # ============================================================
@@ -279,9 +354,11 @@ app.layout = html.Div(style={
                    'borderRadius': '4px', 'color': '#888', 'cursor': 'pointer', 'fontSize': '11px',
                    'fontFamily': 'inherit'})
         for tab, label in [
-            ('buzz', '🔥 Coin Buzz'), ('gems', '💎 Gems'), ('narratives', '📡 Narratives'),
+            ('portfolio', '💼 Portfolio'), ('agent', '🤖 Agent'), ('watchlist', '👁 Watchlist'),
+            ('dexgems', '💎 DEX Gems'), ('alpha', '🎯 Alpha'), ('airdrops2', '🪂 Airdrops'),
+            ('buzz', '🔥 Buzz'), ('narratives', '📡 Narratives'),
             ('listings', '🏦 Listings'), ('whales', '🐋 Whales'), ('news', '📰 News'),
-            ('macro', '🏦 Macro'), ('reddit', '💬 Reddit'), ('x', '🐦 X/Twitter'),
+            ('macro', '🏦 Macro'), ('reddit', '💬 Reddit'), ('x', '🐦 X'),
         ]
     ]),
 
@@ -289,7 +366,7 @@ app.layout = html.Div(style={
 
     # Footer
     html.Div(style={'textAlign': 'center', 'color': '#333', 'fontSize': '10px', 'letterSpacing': '2px'}, children=[
-        html.P("ALPHASCOPE v2.2 — AMENTINHO"),
+        html.P("ALPHASCOPE v2.3 — AMENTINHO"),
     ]),
 ])
 
@@ -489,7 +566,7 @@ def update_main(_):
 # ============================================================
 @app.callback(
     [Output('detail-panel', 'children'), Output('detail-panel', 'style')],
-    [Input(f'tab-{t}', 'n_clicks') for t in ['buzz','gems','narratives','listings','whales','news','macro','reddit','x']],
+    [Input(f'tab-{t}', 'n_clicks') for t in ['portfolio','agent','watchlist','dexgems','alpha','airdrops2','buzz','narratives','listings','whales','news','macro','reddit','x']],
     prevent_initial_call=True
 )
 def show_detail(*clicks):
@@ -500,7 +577,156 @@ def show_detail(*clicks):
     tab = ctx.triggered[0]['prop_id'].split('.')[0].replace('tab-', '')
     style = {**CARD, 'display': 'block', 'marginBottom': '20px'}
     
-    if tab == 'buzz':
+    if tab == 'portfolio':
+        df, run = load_sim_portfolio()
+        items = [html.H3("💼 Sim Portfolio — Latest Run", style={'color': '#00d4ff', 'marginBottom': '10px'})]
+        if run is not None:
+            pnl = run.get('total_pnl_usd', 0) or 0
+            col = '#00cc44' if pnl >= 0 else '#ff4444'
+            items.append(html.Div(style={'display':'flex','gap':'20px','marginBottom':'12px','flexWrap':'wrap'}, children=[
+                html.Span(f"ID: {run.get('sim_id','?')}", style={'color':'#888','fontSize':'11px'}),
+                html.Span(f"P&L: ${pnl:+,.2f}", style={'color':col,'fontWeight':'bold'}),
+                html.Span(f"Trades: {run.get('trades_total',0)}W  {run.get('trades_won',0)}W/{run.get('trades_lost',0)}L", style={'color':'#888','fontSize':'11px'}),
+                html.Span(f"Best: {run.get('best_trade','—')}", style={'color':'#00cc44','fontSize':'11px'}),
+            ]))
+        if df.empty:
+            items.append(html.P("No sim trades yet — run simulation.py first", style={'color':'#666'}))
+        for _, r in df.iterrows():
+            pnl = r.get('pnl_usd') or 0
+            pct = r.get('pnl_pct') or 0
+            col = '#00cc44' if pnl >= 0 else '#ff4444'
+            status_col = '#ffdd00' if r['status'] == 'HOLDING' else '#888'
+            items.append(html.Div(style={'display':'flex','justifyContent':'space-between','padding':'6px 0','borderBottom':'1px solid #2a2a4a','flexWrap':'wrap','gap':'8px'}, children=[
+                html.Span(f"{r['symbol']} ({r['chain']})", style={'color':'#fff','fontWeight':'bold','minWidth':'120px'}),
+                html.Span(f"${r['buy_price_usd']:.4f}", style={'color':'#888','fontSize':'11px'}),
+                html.Span(f"P&L: ${pnl:+.2f} ({pct:+.1f}%)", style={'color':col,'fontSize':'12px'}),
+                html.Span(r['status'], style={'color':status_col,'fontSize':'11px'}),
+            ]))
+        return items, style
+
+    elif tab == 'agent':
+        df = load_agent_trades()
+        items = [html.H3("🤖 Agent Trade Log", style={'color':'#00d4ff','marginBottom':'10px'})]
+        if df.empty:
+            items.append(html.P("No agent trades recorded yet", style={'color':'#666'}))
+        for _, r in df.iterrows():
+            pnl = r.get('pnl_usd') or 0
+            col = '#00cc44' if r['action'] == 'BUY' else '#ff6b6b'
+            items.append(html.Div(style={'display':'flex','justifyContent':'space-between','padding':'5px 0','borderBottom':'1px solid #2a2a4a','flexWrap':'wrap','gap':'6px'}, children=[
+                html.Span(f"{r['action']} {r['symbol']}", style={'color':col,'fontWeight':'bold','minWidth':'80px'}),
+                html.Span(f"{r['chain']}", style={'color':'#888','fontSize':'11px','minWidth':'70px'}),
+                html.Span(f"${r.get('amount_usd',0):.0f} @ ${r.get('price_usd',0):.6f}", style={'color':'#ccc','fontSize':'11px'}),
+                html.Span(f"P&L: ${pnl:+.2f}", style={'color':'#00cc44' if pnl>=0 else '#ff4444','fontSize':'11px'}),
+                html.Span(str(r.get('created_at',''))[:16], style={'color':'#555','fontSize':'10px'}),
+            ]))
+        return items, style
+
+    elif tab == 'watchlist':
+        df = load_watchlist()
+        items = [html.H3("👁 Project Watchlist", style={'color':'#cc44ff','marginBottom':'10px'})]
+        if df.empty:
+            items.append(html.P("Watchlist empty — project_watchlist.py populates this", style={'color':'#666'}))
+        for _, r in df.iterrows():
+            alerts = []
+            if r.get('dex_launched'): alerts.append('🟢 DEX LIVE')
+            if r.get('presale_found'): alerts.append('🟡 PRESALE')
+            if r.get('listing_found'): alerts.append('🏦 LISTING')
+            p = r.get('current_price') or 0
+            chg = r.get('price_change_24h') or 0
+            col = '#00cc44' if chg >= 0 else '#ff4444'
+            items.append(html.Div(style={'padding':'6px 0','borderBottom':'1px solid #2a2a4a'}, children=[
+                html.Div(style={'display':'flex','justifyContent':'space-between','flexWrap':'wrap','gap':'6px'}, children=[
+                    html.Span(f"{r.get('symbol','?')} ({r.get('chain','?')})", style={'color':'#fff','fontWeight':'bold'}),
+                    html.Span(f"${p:.6f} ({chg:+.1f}%)" if p else "price N/A", style={'color':col,'fontSize':'12px'}),
+                    html.Span(' '.join(alerts) if alerts else '', style={'color':'#ffdd00','fontSize':'11px'}),
+                ]),
+                html.P(str(r.get('alert_detail',''))[:100], style={'color':'#666','fontSize':'11px','margin':'2px 0 0'}),
+            ]))
+        return items, style
+
+    elif tab == 'dexgems':
+        df = load_dex_gems()
+        val_df = load_token_validations()
+        val_map = {}
+        if not val_df.empty:
+            for _, v in val_df.iterrows():
+                val_map[f"{v['symbol']}_{v['chain']}"] = v
+        items = [html.H3("💎 DEX Gems (Live)", style={'color':'#ff6b6b','marginBottom':'10px'})]
+        if df.empty:
+            items.append(html.P("No gems yet — run fetcher.py first", style={'color':'#666'}))
+        for _, r in df.iterrows():
+            liq = r.get('liquidity_usd') or 0
+            vol = r.get('volume_24h') or 0
+            age = r.get('age_hours') or 0
+            score = r.get('cross_score') or 0
+            chg = r.get('price_change_24h') or 0
+            col = '#00cc44' if chg >= 0 else '#ff4444'
+            vk = f"{r['symbol']}_{r['chain']}"
+            verdict = val_map.get(vk, {})
+            v_color = {'SAFE':'#00cc44','WATCH':'#ffdd00','CAUTION':'#ff8c00','AVOID':'#ff4444'}.get(str(verdict.get('verdict','')), '#888')
+            v_label = verdict.get('verdict', '—') if verdict else '—'
+            items.append(html.Div(style={'padding':'7px 0','borderBottom':'1px solid #2a2a4a'}, children=[
+                html.Div(style={'display':'flex','justifyContent':'space-between','flexWrap':'wrap','gap':'6px'}, children=[
+                    html.Span(f"{r['symbol']} ({r['chain']})", style={'color':'#ff6b6b','fontWeight':'bold'}),
+                    html.Span(f"score:{score}", style={'color':'#ffdd00','fontSize':'11px'}),
+                    html.Span(f"liq:${liq/1000:.0f}k vol:${vol/1000:.0f}k", style={'color':'#888','fontSize':'11px'}),
+                    html.Span(f"{chg:+.1f}%", style={'color':col,'fontSize':'11px'}),
+                    html.Span(f"age:{age:.0f}h", style={'color':'#555','fontSize':'11px'}),
+                    html.Span(v_label, style={'color':v_color,'fontSize':'11px','fontWeight':'bold'}),
+                ]),
+                html.A(r.get('dex_url',''), href=r.get('dex_url',''), target='_blank',
+                    style={'color':'#444','fontSize':'10px','textDecoration':'none'}) if r.get('dex_url') else html.Span(''),
+            ]))
+        return items, style
+
+    elif tab == 'alpha':
+        gems = load_hidden_gems()
+        buzz = load_coin_buzz()
+        listings = load_exchange_listings()
+        items = [html.H3("🎯 Alpha Signals", style={'color':'#00d4ff','marginBottom':'10px'})]
+        items.append(html.H4("Hidden Gems", style={'color':'#888','fontSize':'12px'}))
+        for _, r in gems.iterrows():
+            items.append(html.Div(style={'padding':'6px 0','borderBottom':'1px solid #2a2a4a'}, children=[
+                html.Span(f"{r['name']} ({r['symbol']})", style={'color':'#ff6b6b','fontWeight':'bold'}),
+                html.Span(f" #{int(r['market_cap_rank'])}" if pd.notna(r.get('market_cap_rank')) else "", style={'color':'#ffdd00','fontSize':'12px'}),
+                html.P(r['signal_detail'], style={'color':'#888','fontSize':'12px','margin':'2px 0 0'}),
+            ]))
+        items.append(html.H4("Top Buzz", style={'color':'#888','fontSize':'12px','marginTop':'12px'}))
+        for _, r in buzz.head(8).iterrows():
+            sent = r['avg_sentiment'] or 0
+            col = '#00cc44' if sent > 0.1 else '#ff4444' if sent < -0.1 else '#ffdd00'
+            items.append(html.Div(style={'display':'flex','justifyContent':'space-between','padding':'4px 0','borderBottom':'1px solid #1a1a3a'}, children=[
+                html.Span(r['coin'], style={'color':'#fff','fontWeight':'bold'}),
+                html.Span(f"{r['mention_count']} mentions", style={'color':'#888','fontSize':'11px'}),
+                html.Span(f"sent:{sent:+.2f}", style={'color':col,'fontSize':'11px'}),
+            ]))
+        items.append(html.H4("Exchange Listings", style={'color':'#888','fontSize':'12px','marginTop':'12px'}))
+        for _, r in listings.head(5).iterrows():
+            items.append(html.Div(style={'padding':'4px 0','borderBottom':'1px solid #1a1a3a'}, children=[
+                html.Span(f"{r['exchange']} — {r.get('coin','')}", style={'color':'#ffdd00','fontSize':'12px','fontWeight':'bold'}),
+                html.P(clean_html(r['title'][:100]), style={'color':'#888','fontSize':'11px','margin':'2px 0 0'}),
+            ]))
+        return items, style
+
+    elif tab == 'airdrops2':
+        airdrops = load_airdrops()
+        items = [html.H3("🪂 Airdrop Pipeline", style={'color':'#cc44ff','marginBottom':'10px'})]
+        if airdrops.empty:
+            items.append(html.P("No airdrops yet — airdrop_intel.py populates this", style={'color':'#666'}))
+        for _, r in airdrops.iterrows():
+            items.append(html.Div(style={'padding':'8px 0','borderBottom':'1px solid #2a2a4a'}, children=[
+                html.Div(style={'display':'flex','justifyContent':'space-between','flexWrap':'wrap','gap':'6px'}, children=[
+                    html.Span(r['project_name'], style={'color':'#cc44ff','fontWeight':'bold'}),
+                    effort_badge(r.get('effort_level','')),
+                    html.Span(f"legit:{r.get('legitimacy_score','?')}/10", style={'color':'#ffdd00','fontSize':'11px'}),
+                    html.Span(r.get('status',''), style={'color':'#888','fontSize':'11px'}),
+                ]),
+                html.P(str(r.get('qualification_steps',''))[:120], style={'color':'#888','fontSize':'11px','margin':'3px 0 0'}),
+                html.P(f"Reward: {r.get('reward_estimate','?')} | Deadline: {r.get('deadline','?')}", style={'color':'#666','fontSize':'10px','margin':'2px 0 0'}),
+            ]))
+        return items, style
+
+    elif tab == 'buzz':
         buzz = load_coin_buzz()
         items = [html.H3("🔥 Coin Buzz Rankings", style={'color': '#ff6b6b', 'marginBottom': '10px'})]
         for _, r in buzz.iterrows():

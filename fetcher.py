@@ -406,9 +406,15 @@ def fetch_telegram_data():
         time.sleep(2)
 
 # ============================================================
-# X/TWITTER — Optional, toggle via .env
+# X/TWITTER — Routed through social_monitor credit budget
 # ============================================================
 def fetch_x_data():
+    """
+    Twitter sentiment for portfolio cashtags.
+    Routes through social_monitor to respect the session credit budget
+    and persist results to token_social_cache (never re-query within TTL).
+    Only fires once per session per coin via Tier 3 (hourly cadence).
+    """
     enable = os.environ.get('ENABLE_TWITTER_FETCH', '')
     if not enable:
         try:
@@ -416,55 +422,31 @@ def fetch_x_data():
                 for line in f:
                     if line.startswith('ENABLE_TWITTER_FETCH='):
                         enable = line.strip().split('=', 1)[1]
-        except:
+        except Exception:
             pass
     if enable.lower() != 'true':
         return
 
-    print("  Fetching X/Twitter...")
-    now = datetime.now().isoformat()
-    for cashtag in CASHTAGS:
-        try:
-            res = requests.get("https://api.twitterapi.io/twitter/tweet/advanced_search",
-                headers={"X-API-Key": TWITTER_API_KEY},
-                params={"query": cashtag, "queryType": "Latest", "cursor": ""}, timeout=15)
-            if res.status_code == 429:
-                print(f"    {cashtag}: rate limited")
-                time.sleep(3)
-                continue
-            if res.status_code != 200:
-                continue
-            tweets = res.json().get("tweets", [])[:20]
-            if not tweets:
-                continue
-            conn = get_db()
-            c = conn.cursor()
-            pos = sum(1 for t in tweets if any(w in t.get('text', '').lower() for w in POSITIVE_WORDS))
-            neg = sum(1 for t in tweets if any(w in t.get('text', '').lower() for w in NEGATIVE_WORDS))
-            score = (pos - neg) / len(tweets)
-            label = "BULLISH" if score > 0.15 else "BEARISH" if score < -0.15 else "NEUTRAL"
-            engagement = sum(t.get('likeCount', 0) + t.get('retweetCount', 0) for t in tweets)
-            top = max(tweets, key=lambda t: t.get('likeCount', 0) + t.get('retweetCount', 0))
-            c.execute('''INSERT INTO signals (source, source_detail, signal_type, title, content, coin,
-                         sentiment_score, sentiment_label, engagement, url, fetched_at)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-                ('twitter', cashtag, 'SENTIMENT', f'{cashtag} sentiment: {label}',
-                 top.get('text', '')[:300], cashtag.replace('$', ''),
-                 score, label, engagement, '', now))
-            conn.commit()
-            conn.close()
-            emoji = "🟢" if score > 0.1 else "🔴" if score < -0.1 else "🟡"
-            print(f"    {emoji} {cashtag}: {label} ({score:+.2f}) | {len(tweets)} tweets")
-        except Exception as e:
-            print(f"    {cashtag}: {e}")
-        time.sleep(2)
+    try:
+        from social_monitor import tier3_scan, _can_use_twitter
+        if not _can_use_twitter():
+            print("  Twitter: session credit budget exhausted — skipping")
+            return
+        print("  Fetching X/Twitter (via social_monitor Tier 3)...")
+        for cashtag in CASHTAGS:
+            sym = cashtag.replace('$', '')
+            # Tier 3: hourly cadence, cached — won't re-hit API if fresh result exists
+            tier3_scan(sym, chain='ethereum', project_name=sym)
+    except Exception as e:
+        print(f"  Twitter fetch failed: {e}")
 
-# ============================================================
-# HIDDEN GEMS — Cross-source validation
-# ============================================================
+
 def fetch_x_airdrops():
-    """Search X for airdrop-specific signals."""
-    import os
+    """
+    Search X for airdrop signals. Routed through social_monitor budget.
+    Results stored in signals table AND in twitter_project_history
+    so we never re-query a project already evaluated.
+    """
     enable = os.environ.get('ENABLE_TWITTER_FETCH', '')
     if not enable:
         try:
@@ -472,41 +454,73 @@ def fetch_x_airdrops():
                 for line in f:
                     if line.startswith('ENABLE_TWITTER_FETCH='):
                         enable = line.strip().split('=', 1)[1]
-        except:
+        except Exception:
             pass
     if enable.lower() != 'true':
         return
-    
+
+    try:
+        from social_monitor import _can_use_twitter, search_twitter, _record_credit_use
+        if not _can_use_twitter():
+            print("  Twitter airdrops: credit budget exhausted — skipping")
+            return
+    except ImportError:
+        return
+
     print("  Fetching X airdrop signals...")
     now = datetime.now().isoformat()
-    queries = ['crypto airdrop confirmed', 'airdrop live now', 'free airdrop crypto', 'testnet airdrop']
-    
+    queries = ['crypto airdrop confirmed', 'airdrop live now', 'testnet airdrop reward']
+
+    conn = get_db()
+    c = conn.cursor()
+    # Ensure project history table exists
+    c.execute('''CREATE TABLE IF NOT EXISTS twitter_project_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project TEXT UNIQUE,
+        query TEXT,
+        tweet_count INTEGER,
+        top_tweet TEXT,
+        sentiment_score REAL,
+        fetched_at TEXT)''')
+    conn.commit()
+
     for query in queries:
+        # Skip if we already fetched this query in the last 6 hours
+        row = c.execute(
+            "SELECT fetched_at FROM twitter_project_history WHERE project=? "
+            "AND fetched_at >= datetime('now','-6 hours')", (query,)).fetchone()
+        if row:
+            print(f"    '{query}': cached ({row[0][:16]}) — skipping")
+            continue
+
         try:
-            res = requests.get("https://api.twitterapi.io/twitter/tweet/advanced_search",
-                headers={"X-API-Key": TWITTER_API_KEY},
-                params={"query": query, "queryType": "Top", "cursor": ""}, timeout=15)
-            if res.status_code != 200:
+            tweets = search_twitter(query, project_name=query, max_results=10, query_type='Top')
+            if not tweets:
                 continue
-            tweets = res.json().get("tweets", [])[:10]
-            conn = get_db()
-            c = conn.cursor()
+            _record_credit_use(1)
             for t in tweets:
                 eng = t.get('likeCount', 0) + t.get('retweetCount', 0)
                 if eng >= 3:
                     coins = detect_coins(t.get('text', ''), 'twitter:airdrop')
-                    c.execute('''INSERT INTO signals (source, source_detail, signal_type, title, content, coin,
-                                 sentiment_score, sentiment_label, engagement, url, fetched_at)
-                                 VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-                        ('twitter', f"@{t.get('author',{}).get('userName','')}", 'AIRDROP',
-                         t.get('text', '')[:200], t.get('text', '')[:500],
+                    c.execute('''INSERT INTO signals
+                        (source, source_detail, signal_type, title, content, coin,
+                         sentiment_score, sentiment_label, engagement, url, fetched_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                        ('twitter', f"@{t.get('author',{}).get('userName','')}",
+                         'AIRDROP', t.get('text','')[:200], t.get('text','')[:500],
                          ','.join(coins), 0, 'N/A', eng, '', now))
+            # Record in project history so we skip next time
+            top = max(tweets, key=lambda t: t.get('likeCount',0)+t.get('retweetCount',0), default={})
+            c.execute('''INSERT OR REPLACE INTO twitter_project_history
+                (project, query, tweet_count, top_tweet, sentiment_score, fetched_at)
+                VALUES (?,?,?,?,?,?)''',
+                (query, query, len(tweets), top.get('text','')[:300], 0, now))
             conn.commit()
-            conn.close()
-            print(f"    '{query}': {len(tweets)} tweets")
-        except:
-            pass
+            print(f"    '{query}': {len(tweets)} tweets stored")
+        except Exception as e:
+            print(f"    '{query}': {e}")
         time.sleep(2)
+    conn.close()
 
 def detect_hidden_gems():
     conn = get_db()

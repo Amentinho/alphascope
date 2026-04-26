@@ -17,7 +17,8 @@ STOP_LOSS_PCT        = -30.0
 TAKE_PROFIT_PCT      = 150.0
 MIN_SIGNAL_CONF      = 65
 
-CHAINS = ['solana', 'bsc', 'base', 'arbitrum']
+CHAINS = ['solana', 'bsc', 'base', 'arbitrum', 'ethereum']
+ETH_BUDGET_USD = 800.0   # ETH mainnet gets more — real gems live here
 NATIVE_TOKENS = {
     'solana':   ('SOL', 'solana'),
     'bsc':      ('BNB', 'binancecoin'),
@@ -154,13 +155,15 @@ class SimPortfolio:
     def __init__(self, sim_id):
         self.sim_id = sim_id
         self.cash = {ch: STARTING_BALANCE_USD for ch in CHAINS}
-        self.cash['ethereum'] = 0
+        self.cash['ethereum'] = ETH_BUDGET_USD
         self.holdings = {}
         self.trades = []
         self._saved_count = 0
         self._seed_real()
-        self.starting_real = self._real_value()
-        self.starting_trading = STARTING_BALANCE_USD * len(CHAINS)
+        # Capture T=0 live prices for intra-sim PnL reference
+        self.t0_prices = self._snapshot_prices()
+        self.starting_real = self._real_cost_basis()  # Fixed reference: your original purchase cost
+        self.starting_trading = (STARTING_BALANCE_USD * (len(CHAINS) - 1)) + ETH_BUDGET_USD
         self.starting_total = self.starting_trading + self.starting_real
 
     def _seed_real(self):
@@ -174,12 +177,40 @@ class SimPortfolio:
                     'source': 'real', 'is_real': True, '_zero_count': 0,
                 }
 
+    def _snapshot_prices(self):
+        """Capture live prices at sim launch (T=0). Used as intra-sim reference."""
+        snapshot = {}
+        for chain, positions in REAL_PORTFOLIO.items():
+            for pos in positions:
+                p = resolve_price(pos['symbol'], pos['coin_id'], chain)
+                if p and p > 0:
+                    snapshot[pos['symbol']] = p
+                    print(f"    T=0 price: {pos['symbol']} = ${p:,.4f}")
+        return snapshot
+
+    def _real_cost_basis(self):
+        """Fixed reference: what you originally paid for your real portfolio."""
+        total = 0
+        for chain, positions in REAL_PORTFOLIO.items():
+            for pos in positions:
+                total += pos['amount'] * pos['entry_price']
+        return total
+
     def _real_value(self):
+        """Current live value of real portfolio. Falls back to T=0 snapshot, never to entry prices."""
         total = 0
         for chain, positions in REAL_PORTFOLIO.items():
             for pos in positions:
                 p = resolve_price(pos['symbol'], pos['coin_id'], chain)
-                total += pos['amount'] * (p or pos['entry_price'])
+                if not p or p <= 0:
+                    # Fall back to T=0 snapshot price (not stale entry price)
+                    p = self.t0_prices.get(pos['symbol'], 0)
+                    if p > 0:
+                        print(f"    WARN: {pos['symbol']} live price unavailable, using T=0 snapshot ${p:,.4f}")
+                    else:
+                        print(f"    WARN: {pos['symbol']} price unavailable, excluded from total")
+                        continue
+                total += pos['amount'] * p
         return total
 
     def _trading_value(self):
@@ -274,8 +305,9 @@ class SimPortfolio:
     def print_status(self):
         tv = self._trading_value()
         rv = self._real_value()
+        cost = self._real_cost_basis()
         tp = tv - self.starting_trading
-        rp = rv - self.starting_real
+        rp = rv - cost  # PnL vs original purchase cost
         sells = [t for t in self.trades if t['action'] == 'SELL']
         wins = sum(1 for t in sells if t.get('pnl', 0) > 0)
         losses = sum(1 for t in sells if t.get('pnl', 0) <= 0)
@@ -285,7 +317,7 @@ class SimPortfolio:
         worst_str = f"{worst['symbol']} {worst['pnl_pct']:+.0f}%" if worst else 'none'
         print(f"\n  {'='*52}")
         print(f"  {self.sim_id} | {datetime.now().strftime('%H:%M:%S')}")
-        print(f"  Real portfolio:   ${rv:>10,.2f}  ({rp:+.2f} since start)")
+        print(f"  Real portfolio:   ${rv:>10,.2f}  (cost: ${cost:,.2f} | pnl: {rp:+.2f})")
         print(f"  Trading capital:  ${tv:>10,.2f}  ({tp:+.2f} | {tp/max(self.starting_trading,1)*100:+.1f}%)")
         print(f"  Trades: {len(self.trades)} | W:{wins} L:{losses} | Best: {best_str} | Worst: {worst_str}")
         cash_str = ' | '.join(f"{c}:${v:.0f}" for c, v in self.cash.items() if v > 0)
@@ -399,6 +431,69 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
 
 
 # ── Agent cycle ───────────────────────────────────────────────────────────────
+def _fallback_signals():
+    """
+    Fallback signal generator: uses live CoinGecko trending + DexScreener
+    when the DB is empty (fetcher hasn't run yet or tables are stale).
+    Returns proposals in the same format as wallet_agent.evaluate_signals().
+    """
+    proposals = []
+    # Try CoinGecko trending coins
+    try:
+        r = requests.get('https://api.coingecko.com/api/v3/search/trending', timeout=8)
+        if r.status_code == 200:
+            coins = r.json().get('coins', [])[:7]
+            for c in coins:
+                item = c.get('item', {})
+                sym = item.get('symbol', '').upper()
+                coin_id = item.get('id', '')
+                if not sym or sym in ('BTC','ETH','SOL','BNB','USDT','USDC'):
+                    continue
+                proposals.append({
+                    'action': 'BUY',
+                    'symbol': sym,
+                    'coin_id': coin_id,
+                    'chain': 'solana',  # default to SOL for low gas
+                    'trade_usd': 40,
+                    'alpha_score': 70,
+                    'reasons': 'CoinGecko trending (fallback)',
+                    'sources': 'fallback',
+                    'category': 'TRENDING',
+                })
+    except Exception:
+        pass
+
+    # Try DexScreener hot pairs on SOL
+    try:
+        r = requests.get('https://api.dexscreener.com/latest/dex/tokens/solana', timeout=8)
+        if r.status_code == 200:
+            pairs = r.json().get('pairs', [])
+            for p in pairs[:5]:
+                sym = p.get('baseToken', {}).get('symbol', '').upper()
+                liq = float(p.get('liquidity', {}).get('usd', 0) or 0)
+                vol = float(p.get('volume', {}).get('h24', 0) or 0)
+                price = float(p.get('priceUsd', 0) or 0)
+                if not sym or liq < 20000 or vol < 10000 or price <= 0:
+                    continue
+                if sym in ('SOL', 'ETH', 'BTC', 'USDT', 'USDC', 'WSOL'):
+                    continue
+                proposals.append({
+                    'action': 'BUY',
+                    'symbol': sym,
+                    'coin_id': p.get('baseToken', {}).get('address', ''),
+                    'chain': 'solana',
+                    'trade_usd': 35,
+                    'alpha_score': 68,
+                    'reasons': f'DexScreener SOL hot liq:${liq/1000:.0f}k vol:${vol/1000:.0f}k',
+                    'sources': 'fallback_dex',
+                    'category': 'DEX_GEM',
+                })
+    except Exception:
+        pass
+
+    return proposals[:8]  # cap to 8 fallback proposals
+
+
 def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
     actions = 0
 
@@ -432,64 +527,81 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
     except Exception:
         pass
 
-    # 3. DEX gem proposals
+    # 3. DEX gem proposals (primary agent)
+    proposals = []
     try:
         from wallet_agent import evaluate_signals
-        proposals = evaluate_signals()
-        stop_lossed = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
-                       if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
-        # Also load permanent ban list from previous sims
-        try:
-            import json as _j
-            with open('sim_ban_list.json') as _f:
-                stop_lossed |= set(_j.load(_f))
-        except Exception:
-            pass
-        chain_counts = {}
-        for key, pos in portfolio.holdings.items():
-            if not pos.get('is_real'):
-                ch = pos['chain']
-                chain_counts[ch] = chain_counts.get(ch, 0) + 1
-
-        for p in proposals:
-            if p.get('action') == 'SKIP':
-                continue
-            sym = p.get('symbol','')
-            chain = p.get('chain','solana')
-            action = p.get('action','')
-            trade_usd = min(p.get('trade_usd', 50), 75)
-
-            if not sym or action not in ('BUY','ACCUMULATE'):
-                continue
-            key = f"{sym}_{chain}"
-            if key in portfolio.holdings:
-                continue
-            if key in stop_lossed:
-                continue
-            chain_limit = 4 if chain == 'solana' else 3
-            if chain_counts.get(chain, 0) >= chain_limit:
-                continue
-            if chain == 'ethereum':
-                continue
-            if not portfolio.can_buy(chain, trade_usd):
-                continue
-
-            # Fetch live price -- MUST be > 0 to buy
-            price = resolve_price(sym, coin_id=p.get('coin_id',''), chain=chain, use_cache=False)
-            if not price or price <= 0:
-                print(f"    SKIP {sym} -- price unavailable")
-                continue
-            if price < 1e-9:  # effectively zero price
-                print(f'    SKIP {sym} -- price too low (${price:.2e})')
-                continue
-
-            ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources','agent'))
-            if ok:
-                print(f"    BUY {sym} ${trade_usd:.0f} @ ${price:.8f} | {p.get('reasons','')[:50]}")
-                chain_counts[chain] = chain_counts.get(chain, 0) + 1
-                actions += 1
+        proposals = evaluate_signals() or []
     except Exception as e:
-        print(f"    Agent error: {e}")
+        print(f"    wallet_agent error: {e}")
+
+    # 3b. Fallback: if DB returned nothing actionable, use live APIs directly
+    actionable = [p for p in proposals if p.get('action') not in ('SKIP', None)]
+    if not actionable:
+        print(f"    DB proposals empty — using live fallback signals")
+        proposals = _fallback_signals()
+    else:
+        print(f"    wallet_agent: {len(actionable)} actionable proposals")
+
+    stop_lossed = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
+                   if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
+    try:
+        with open('sim_ban_list.json') as _f:
+            stop_lossed |= set(json.load(_f))
+    except Exception:
+        pass
+
+    chain_counts = {}
+    for key, pos in portfolio.holdings.items():
+        if not pos.get('is_real'):
+            ch = pos['chain']
+            chain_counts[ch] = chain_counts.get(ch, 0) + 1
+
+    for p in proposals:
+        if p.get('action') == 'SKIP':
+            continue
+
+        sym      = p.get('symbol', '')
+        chain    = p.get('chain', 'solana')
+        action   = p.get('action', '')
+        cat      = p.get('category', '')
+        trade_usd = min(p.get('trade_usd', 40), 75)
+
+        if not sym or action not in ('BUY', 'ACCUMULATE'):
+            continue
+
+        # PORTFOLIO category = real holdings, agent shouldn't sim-trade these
+        if cat == 'PORTFOLIO':
+            continue
+
+        # bitcoin has no DEX / sim cash
+        if chain == 'bitcoin':
+            continue
+
+        key = f"{sym}_{chain}"
+        if key in portfolio.holdings:
+            continue
+        if key in stop_lossed:
+            continue
+        chain_limit = 4 if chain in ('solana', 'bsc') else 3
+        if chain_counts.get(chain, 0) >= chain_limit:
+            continue
+        if not portfolio.can_buy(chain, trade_usd):
+            continue
+
+        price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain, use_cache=False)
+        if not price or price <= 0:
+            print(f"    SKIP {sym} -- price unavailable on {chain}")
+            continue
+        if price < 1e-9:
+            print(f'    SKIP {sym} -- price too low (${price:.2e})')
+            continue
+
+        ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'))
+        if ok:
+            print(f"    BUY {sym} ${trade_usd:.0f} @ ${price:.8f} | {str(p.get('reasons', ''))[:50]}")
+            chain_counts[chain] = chain_counts.get(chain, 0) + 1
+            actions += 1
 
     return actions
 
@@ -507,11 +619,12 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
                                 duration_minutes=int(hours*60)+5)
 
     print(f"\n{'='*60}")
-    print(f"  AlphaScope Trade Simulation v2.1")
+    print(f"  AlphaScope Trade Simulation v2.3")
     print(f"  Sim ID: {sim_id}")
-    print(f"  Trading capital: ${STARTING_BALANCE_USD*len(CHAINS):.0f} "
-          f"(${STARTING_BALANCE_USD} x {len(CHAINS)} chains)")
-    print(f"  Real portfolio tracked: ~${portfolio.starting_real:,.0f}")
+    print(f"  Trading capital: ${portfolio.starting_trading:.0f} "
+          f"(SOL/BSC/BASE/ARB: ${STARTING_BALANCE_USD:.0f} each | ETH: ${ETH_BUDGET_USD:.0f})")
+    print(f"  Real portfolio cost basis: ${portfolio.starting_real:,.2f}")
+    print(f"  Real portfolio T=0 value:  ${portfolio._real_value():,.2f}")
     print(f"  Duration: {hours}h | Cycle: {cycle_min}min | "
           f"Stop: {stop_loss}% | TP: +{take_profit}%")
     print(f"  Price monitor: every 60s (catches rugs fast)")
