@@ -477,6 +477,9 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             if not price or price <= 0:
                 print(f"    SKIP {sym} -- price unavailable")
                 continue
+            if price < 1e-9:  # effectively zero price
+                print(f'    SKIP {sym} -- price too low (${price:.2e})')
+                continue
 
             ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources','agent'))
             if ok:
