@@ -103,18 +103,28 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
         except Exception:
             pass
 
-    # 3. DexScreener by contract
-    if not price and coin_id and len(coin_id) > 20:
-        try:
-            r = requests.get(
-                f'https://api.dexscreener.com/latest/dex/tokens/{coin_id}',
-                timeout=6)
-            if r.status_code == 200:
-                pairs = r.json().get('pairs', [])
-                if pairs:
-                    price = float(pairs[0].get('priceUsd', 0) or 0)
-        except Exception:
-            pass
+    # 3. DexScreener by contract address
+    if not price and coin_id:
+        # Extract contract if coin_id is a dexscreener URL
+        contract = coin_id
+        if 'dexscreener.com/' in coin_id:
+            contract = coin_id.rstrip('/').split('/')[-1]
+        if len(contract) > 20:
+            try:
+                r = requests.get(
+                    f'https://api.dexscreener.com/latest/dex/tokens/{contract}',
+                    timeout=6)
+                if r.status_code == 200:
+                    pairs = r.json().get('pairs', [])
+                    # Filter to correct chain if possible
+                    if chain and chain not in ('ethereum', 'bitcoin'):
+                        cp = [p for p in pairs if p.get('chainId', '') == chain]
+                        pairs = cp or pairs
+                    if pairs:
+                        best = max(pairs, key=lambda p: float(p.get('liquidity', {}).get('usd', 0) or 0))
+                        price = float(best.get('priceUsd', 0) or 0)
+            except Exception:
+                pass
 
     if price > 0:
         _price_cache[cache_key] = (price, time.time())

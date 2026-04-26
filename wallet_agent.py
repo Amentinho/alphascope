@@ -319,7 +319,8 @@ def _load_all_candidates():
                     continue
             if sym not in candidates or score > candidates[sym].get('alpha_score', 0):
                 candidates[sym] = {
-                    'symbol': sym, 'coin_id': r.get('dex_url', ''),
+                    'symbol': sym,
+                    'coin_id': r.get('contract_address', '') or r.get('dex_url', ''),
                     'contract_address': r.get('contract_address', ''),
                     'chain': chain, 'price_usd': float(r.get('price_usd', 0) or 0),
                     'alpha_score': score, 'signal': 'WATCH', 'confidence': 50,
