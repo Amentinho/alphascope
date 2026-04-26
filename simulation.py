@@ -52,17 +52,42 @@ CG_IDS = {
 # ── Price resolver ────────────────────────────────────────────────────────────
 _price_cache = {}
 
+def _db_price(symbol):
+    """Read latest price from token_data table — populated by fetcher. Fast, no API call."""
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect('alphascope.db', timeout=5)
+        # Try symbol match first, then coin_id match (fetcher stores both)
+        row = conn.execute(
+            """SELECT price_usd FROM token_data
+               WHERE (UPPER(symbol)=UPPER(?) OR UPPER(coin_id)=UPPER(?))
+               AND price_usd > 0
+               ORDER BY fetched_at DESC LIMIT 1""",
+            (symbol, symbol)).fetchone()
+        conn.close()
+        if row and row[0] and float(row[0]) > 0:
+            return float(row[0])
+    except Exception:
+        pass
+    return 0.0
+
+
 def resolve_price(symbol, coin_id='', chain='', use_cache=True):
-    """Fetch live price. Returns 0.0 if unavailable."""
+    """Fetch live price. DB first (from fetcher), then live APIs."""
     sym = symbol.upper()
     cache_key = f"{sym}_{chain}"
 
-    # Cache for 4 minutes — long enough to avoid hammering within a cycle,
-    # short enough to get fresh prices each 5-min sim cycle
+    # Cache for 4 minutes within a cycle
     if use_cache and cache_key in _price_cache:
         cached_price, cached_time = _price_cache[cache_key]
         if time.time() - cached_time < 240 and cached_price > 0:
             return cached_price
+
+    # Try DB first — fetcher populates this every cycle, always fresh
+    price = _db_price(sym)
+    if price > 0:
+        _price_cache[cache_key] = (price, time.time())
+        return price
 
     price = 0.0
 
@@ -189,14 +214,39 @@ class SimPortfolio:
                 }
 
     def _snapshot_prices(self):
-        """Capture live prices at sim launch (T=0). Used as intra-sim reference."""
+        """Capture prices at sim launch from DB (fetcher just ran) then API fallback."""
         snapshot = {}
-        for chain, positions in REAL_PORTFOLIO.items():
-            for pos in positions:
-                p = resolve_price(pos['symbol'], pos['coin_id'], chain)
-                if p and p > 0:
-                    snapshot[pos['symbol']] = p
-                    print(f"    T=0 price: {pos['symbol']} = ${p:,.4f}")
+        import sqlite3 as _sq
+        try:
+            conn = _sq.connect('alphascope.db', timeout=5)
+            for chain, positions in REAL_PORTFOLIO.items():
+                for pos in positions:
+                    sym = pos['symbol']
+                    cg_id = pos['coin_id']
+                    # Try DB first — fetcher wrote these seconds ago
+                    row = conn.execute(
+                        """SELECT price_usd FROM token_data
+                           WHERE (UPPER(symbol)=UPPER(?) OR coin_id=?)
+                           AND price_usd > 0
+                           ORDER BY fetched_at DESC LIMIT 1""",
+                        (sym, cg_id)).fetchone()
+                    p = float(row[0]) if row and row[0] else 0
+                    # API fallback
+                    if not p:
+                        p = resolve_price(sym, cg_id, chain, use_cache=False)
+                    if p and p > 0:
+                        snapshot[sym] = p
+                        print(f"    T=0 {sym} = ${p:,.4f} ({'db' if row else 'api'})")
+            conn.close()
+        except Exception as e:
+            print(f"    T=0 snapshot error: {e}")
+            # Full API fallback
+            for chain, positions in REAL_PORTFOLIO.items():
+                for pos in positions:
+                    p = resolve_price(pos['symbol'], pos['coin_id'], chain, use_cache=False)
+                    if p and p > 0:
+                        snapshot[pos['symbol']] = p
+                        print(f"    T=0 {pos['symbol']} = ${p:,.4f} (api)")
         return snapshot
 
     def _real_cost_basis(self):
@@ -444,6 +494,76 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
 
 
 # ── Agent cycle ───────────────────────────────────────────────────────────────
+def _load_dex_proposals(portfolio):
+    """
+    Load DEX gem proposals directly from dex_gems table.
+    Authoritative source for chain + contract. No dedup confusion with buzz/social.
+    """
+    import sqlite3 as _sq
+    proposals = []
+    try:
+        conn = _sq.connect('alphascope.db', timeout=10)
+        rows = conn.execute("""
+            SELECT symbol, chain, contract_address, dex_url, price_usd,
+                   liquidity_usd, age_hours, cross_score
+            FROM dex_gems
+            WHERE fetched_at >= datetime('now', '-24 hours')
+            AND cross_score >= 4
+            ORDER BY cross_score DESC, liquidity_usd DESC
+            LIMIT 20
+        """).fetchall()
+        conn.close()
+
+        # Load ban list
+        stop_lossed = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
+                       if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
+        try:
+            import json as _j
+            with open('sim_ban_list.json') as _f:
+                stop_lossed |= set(_j.load(_f))
+        except Exception:
+            pass
+
+        seen = set()
+        for sym, chain, contract, dex_url, price_db, liq, age, score in rows:
+            sym = sym.upper()
+            chain = (chain or 'solana').lower()
+            if sym in seen:
+                continue
+            seen.add(sym)
+            key = f"{sym}_{chain}"
+            if key in stop_lossed:
+                continue
+            if key in portfolio.holdings:
+                continue
+            # Skip majors
+            if sym in ('BTC','ETH','SOL','BNB','USDT','USDC','WETH','WSOL','WBTC'):
+                continue
+            liq = liq or 0
+            age = age or 99
+            # Liquidity minimums per chain
+            liq_min = {'solana':15000,'bsc':20000,'base':25000,
+                       'arbitrum':25000,'ethereum':35000}.get(chain, 20000)
+            if liq < liq_min:
+                continue
+            # Size by chain
+            trade_usd = 40 if chain in ('solana','bsc') else 50
+            proposals.append({
+                'action': 'BUY',
+                'symbol': sym,
+                'coin_id': contract or dex_url or sym.lower(),
+                'chain': chain,
+                'trade_usd': trade_usd,
+                'alpha_score': min(100, score * 12 + 20),
+                'reasons': f'DEX liq:${liq/1000:.0f}k age:{age:.0f}h score:{score}',
+                'sources': 'dex_direct',
+                'category': 'DEX_GEM',
+            })
+    except Exception as e:
+        print(f"    dex_proposals error: {e}")
+    return proposals
+
+
 def _fallback_signals():
     """
     Fallback signal generator: uses live CoinGecko trending + DexScreener
@@ -540,22 +660,31 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
     except Exception:
         pass
 
-    # 3. DEX gem proposals (primary agent)
-    proposals = []
+    # 3. DEX gem proposals — load directly from DB, bypassing wallet_agent chain confusion
+    proposals = _load_dex_proposals(portfolio)
+
+    # 3b. Supplement with wallet_agent for non-DEX signals (listings, pre-launch etc)
     try:
         from wallet_agent import evaluate_signals
-        proposals = evaluate_signals() or []
+        wa_proposals = evaluate_signals() or []
+        # Only take non-DEX_GEM proposals from wallet_agent to avoid chain mismatch
+        for p in wa_proposals:
+            if p.get('action') in ('SKIP', None): continue
+            if p.get('category') == 'DEX_GEM': continue  # handled by _load_dex_proposals
+            sym = p.get('symbol','')
+            chain = p.get('chain','')
+            if not any(x.get('symbol') == sym for x in proposals):
+                proposals.append(p)
     except Exception as e:
         print(f"    wallet_agent error: {e}")
 
-    # 3b. Fallback: if DB returned nothing actionable, use live APIs directly
     actionable = [p for p in proposals if p.get('action') not in ('SKIP', None)]
     if not actionable:
-        print(f"    DB proposals empty — using live fallback signals")
+        print(f"    No proposals — using live fallback signals")
         proposals = _fallback_signals()
     else:
-        print(f"    wallet_agent: {len(actionable)} proposals — "
-              + " | ".join(f"{p['action']} {p['symbol']}({p.get('chain','?')[:3]})" for p in actionable[:8]))
+        print(f"    Proposals: " + " | ".join(
+            f"{p['action']} {p['symbol']}({p.get('chain','?')[:3]})" for p in actionable[:10]))
 
     stop_lossed = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
                    if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
