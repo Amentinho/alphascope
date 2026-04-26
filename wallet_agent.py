@@ -100,7 +100,7 @@ def init_agent_tables():
         ('wallet_address', ''),
     ]
     for k, v in defaults:
-        c.execute("INSERT OR IGNORE INTO agent_config (key, value, updated_at) VALUES (?,?,?)",
+        c.execute("INSERT OR REPLACE INTO agent_config (key, value, updated_at) VALUES (?,?,?)",
                   (k, v, datetime.now().isoformat()))
     conn.commit()
     conn.close()
@@ -311,8 +311,15 @@ def _load_all_candidates():
             if r.get('social_buzz'): reasons.append('social buzz match')
             if r.get('pre_launch_match'): reasons.append('ICO listing match')
 
-            # Dedup — if same symbol already seen with higher score, skip
+            # Dedup — DEX data always wins on chain + contract (it's authoritative)
             if sym in candidates:
+                # Always update chain/contract from DEX — buzz/social default to ethereum wrongly
+                candidates[sym]['chain'] = chain
+                if r.get('contract_address'):
+                    candidates[sym]['coin_id'] = r.get('contract_address')
+                    candidates[sym]['contract_address'] = r.get('contract_address')
+                candidates[sym]['category'] = 'DEX_GEM'
+                candidates[sym]['liquidity_usd'] = liq
                 existing_score = candidates[sym].get('alpha_score', 0)
                 if score <= existing_score:
                     candidates[sym]['sources'].append('dex')
@@ -339,8 +346,8 @@ def _load_all_candidates():
             elif score >= 50:
                 candidates[sym]['signal'] = 'ACCUMULATE'
                 candidates[sym]['confidence'] = max(candidates[sym]['confidence'], 60)
-    except Exception:
-        pass
+    except Exception as _dex_err:
+        print(f"    [agent] dex_gems load error: {_dex_err}")
 
     # ── 4. Hidden gems — CoinGecko trending low-cap ───────────────────────────
     try:
@@ -473,6 +480,8 @@ def _load_all_candidates():
         elif src_count >= 2:
             c['alpha_score'] = min(100, c['alpha_score'] + 10)
             c['confidence'] = min(85, c['confidence'] + 8)
+        # Hard cap
+        c['alpha_score'] = min(100, c['alpha_score'])
 
     return candidates
 
