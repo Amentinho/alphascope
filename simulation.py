@@ -6,6 +6,7 @@ Complete clean rewrite fixing all accumulated issues.
 import sqlite3
 import json
 import time
+import os
 import argparse
 import threading
 import requests
@@ -32,15 +33,17 @@ REAL_PORTFOLIO = {
         {'symbol': 'ETH',  'coin_id': 'ethereum',    'amount': 0.0338,  'entry_price': 2333.18},
     ],
     'bitcoin': [
-        {'symbol': 'BTC',  'coin_id': 'bitcoin',     'amount': 0.1,     'entry_price': 75000},
+        {'symbol': 'BTC',  'coin_id': 'bitcoin',     'amount': 0.1,     'entry_price': 75000.00},
     ],
     'solana': [
-        {'symbol': 'SOL',  'coin_id': 'solana',      'amount': 20,      'entry_price': 85},
+        {'symbol': 'SOL',  'coin_id': 'solana',      'amount': 20,      'entry_price': 85.00},
     ],
     'arbitrum': [
-        {'symbol': 'HYPE', 'coin_id': 'hyperliquid', 'amount': 10,      'entry_price': 38},
+        {'symbol': 'HYPE', 'coin_id': 'hyperliquid', 'amount': 10,      'entry_price': 38.00},
     ],
 }
+# Note: entry_price = your actual purchase price (cost basis), never changes
+# T=0 price = live price at sim launch, used for session P&L tracking
 
 CG_IDS = {
     'BTC':'bitcoin','ETH':'ethereum','SOL':'solana','BNB':'binancecoin',
@@ -56,7 +59,7 @@ def _db_price(symbol):
     """Read latest price from token_data table — populated by fetcher. Fast, no API call."""
     try:
         import sqlite3 as _sq
-        conn = _sq.connect('alphascope.db', timeout=5)
+        conn = _sq.connect(MAIN_DB, timeout=10)
         # Try symbol match first, then coin_id match (fetcher stores both)
         row = conn.execute(
             """SELECT price_usd FROM token_data
@@ -157,33 +160,111 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
     return price
 
 
+SIM_DB = 'sim.db'      # sim writes here (no contention with fetcher)
+MAIN_DB = 'alphascope.db'  # read-only: prices, dex_gems, signals
+
+# ── Single-writer DB queue ─────────────────────────────────────────────────────
+import queue as _queue
+_db_write_queue = _queue.Queue()
+_db_conn = None  # single persistent connection, main thread only
+
+def _db_writer_loop():
+    """Dedicated DB writer thread — sole writer to sim.db. Auto-reconnects on error."""
+    global _db_conn
+
+    def _connect():
+        global _db_conn
+        c = sqlite3.connect(SIM_DB, timeout=60, check_same_thread=False)
+        c.execute('PRAGMA journal_mode=WAL')
+        c.execute('PRAGMA synchronous=NORMAL')
+        c.execute('PRAGMA busy_timeout=10000')
+        _db_conn = c
+        return c
+
+    conn = None
+    while True:
+        try:
+            if conn is None:
+                conn = _connect()
+            item = _db_write_queue.get(timeout=5)
+            if item is None:  # shutdown signal
+                break
+            sql, params = item
+            try:
+                conn.execute(sql, params)
+                conn.commit()
+            except sqlite3.ProgrammingError:
+                # Connection closed — reconnect and retry
+                try:
+                    conn = _connect()
+                    conn.execute(sql, params)
+                    conn.commit()
+                except Exception as e2:
+                    print(f"  DB write error (retry): {e2}")
+            except Exception as e:
+                print(f"  DB write error: {e}")
+        except _queue.Empty:
+            continue
+        except Exception as e:
+            print(f"  DB writer loop error: {e} — reconnecting")
+            conn = None
+            time.sleep(1)
+
+def _db_exec(sql, params=()):
+    """Queue a write to sim.db. Non-blocking."""
+    _db_write_queue.put((sql, params))
+
+def _start_db_writer():
+    t = threading.Thread(target=_db_writer_loop, daemon=True, name='db_writer')
+    t.start()
+    return t
+
 def get_db():
-    conn = sqlite3.connect('alphascope.db', timeout=30)
+    """Returns the shared DB connection (read or batch operations)."""
+    if _db_conn:
+        return _db_conn
+    conn = sqlite3.connect(SIM_DB, timeout=30, check_same_thread=False)
     conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=5000')
     return conn
+
+def get_main_db():
+    """Main DB — read-only access for prices/gems."""
+    import time as _time
+    for attempt in range(3):
+        try:
+            conn = sqlite3.connect(MAIN_DB, timeout=10)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA query_only=ON')
+            return conn
+        except sqlite3.OperationalError:
+            if attempt < 2:
+                _time.sleep(1)
+    return None
 
 
 def init_sim_tables():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sim_portfolio (
+    # Wait up to 3s for DB writer thread to initialize
+    for _ in range(30):
+        if _db_conn is not None:
+            break
+        time.sleep(0.1)
+    _db_exec('''CREATE TABLE IF NOT EXISTS sim_portfolio (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sim_id TEXT, symbol TEXT, chain TEXT,
         amount_tokens REAL, buy_price_usd REAL, buy_time TEXT,
         sell_price_usd REAL, sell_time TEXT,
         pnl_usd REAL, pnl_pct REAL,
-        status TEXT DEFAULT 'HOLDING',
-        signal_source TEXT, notes TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS sim_runs (
+        status TEXT DEFAULT "HOLDING",
+        signal_source TEXT, notes TEXT)''', ())
+    _db_exec('''CREATE TABLE IF NOT EXISTS sim_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sim_id TEXT UNIQUE, mode TEXT,
         start_time TEXT, end_time TEXT,
         starting_usd REAL, ending_usd REAL,
         total_pnl_usd REAL, total_pnl_pct REAL,
         trades_total INTEGER, trades_won INTEGER, trades_lost INTEGER,
-        best_trade TEXT, worst_trade TEXT, summary TEXT)''')
-    conn.commit()
-    conn.close()
+        best_trade TEXT, worst_trade TEXT, summary TEXT)''', ())
 
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────
@@ -218,7 +299,7 @@ class SimPortfolio:
         snapshot = {}
         import sqlite3 as _sq
         try:
-            conn = _sq.connect('alphascope.db', timeout=5)
+            conn = _sq.connect(MAIN_DB, timeout=10)
             for chain, positions in REAL_PORTFOLIO.items():
                 for pos in positions:
                     sym = pos['symbol']
@@ -305,6 +386,12 @@ class SimPortfolio:
             'usd': usd, 'price': price, 'tokens': tokens,
             'time': datetime.now().isoformat(), 'source': source,
         })
+        try:
+            from executor import on_buy
+            contract = self.holdings.get(f"{symbol}_{chain}", {}).get('coin_id', '')
+            on_buy(symbol, chain, usd, price, source, contract)
+        except Exception:
+            pass
         return True, f"bought {tokens:.4f} {symbol} @ ${price:.8f}"
 
     def sell(self, symbol, chain, price, reason='signal'):
@@ -330,6 +417,12 @@ class SimPortfolio:
             'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason,
             'time': datetime.now().isoformat(),
         })
+        try:
+            from executor import on_sell
+            on_sell(symbol, chain, price, pnl_pct, reason,
+                    token_amount=pos.get('amount', 0), contract=pos.get('coin_id', ''))
+        except Exception:
+            pass
         return True, f"sold {symbol} @ ${price:.8f} | P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
 
     def check_exits(self, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
@@ -339,27 +432,35 @@ class SimPortfolio:
             if not pos or pos.get('is_real'):
                 continue
             sym, chain = pos['symbol'], pos['chain']
-            price = resolve_price(sym, chain=chain, use_cache=False)
+            buy_price = pos.get('buy_price', 0)
+            if not buy_price:
+                continue
+            try:
+                price = resolve_price(sym, chain=chain, use_cache=False)
+            except Exception:
+                price = 0
             if not price or price <= 0:
                 pos['_zero_count'] = pos.get('_zero_count', 0) + 1
-                if pos['_zero_count'] >= 3:
-                    print(f"    WARNING: {sym} price=0 x3 -- assuming rug, force stop-loss")
-                    price = pos['buy_price'] * 0.001
+                if pos['_zero_count'] >= 1:
+                    # Price unavailable = rug. Sell at near-zero.
+                    price = buy_price * 0.001
+                    print(f"    RUG {sym}: price=0, force stop-loss")
                 else:
                     continue
             else:
                 pos['_zero_count'] = 0
-            pnl_pct = (price - pos['buy_price']) / pos['buy_price'] * 100
-            effective_stop = -20 if chain in ('solana', 'bsc') else stop_loss
+                pos['_last_price'] = price
+            pnl_pct = (price - buy_price) / buy_price * 100
+            effective_stop = -20.0 if chain in ('solana', 'bsc') else -30.0
             if pnl_pct <= effective_stop:
                 ok, msg = self.sell(sym, chain, price, 'stop_loss')
                 if ok:
-                    print(f"    STOP-LOSS {sym}: {pnl_pct:.1f}% | {msg}")
+                    print(f"    STOP-LOSS {sym}: {pnl_pct:.1f}%")
                     actions += 1
             elif pnl_pct >= take_profit:
                 ok, msg = self.sell(sym, chain, price, 'take_profit')
                 if ok:
-                    print(f"    TAKE-PROFIT {sym}: +{pnl_pct:.1f}% | {msg}")
+                    print(f"    TAKE-PROFIT {sym}: +{pnl_pct:.1f}%")
                     actions += 1
         return actions
 
@@ -397,58 +498,51 @@ class SimPortfolio:
         print(f"  {'='*52}")
 
     def save(self):
-        init_sim_tables()
-        conn = get_db()
-        c = conn.cursor()
+        """Non-blocking save — queues all writes to the dedicated DB writer thread."""
+        try:
+            init_sim_tables()
+        except Exception:
+            pass
         new_trades = self.trades[self._saved_count:]
         for t in new_trades:
             if t['action'] == 'BUY':
-                try:
-                    c.execute('''INSERT INTO sim_portfolio
-                        (sim_id,symbol,chain,amount_tokens,buy_price_usd,buy_time,
-                         sell_price_usd,pnl_usd,pnl_pct,status,signal_source)
-                        VALUES(?,?,?,?,?,?,0,0,0,'HOLDING',?)''',
-                        (self.sim_id,t['symbol'],t['chain'],
-                         t['tokens'],t['price'],t['time'],t.get('source','')))
-                except Exception:
-                    pass
+                _db_exec(
+                    "INSERT OR IGNORE INTO sim_portfolio "
+                    "(sim_id,symbol,chain,amount_tokens,buy_price_usd,buy_time,"
+                    "sell_price_usd,pnl_usd,pnl_pct,status,signal_source) "
+                    "VALUES(?,?,?,?,?,?,0,0,0,?,?)",
+                    (self.sim_id,t['symbol'],t['chain'],
+                     t['tokens'],t['price'],t['time'],'HOLDING',t.get('source','')))
             else:
-                try:
-                    c.execute('''UPDATE sim_portfolio
-                        SET sell_price_usd=?,sell_time=?,pnl_usd=?,pnl_pct=?,status='CLOSED'
-                        WHERE sim_id=? AND symbol=? AND chain=? AND status='HOLDING'
-                        ORDER BY id DESC LIMIT 1''',
-                        (t['price'],t['time'],t.get('pnl',0),t.get('pnl_pct',0),
-                         self.sim_id,t['symbol'],t['chain']))
-                except Exception:
-                    pass
+                _db_exec(
+                    "UPDATE sim_portfolio "
+                    "SET sell_price_usd=?,sell_time=?,pnl_usd=?,pnl_pct=?,status=? "
+                    "WHERE sim_id=? AND symbol=? AND chain=? AND status=?",
+                    (t['price'],t['time'],t.get('pnl',0),t.get('pnl_pct',0),
+                     'CLOSED',self.sim_id,t['symbol'],t['chain'],'HOLDING'))
         self._saved_count = len(self.trades)
         tv = self._trading_value()
         tp = tv - self.starting_trading
         sells = [t for t in self.trades if t['action'] == 'SELL']
         wins = sum(1 for t in sells if t.get('pnl',0) > 0)
         losses = sum(1 for t in sells if t.get('pnl',0) <= 0)
-        best = max(sells, key=lambda t: t.get('pnl_pct',0), default=None)
+        best  = max(sells, key=lambda t: t.get('pnl_pct',0), default=None)
         worst = min(sells, key=lambda t: t.get('pnl_pct',0), default=None)
-        try:
-            c.execute('''INSERT OR REPLACE INTO sim_runs
-                (sim_id,mode,start_time,end_time,starting_usd,ending_usd,
-                 total_pnl_usd,total_pnl_pct,trades_total,trades_won,trades_lost,
-                 best_trade,worst_trade,summary)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (self.sim_id,'PAPER',
-                 self.trades[0]['time'] if self.trades else datetime.now().isoformat(),
-                 datetime.now().isoformat(),
-                 self.starting_trading, tv, tp,
-                 tp/max(self.starting_trading,1)*100,
-                 len(self.trades),wins,losses,
-                 f"{best['symbol']} {best['pnl_pct']:+.1f}%" if best else 'none',
-                 f"{worst['symbol']} {worst['pnl_pct']:+.1f}%" if worst else 'none',
-                 json.dumps({'trading_pnl':tp,'real_value':self._real_value()})))
-        except Exception:
-            pass
-        conn.commit()
-        conn.close()
+        _db_exec(
+            "INSERT OR REPLACE INTO sim_runs "
+            "(sim_id,mode,start_time,end_time,starting_usd,ending_usd,"
+            "total_pnl_usd,total_pnl_pct,trades_total,trades_won,trades_lost,"
+            "best_trade,worst_trade,summary) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.sim_id,'PAPER',
+             self.trades[0]['time'] if self.trades else datetime.now().isoformat(),
+             datetime.now().isoformat(),
+             self.starting_trading, tv, tp,
+             tp/max(self.starting_trading,1)*100,
+             len(self.trades),wins,losses,
+             f"{best['symbol']} {best['pnl_pct']:+.1f}%" if best else 'none',
+             f"{worst['symbol']} {worst['pnl_pct']:+.1f}%" if worst else 'none',
+             json.dumps({'trading_pnl':tp,'real_value':self._real_value()})))
 
 
 # ── Price monitor (background thread) ────────────────────────────────────────
@@ -458,37 +552,56 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
     def _loop():
         end = time.time() + duration_minutes * 60
         while time.time() < end:
-            time.sleep(interval_seconds)
-            open_pos = [(k,v) for k,v in portfolio.holdings.items()
-                        if not v.get('is_real')]
-            if not open_pos:
-                continue
-            for key, pos in list(open_pos):
-                sym, chain = pos['symbol'], pos['chain']
-                price = resolve_price(sym, chain=chain, use_cache=False)
-                if not price or price <= 0:
-                    pos['_zero_count'] = pos.get('_zero_count', 0) + 1
-                    if pos['_zero_count'] >= 2:
-                        print(f"\n    [MONITOR] {sym} price=0 x{pos['_zero_count']} -- FORCE STOP-LOSS")
-                        # Use last known price * 0.01 to trigger stop-loss
-                        price = pos['buy_price'] * 0.01
-                    else:
+            try:
+                time.sleep(interval_seconds)
+                open_pos = [(k,v) for k,v in list(portfolio.holdings.items())
+                            if not v.get('is_real')]
+                if not open_pos:
+                    continue
+                for key, pos in open_pos:
+                    if key not in portfolio.holdings:
                         continue
-                else:
-                    pos['_zero_count'] = 0
-                pnl_pct = (price - pos['buy_price']) / pos['buy_price'] * 100
-                effective_stop = -20 if chain in ('solana', 'bsc') else stop_loss
-                if pnl_pct <= effective_stop:
-                    ok, msg = portfolio.sell(sym, chain, price, 'stop_loss')
-                    if ok:
-                        print(f"\n    [MONITOR] STOP-LOSS {sym}: {pnl_pct:.1f}%")
-                        portfolio.save()
-                elif pnl_pct >= take_profit:
-                    ok, msg = portfolio.sell(sym, chain, price, 'take_profit')
-                    if ok:
-                        print(f"\n    [MONITOR] TAKE-PROFIT {sym}: +{pnl_pct:.1f}%")
-                        portfolio.save()
-    t = threading.Thread(target=_loop, daemon=True)
+                    sym, chain = pos['symbol'], pos['chain']
+                    buy_price = pos.get('buy_price', 0)
+                    if not buy_price:
+                        continue
+                    try:
+                        price = resolve_price(sym, chain=chain, use_cache=False)
+                    except Exception:
+                        price = 0
+                    if not price or price <= 0:
+                        pos['_zero_count'] = pos.get('_zero_count', 0) + 1
+                        # Fire stop-loss after 1 failed price fetch (rug detected)
+                        if pos['_zero_count'] >= 1:
+                            price = buy_price * 0.001  # treat as near-zero
+                            print(f"\n    [MONITOR] {sym} price=0 -- RUG detected, stop-loss")
+                        else:
+                            continue
+                    else:
+                        pos['_zero_count'] = 0
+                        pos['_last_price'] = price  # track last known price
+                    pnl_pct = (price - buy_price) / buy_price * 100
+                    effective_stop = -20 if chain in ('solana', 'bsc') else stop_loss
+                    if pnl_pct <= effective_stop:
+                        ok, msg = portfolio.sell(sym, chain, price, 'stop_loss')
+                        if ok:
+                            print(f"\n    [MONITOR] STOP-LOSS {sym}: {pnl_pct:.1f}% | {msg}")
+                            try:
+                                portfolio.save()
+                            except Exception:
+                                pass
+                    elif pnl_pct >= take_profit:
+                        ok, msg = portfolio.sell(sym, chain, price, 'take_profit')
+                        if ok:
+                            print(f"\n    [MONITOR] TAKE-PROFIT {sym}: +{pnl_pct:.1f}% | {msg}")
+                            try:
+                                portfolio.save()
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"\n    [MONITOR] error: {e}")
+                time.sleep(5)
+    t = threading.Thread(target=_loop, daemon=True, name='price_monitor')
     t.start()
     return t
 
@@ -502,25 +615,29 @@ def _load_dex_proposals(portfolio):
     import sqlite3 as _sq
     proposals = []
     try:
-        conn = _sq.connect('alphascope.db', timeout=10)
-        rows = conn.execute("""
-            SELECT symbol, chain, contract_address, dex_url, price_usd,
-                   liquidity_usd, age_hours, cross_score
-            FROM dex_gems
-            WHERE fetched_at >= datetime('now', '-24 hours')
-            AND cross_score >= 4
-            ORDER BY cross_score DESC, liquidity_usd DESC
-            LIMIT 20
-        """).fetchall()
-        conn.close()
+        conn = _sq.connect(MAIN_DB, timeout=10)
+        try:
+            rows = conn.execute("""
+                SELECT symbol, chain, contract_address, dex_url, price_usd,
+                       liquidity_usd, age_hours, cross_score
+                FROM dex_gems
+                WHERE fetched_at >= datetime('now', '-24 hours')
+                AND cross_score >= 5
+                ORDER BY cross_score DESC, liquidity_usd DESC
+                LIMIT 20
+            """).fetchall()
+        finally:
+            conn.close()
 
         # Load ban list
-        stop_lossed = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
-                       if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
+        # Ban by symbol across ALL chains — if MUSK rugged on SOL, don't buy on ETH
+        stop_lossed_syms = {t['symbol'] for t in portfolio.trades
+                            if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
         try:
             import json as _j
             with open('sim_ban_list.json') as _f:
-                stop_lossed |= set(_j.load(_f))
+                for entry in _j.load(_f):
+                    stop_lossed_syms.add(entry.split('_')[0])
         except Exception:
             pass
 
@@ -532,7 +649,7 @@ def _load_dex_proposals(portfolio):
                 continue
             seen.add(sym)
             key = f"{sym}_{chain}"
-            if key in stop_lossed:
+            if sym in stop_lossed_syms:
                 continue
             if key in portfolio.holdings:
                 continue
@@ -542,8 +659,8 @@ def _load_dex_proposals(portfolio):
             liq = liq or 0
             age = age or 99
             # Liquidity minimums per chain
-            liq_min = {'solana':15000,'bsc':20000,'base':25000,
-                       'arbitrum':25000,'ethereum':35000}.get(chain, 20000)
+            liq_min = {'solana':25000,'bsc':30000,'base':35000,
+                       'arbitrum':35000,'ethereum':50000}.get(chain, 30000)
             if liq < liq_min:
                 continue
             # Size by chain
@@ -686,11 +803,13 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         print(f"    Proposals: " + " | ".join(
             f"{p['action']} {p['symbol']}({p.get('chain','?')[:3]})" for p in actionable[:10]))
 
-    stop_lossed = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
-                   if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
+    # Ban by symbol across all chains
+    stop_lossed_syms = {t['symbol'] for t in portfolio.trades
+                        if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
     try:
         with open('sim_ban_list.json') as _f:
-            stop_lossed |= set(json.load(_f))
+            for entry in json.load(_f):
+                stop_lossed_syms.add(entry.split('_')[0])
     except Exception:
         pass
 
@@ -724,7 +843,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         key = f"{sym}_{chain}"
         if key in portfolio.holdings:
             continue
-        if key in stop_lossed:
+        if sym in stop_lossed_syms:
             continue
         chain_limit = 4 if chain in ('solana', 'bsc') else 3
         if chain_counts.get(chain, 0) >= chain_limit:
@@ -758,10 +877,20 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     end_time = datetime.now(timezone.utc) + timedelta(hours=hours)
     total_cycles = int(hours * 60 / cycle_min)
 
+    # Start single-writer DB thread (must be first — everything else queues through it)
+    _start_db_writer()
+    time.sleep(0.5)  # let writer initialize
+
     # Start background price monitor
     monitor = run_price_monitor(portfolio, stop_loss, take_profit,
                                 duration_minutes=int(hours*60)+5)
 
+    # Notify executor of sim start
+    try:
+        from executor import alert_start
+        alert_start(sim_id, hours, portfolio.starting_trading)
+    except Exception:
+        pass
     print(f"\n{'='*60}")
     print(f"  AlphaScope Trade Simulation v2.3")
     print(f"  Sim ID: {sim_id}")
@@ -785,19 +914,22 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
         _price_cache.clear()
 
         try:
-            if cycle_min <= 10:
-                print("  Fast refresh...")
-                from dex_scanner import fetch_dex_gems
-                fetch_dex_gems()
-                from social_monitor import run_social_monitoring
-                run_social_monitoring()
-                from portfolio import run_portfolio_signals
-                run_portfolio_signals()
-            else:
-                import subprocess
-                print("  Full fetch...")
-                r = subprocess.run(['python3','fetcher.py'],
-                                   capture_output=True, text=True, timeout=300)
+            import subprocess
+            print("  Refreshing data...")
+            r = subprocess.run(
+                ['python3', '-c',
+                 'from dex_scanner import fetch_dex_gems; fetch_dex_gems(); '
+                 'from social_monitor import run_social_monitoring; run_social_monitoring(); '
+                 'from portfolio import run_portfolio_signals; run_portfolio_signals()'],
+                capture_output=True, text=True, timeout=120,
+                close_fds=True,
+                cwd=os.path.dirname(os.path.abspath(__file__)) or '.')
+            if r.stdout:
+                for line in r.stdout.strip().split('\n'):
+                    if line.strip():
+                        print(f"  {line}")
+            if r.returncode != 0 and r.stderr:
+                print(f"  Refresh warning: {r.stderr[:200]}")
                 for line in r.stdout.split('\n'):
                     if any(x in line for x in ['gems','Social','Portfolio','Agent','Security']):
                         print(f"  {line.strip()}")
@@ -807,7 +939,10 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
         actions = run_agent_cycle(portfolio, stop_loss, take_profit)
         print(f"  Actions: {actions}")
         portfolio.print_status()
-        portfolio.save()
+        try:
+            portfolio.save()
+        except Exception as _se:
+            print(f"  WARN: save failed ({_se}) — continuing")
 
         if datetime.now(timezone.utc) < end_time:
             print(f"\n  Next cycle in {cycle_min} min... (Ctrl+C to stop)")
@@ -820,18 +955,97 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     print(f"\n{'='*60}")
     print(f"  COMPLETE -- {sim_id}")
     portfolio.print_status()
-    display_results(sim_id)
+    display_results(sim_id, portfolio)
     portfolio.save()
 
 
 # ── Results display ───────────────────────────────────────────────────────────
-def display_results(sim_id=None):
-    conn = get_db()
+def _display_from_memory(portfolio):
+    """Display final results from in-memory portfolio — DB-independent."""
+    print(f"\n{'='*65}")
+    print(f"  RESULTS: {portfolio.sim_id}")
+    print(f"{'='*65}")
+    print(f"  {'Symbol':<10} {'Chain':<8} {'Buy':>12} {'Now':>12} {'P&L':>10} {'%':>8} Status")
+    print(f"  {'-'*63}")
+
+    sells = [t for t in portfolio.trades if t['action'] == 'SELL']
+    buys  = {f"{t['symbol']}_{t['chain']}": t for t in portfolio.trades if t['action'] == 'BUY'}
+    total_in = total_now = 0
+
+    # Open positions
+    for key, pos in sorted(portfolio.holdings.items(), key=lambda x: -(x[1].get('buy_price',0))):
+        if pos.get('is_real'):
+            continue
+        sym, chain = pos['symbol'], pos['chain']
+        buy_p = pos.get('buy_price', 0)
+        now_p = resolve_price(sym, chain=chain) or buy_p
+        val_now = pos['amount'] * now_p
+        val_in  = pos.get('usd_spent', 0)
+        pnl = val_now - val_in
+        pct = pnl / val_in * 100 if val_in else 0
+        d = 'UP' if pnl >= 0 else 'DN'
+        total_in += val_in
+        total_now += val_now
+        print(f"  {d} {sym:<10} {chain:<8} {buy_p:>12.8g} {now_p:>12.8g} {pnl:>10.2f} {pct:>7.1f}% HOLDING")
+
+    # Closed positions
+    for t in sorted(sells, key=lambda x: x.get('pnl_pct', 0)):
+        sym, chain = t['symbol'], t['chain']
+        buy_p = t.get('buy_price', 0)
+        sell_p = t.get('price', 0)
+        pnl = t.get('pnl', 0)
+        pct = t.get('pnl_pct', 0)
+        usd = t.get('usd', 0)
+        d = 'UP' if pnl >= 0 else 'DN'
+        total_in += usd
+        total_now += usd + pnl
+        reason = t.get('reason', 'SOLD')
+        print(f"  {d} {sym:<10} {chain:<8} {buy_p:>12.8g} {sell_p:>12.8g} {pnl:>10.2f} {pct:>7.1f}% {reason.upper()}")
+
+    print(f"  {'-'*63}")
+    wins   = sum(1 for t in sells if t.get('pnl',0) > 0)
+    losses = sum(1 for t in sells if t.get('pnl',0) <= 0)
+    total_pnl = total_now - total_in
+    pct_total = total_pnl / total_in * 100 if total_in else 0
+    d = 'UP' if total_pnl >= 0 else 'DN'
+    print(f"  {d} Trading: ${total_in:.2f} -> ${total_now:.2f} = ${total_pnl:+.2f} ({pct_total:+.1f}%)")
+    print(f"  Win rate: {wins}W / {losses}L = {wins/max(wins+losses,1)*100:.0f}%")
+
+    t0 = getattr(portfolio, 't0_prices', {})
+    print(f"\n  Real Portfolio (vs T=0):")
+    real_total = real_pnl = 0
+    for chain, plist in REAL_PORTFOLIO.items():
+        for pos in plist:
+            p_now = resolve_price(pos['symbol'], pos['coin_id'], chain) or pos['entry_price']
+            p_ref = t0.get(pos['symbol'], pos['entry_price'])
+            val = pos['amount'] * p_now
+            pnl_r = (p_now - p_ref) * pos['amount']
+            real_total += val
+            real_pnl += pnl_r
+            d = 'UP' if pnl_r >= 0 else 'DN'
+            print(f"    {d} {pos['symbol']:<6} ${p_ref:.2f}->${p_now:.2f} x{pos['amount']} = ${val:,.2f} ({pnl_r:+.2f})")
+    print(f"  Real portfolio total: ${real_total:,.2f} (session pnl: ${real_pnl:+.2f})")
+    print(f"{'='*65}\n")
+
+
+def display_results(sim_id=None, portfolio=None):
+    # Prefer in-memory portfolio over DB (DB may be stale if writes failed)
+    if portfolio and portfolio.trades:
+        _display_from_memory(portfolio)
+        return
+
+    # Use a fresh read-only connection — never the shared writer connection
+    try:
+        conn = sqlite3.connect(SIM_DB, timeout=10)
+    except Exception:
+        print("  Cannot read sim DB")
+        return
     if not sim_id:
         row = conn.execute(
             "SELECT sim_id FROM sim_runs ORDER BY start_time DESC LIMIT 1").fetchone()
         if not row:
             print("No simulations found")
+            conn.close()
             return
         sim_id = row[0]
 
@@ -894,21 +1108,23 @@ def display_results(sim_id=None):
     print(f"  {d} Trading: ${total_in:.2f} -> ${total_now:.2f} = ${total_pnl:+.2f} ({pct:+.1f}%)")
     print(f"  Win rate: {wins}W / {losses}L = {wins/max(wins+losses,1)*100:.0f}%")
 
-    print(f"\n  Real Portfolio (live prices):")
+    print(f"\n  Real Portfolio (vs T=0 session start):")
     real_total = real_pnl = 0
+    # Use portfolio T=0 snapshot if available, else entry_price
+    t0 = getattr(portfolio, 't0_prices', {}) if portfolio else {}
     for chain, plist in REAL_PORTFOLIO.items():
         for pos in plist:
-            p = resolve_price(pos['symbol'], pos['coin_id'], chain)
-            p = p or pos['entry_price']
-            val = pos['amount'] * p
-            entry = pos['amount'] * pos['entry_price']
-            pnl_r = val - entry
+            p_now = resolve_price(pos['symbol'], pos['coin_id'], chain)
+            p_now = p_now or pos['entry_price']
+            p_ref = t0.get(pos['symbol'], pos['entry_price'])  # T=0 or entry
+            val = pos['amount'] * p_now
+            pnl_r = (p_now - p_ref) * pos['amount']
             real_total += val
             real_pnl += pnl_r
             d = 'UP' if pnl_r >= 0 else 'DN'
-            print(f"    {d} {pos['symbol']:<6} ${pos['entry_price']:.2f}->${p:.2f} "
+            print(f"    {d} {pos['symbol']:<6} ${p_ref:.2f}->${p_now:.2f} "
                   f"x{pos['amount']} = ${val:,.2f} ({pnl_r:+.2f})")
-    print(f"  Real portfolio total: ${real_total:,.2f} (pnl: ${real_pnl:+.2f})")
+    print(f"  Real portfolio total: ${real_total:,.2f} (session pnl: ${real_pnl:+.2f})")
     print(f"{'='*65}\n")
 
 
