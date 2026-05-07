@@ -7,10 +7,18 @@ import sqlite3
 import json
 import time
 import os
+import resource
 import argparse
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
+
+# Raise file descriptor limit to prevent "Too many open files" after long runs
+try:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(8192, hard), hard))
+except Exception:
+    pass
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 STARTING_BALANCE_USD = 200.0
@@ -75,8 +83,17 @@ def _db_price(symbol):
     return 0.0
 
 
+# Binance symbols for direct price feed (no rate limit)
+BINANCE_SYMBOLS = {
+    'BTC':'BTCUSDT','ETH':'ETHUSDT','SOL':'SOLUSDT','BNB':'BNBUSDT',
+    'LINK':'LINKUSDT','HYPE':'HYPEUSDT','XRP':'XRPUSDT','ADA':'ADAUSDT',
+    'DOGE':'DOGEUSDT','AVAX':'AVAXUSDT','ATOM':'ATOMUSDT','NEAR':'NEARUSDT',
+    'ARB':'ARBUSDT','AAVE':'AAVEUSDT','UNI':'UNIUSDT','LTC':'LTCUSDT',
+}
+
+
 def resolve_price(symbol, coin_id='', chain='', use_cache=True):
-    """Fetch live price. DB first (from fetcher), then live APIs."""
+    """Fetch live price. Multiple sources with fallback chain."""
     sym = symbol.upper()
     cache_key = f"{sym}_{chain}"
 
@@ -86,7 +103,7 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
         if time.time() - cached_time < 240 and cached_price > 0:
             return cached_price
 
-    # Try DB first — fetcher populates this every cycle, always fresh
+    # 0. DB first — fetcher writes fresh prices here every cycle
     price = _db_price(sym)
     if price > 0:
         _price_cache[cache_key] = (price, time.time())
@@ -94,11 +111,22 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
 
     price = 0.0
 
-    # 1. CoinGecko for majors
+    # 1. Binance — free, no rate limit, instant for majors
+    if sym in BINANCE_SYMBOLS:
+        try:
+            r = requests.get(
+                f'https://api.binance.com/api/v3/ticker/price?symbol={BINANCE_SYMBOLS[sym]}',
+                timeout=5)
+            if r.status_code == 200:
+                price = float(r.json().get('price', 0) or 0)
+        except Exception:
+            pass
+
+    # 2. CoinGecko for majors (rate-limited — use as fallback)
     cg_id = CG_IDS.get(sym, '')
     if not cg_id and coin_id and len(coin_id) < 30 and '-' in coin_id:
         cg_id = coin_id
-    if cg_id:
+    if not price and cg_id:
         try:
             r = requests.get(
                 f'https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd',
@@ -107,6 +135,21 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
                 price = float(r.json().get(cg_id, {}).get('usd', 0) or 0)
         except Exception:
             pass
+
+    # 3. GeckoTerminal — good for new tokens, no auth needed
+    if not price and chain and chain not in ('bitcoin',):
+        gt_chain = {'solana':'solana','ethereum':'eth','bsc':'bsc',
+                    'base':'base','arbitrum':'arbitrum'}.get(chain,'')
+        if gt_chain and coin_id and len(coin_id) > 20:
+            try:
+                r = requests.get(
+                    f'https://api.geckoterminal.com/api/v2/networks/{gt_chain}/tokens/{coin_id}',
+                    timeout=6)
+                if r.status_code == 200:
+                    p = r.json().get('data',{}).get('attributes',{}).get('price_usd')
+                    price = float(p or 0)
+            except Exception:
+                pass
 
     # 2. DexScreener by symbol
     if not price:
@@ -339,18 +382,18 @@ class SimPortfolio:
         return total
 
     def _real_value(self):
-        """Current live value of real portfolio. Falls back to T=0 snapshot, never to entry prices."""
+        """Current live value — always fetches fresh, never uses cache."""
         total = 0
         for chain, positions in REAL_PORTFOLIO.items():
             for pos in positions:
-                p = resolve_price(pos['symbol'], pos['coin_id'], chain)
+                sym = pos['symbol']
+                # Always bypass cache for real portfolio — we need current prices
+                p = resolve_price(sym, pos['coin_id'], chain, use_cache=False)
                 if not p or p <= 0:
-                    # Fall back to T=0 snapshot price (not stale entry price)
-                    p = self.t0_prices.get(pos['symbol'], 0)
+                    p = self.t0_prices.get(sym, 0)
                     if p > 0:
-                        print(f"    WARN: {pos['symbol']} live price unavailable, using T=0 snapshot ${p:,.4f}")
+                        print(f"    WARN: {sym} using T=0 snapshot ${p:,.4f}")
                     else:
-                        print(f"    WARN: {pos['symbol']} price unavailable, excluded from total")
                         continue
                 total += pos['amount'] * p
         return total
@@ -389,7 +432,8 @@ class SimPortfolio:
         try:
             from executor import on_buy
             contract = self.holdings.get(f"{symbol}_{chain}", {}).get('coin_id', '')
-            on_buy(symbol, chain, usd, price, source, contract)
+            cash_left = sum(self.cash.values())
+            on_buy(symbol, chain, usd, price, source, contract, cash_left=cash_left)
         except Exception:
             pass
         return True, f"bought {tokens:.4f} {symbol} @ ${price:.8f}"
@@ -419,8 +463,14 @@ class SimPortfolio:
         })
         try:
             from executor import on_sell
+            trading_total = self._trading_value()
+            trading_pct = (trading_total - self.starting_trading) / max(self.starting_trading, 1) * 100
             on_sell(symbol, chain, price, pnl_pct, reason,
-                    token_amount=pos.get('amount', 0), contract=pos.get('coin_id', ''))
+                    token_amount=pos.get('amount', 0),
+                    contract=pos.get('coin_id', ''),
+                    pnl_usd=pnl,
+                    trading_total=trading_total,
+                    trading_pct=trading_pct)
         except Exception:
             pass
         return True, f"sold {symbol} @ ${price:.8f} | P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
@@ -451,7 +501,11 @@ class SimPortfolio:
                 pos['_zero_count'] = 0
                 pos['_last_price'] = price
             pnl_pct = (price - buy_price) / buy_price * 100
-            effective_stop = -20.0 if chain in ('solana', 'bsc') else -30.0
+            # SOL/BSC: fast rugs, tight stop. BASE/ETH/ARB: more volatile, wider stop
+            effective_stop = {
+                'solana': -20.0, 'bsc': -20.0,
+                'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
+            }.get(chain, -30.0)
             if pnl_pct <= effective_stop:
                 ok, msg = self.sell(sym, chain, price, 'stop_loss')
                 if ok:
@@ -470,7 +524,7 @@ class SimPortfolio:
         t0_rv = sum(self.t0_prices.get(pos['symbol'], 0) * pos['amount']
                     for positions in REAL_PORTFOLIO.values() for pos in positions
                     if self.t0_prices.get(pos['symbol'], 0) > 0)
-        rv_delta = rv - t0_rv  # change vs T=0 (start of this session)
+        rv_delta = rv - t0_rv if t0_rv > 0 else 0  # change vs T=0
         tp = tv - self.starting_trading
         sells = [t for t in self.trades if t['action'] == 'SELL']
         wins   = sum(1 for t in sells if t.get('pnl', 0) > 0)
@@ -581,7 +635,10 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                         pos['_zero_count'] = 0
                         pos['_last_price'] = price  # track last known price
                     pnl_pct = (price - buy_price) / buy_price * 100
-                    effective_stop = -20 if chain in ('solana', 'bsc') else stop_loss
+                    effective_stop = {
+                        'solana': -20.0, 'bsc': -20.0,
+                        'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
+                    }.get(chain, stop_loss)
                     if pnl_pct <= effective_stop:
                         ok, msg = portfolio.sell(sym, chain, price, 'stop_loss')
                         if ok:
@@ -840,6 +897,11 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if chain == 'bitcoin':
             continue
 
+        # Block offensive/inappropriate token names
+        _BLOCKED_TERMS = {'nigga','nigger','negro','nazi','hitler','rape','isis','porn'}
+        if any(t in sym.lower() for t in _BLOCKED_TERMS):
+            continue
+
         key = f"{sym}_{chain}"
         if key in portfolio.holdings:
             continue
@@ -917,11 +979,8 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
             import subprocess
             print("  Refreshing data...")
             r = subprocess.run(
-                ['python3', '-c',
-                 'from dex_scanner import fetch_dex_gems; fetch_dex_gems(); '
-                 'from social_monitor import run_social_monitoring; run_social_monitoring(); '
-                 'from portfolio import run_portfolio_signals; run_portfolio_signals()'],
-                capture_output=True, text=True, timeout=120,
+                ['python3', 'fetcher.py', '--quick'],
+                capture_output=True, text=True, timeout=180,
                 close_fds=True,
                 cwd=os.path.dirname(os.path.abspath(__file__)) or '.')
             if r.stdout:

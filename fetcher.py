@@ -632,5 +632,17 @@ def fetch_all():
 
 
 if __name__ == '__main__':
+    import sys
+    quick = '--quick' in sys.argv
     init_db()
-    fetch_all()
+    if quick:
+        # Quick mode for sim cycle refreshes — only DEX + social, skip slow sources
+        print("  [quick refresh]")
+        from dex_scanner import fetch_dex_gems
+        fetch_dex_gems()
+        from social_monitor import run_social_monitoring
+        run_social_monitoring()
+        from portfolio import run_portfolio_signals
+        run_portfolio_signals()
+    else:
+        fetch_all()
