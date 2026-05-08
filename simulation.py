@@ -382,20 +382,41 @@ class SimPortfolio:
         return total
 
     def _real_value(self):
-        """Current live value — always fetches fresh, never uses cache."""
+        """Current live value — Binance direct, bypasses all caches."""
+        BINANCE_IDS = {
+            'LINK':'LINKUSDT','ETH':'ETHUSDT','BTC':'BTCUSDT',
+            'SOL':'SOLUSDT','HYPE':'HYPEUSDT','BNB':'BNBUSDT',
+        }
         total = 0
         for chain, positions in REAL_PORTFOLIO.items():
             for pos in positions:
                 sym = pos['symbol']
-                # Always bypass cache for real portfolio — we need current prices
-                p = resolve_price(sym, pos['coin_id'], chain, use_cache=False)
-                if not p or p <= 0:
+                p = 0
+                # 1. Binance direct — no cache, always fresh
+                if sym in BINANCE_IDS:
+                    try:
+                        r = requests.get(
+                            f'https://api.binance.com/api/v3/ticker/price?symbol={BINANCE_IDS[sym]}',
+                            timeout=5)
+                        if r.status_code == 200:
+                            p = float(r.json().get('price', 0) or 0)
+                    except Exception:
+                        pass
+                # 2. Fallback to CoinGecko
+                if not p:
+                    try:
+                        r = requests.get(
+                            f'https://api.coingecko.com/api/v3/simple/price?ids={pos["coin_id"]}&vs_currencies=usd',
+                            timeout=6)
+                        if r.status_code == 200:
+                            p = float(r.json().get(pos['coin_id'],{}).get('usd',0) or 0)
+                    except Exception:
+                        pass
+                # 3. T=0 snapshot last resort
+                if not p:
                     p = self.t0_prices.get(sym, 0)
-                    if p > 0:
-                        print(f"    WARN: {sym} using T=0 snapshot ${p:,.4f}")
-                    else:
-                        continue
-                total += pos['amount'] * p
+                if p > 0:
+                    total += pos['amount'] * p
         return total
 
     def _trading_value(self):
