@@ -66,8 +66,50 @@ WETH = {
     'base':     '0x4200000000000000000000000000000000000006',
 }
 
-# Uniswap pool fees (try 3000 = 0.3% first, then 10000 = 1%)
+# Uniswap v3 pool fees (try 0.3% first, then 1%, then 0.05%)
 POOL_FEES = [3000, 10000, 500]
+
+# Additional DEX routers — fallback chain if Uniswap v3 has no pool
+DEX_ROUTERS = {
+    'ethereum': [
+        {'name': 'Uniswap v3',  'type': 'v3', 'router': '0xE592427A0AEce92De3Edee1F18E0157C05861564'},
+        {'name': 'Uniswap v2',  'type': 'v2', 'router': '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D'},
+        {'name': 'SushiSwap',   'type': 'v2', 'router': '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F'},
+    ],
+    'base': [
+        {'name': 'Uniswap v3',  'type': 'v3', 'router': '0xE592427A0AEce92De3Edee1F18E0157C05861564'},
+        {'name': 'Aerodrome',   'type': 'v2', 'router': '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43'},
+        {'name': 'Uniswap v2',  'type': 'v2', 'router': '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24'},
+    ],
+}
+
+# Uniswap v2 router ABI (minimal)
+UNISWAP_V2_ABI = [
+    {
+        "inputs": [
+            {"name": "amountIn",     "type": "uint256"},
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "path",         "type": "address[]"},
+            {"name": "to",           "type": "address"},
+            {"name": "deadline",     "type": "uint256"},
+        ],
+        "name": "swapExactETHForTokensSupportingFeeOnTransferTokens",
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "payable", "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "amountIn",     "type": "uint256"},
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "path",         "type": "address[]"},
+            {"name": "to",           "type": "address"},
+            {"name": "deadline",     "type": "uint256"},
+        ],
+        "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "nonpayable", "type": "function"
+    },
+]
 
 # Jupiter / Jito
 JUPITER_QUOTE = 'https://api.jup.ag/swap/v1/quote'
@@ -207,13 +249,30 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
+def _get_spl_decimals(mint_address) -> int:
+    """Fetch SPL token decimals from Solana RPC."""
+    try:
+        r = requests.post('https://api.mainnet-beta.solana.com', json={
+            'jsonrpc': '2.0', 'id': 1,
+            'method': 'getAccountInfo',
+            'params': [mint_address, {'encoding': 'jsonParsed'}]
+        }, timeout=8)
+        info = r.json().get('result', {}).get('value', {})
+        decimals = info.get('data', {}).get('parsed', {}).get('info', {}).get('decimals', 6)
+        return int(decimals)
+    except Exception:
+        return 6  # safe default for most SPL tokens
+
+
 def execute_sol_sell(symbol, contract, token_amount) -> dict:
     if DRY_RUN: return {'success': False, 'mode': 'dry'}
     kp = _sol_keypair()
     if not kp: return {'success': False, 'error': 'No SOL keypair'}
     if not contract or len(contract) < 30:
         return {'success': False, 'error': f'No contract for {symbol}'}
-    raw = int(token_amount * 1e6)  # assume 6 decimals for SPL
+    # Fetch actual decimals from chain — never assume
+    decimals = _get_spl_decimals(contract)
+    raw = int(token_amount * (10 ** decimals))
     quote = _jupiter_quote(contract, WSOL_MINT, raw)
     if not quote: return {'success': False, 'error': 'Jupiter quote failed'}
     try:
@@ -342,63 +401,117 @@ def _approve_token(w3, chain, token_address, amount_wei, acct, addr):
         print(f"    approve error: {e}")
         return False
 
-def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei) -> dict:
-    """
-    Buy token with ETH via Uniswap v3 exactInputSingle.
-    Tries fee tiers 0.3%, 1%, 0.05% in order.
-    """
-    weth = w3.to_checksum_address(WETH[chain])
-    token = w3.to_checksum_address(token_out)
-    router = w3.eth.contract(
-        address=w3.to_checksum_address(UNISWAP_ROUTER), abi=UNISWAP_ABI)
-
-    slippage = SLIPPAGE_BPS / 10000
-    deadline = int(time.time()) + 300  # 5 min
-
-    # Estimate gas with EIP-1559
+def _gas_params(w3):
+    """EIP-1559 gas params."""
     fee_history = w3.eth.fee_history(1, 'latest', [50])
     base_fee = fee_history['baseFeePerGas'][-1]
     priority_fee = w3.to_wei(2, 'gwei')
-    max_fee = base_fee * 2 + priority_fee
+    return base_fee * 2 + priority_fee, priority_fee
 
-    last_error = None
+
+def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -> dict:
+    """Buy via Uniswap v2 style router (also works for Aerodrome, SushiSwap)."""
+    weth = w3.to_checksum_address(WETH[chain])
+    token = w3.to_checksum_address(token_out)
+    router = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=UNISWAP_V2_ABI)
+    max_fee, priority_fee = _gas_params(w3)
+    deadline = int(time.time()) + 300
+    try:
+        tx = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+            0, [weth, token], addr, deadline
+        ).build_transaction({
+            'from': addr, 'value': eth_amount_wei, 'gas': 200000,
+            'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
+            'nonce': w3.eth.get_transaction_count(addr),
+            'chainId': CHAIN_IDS[chain], 'type': 2,
+        })
+        signed = acct.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt['status'] == 1:
+            return {'success': True, 'tx': tx_hash.hex(), 'gas_used': receipt['gasUsed']}
+        return {'success': False, 'error': 'V2 TX reverted'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> dict:
+    """Sell via Uniswap v2 style router."""
+    weth = w3.to_checksum_address(WETH[chain])
+    token = w3.to_checksum_address(token_in)
+    router = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=UNISWAP_V2_ABI)
+    max_fee, priority_fee = _gas_params(w3)
+    deadline = int(time.time()) + 300
+    try:
+        tx = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            amount_wei, 0, [token, weth], addr, deadline
+        ).build_transaction({
+            'from': addr, 'value': 0, 'gas': 200000,
+            'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
+            'nonce': w3.eth.get_transaction_count(addr),
+            'chainId': CHAIN_IDS[chain], 'type': 2,
+        })
+        signed = acct.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt['status'] == 1:
+            return {'success': True, 'tx': tx_hash.hex(), 'gas_used': receipt['gasUsed']}
+        return {'success': False, 'error': 'V2 sell TX reverted'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei) -> dict:
+    """
+    Buy token with ETH. Tries DEX routers in order:
+    Uniswap v3 (3 fee tiers) → Uniswap v2 → Aerodrome/Sushi
+    """
+    weth = w3.to_checksum_address(WETH[chain])
+    token = w3.to_checksum_address(token_out)
+    max_fee, priority_fee = _gas_params(w3)
+    deadline = int(time.time()) + 300
+    errors = []
+
+    # Try Uniswap v3 first (best price, lowest gas)
+    router_v3 = w3.eth.contract(
+        address=w3.to_checksum_address(UNISWAP_ROUTER), abi=UNISWAP_ABI)
     for pool_fee in POOL_FEES:
         try:
-            # Build swap tx — ETH → token (payable, no approval needed)
-            tx = router.functions.exactInputSingle({
-                'tokenIn':           weth,
-                'tokenOut':          token,
-                'fee':               pool_fee,
-                'recipient':         addr,
-                'deadline':          deadline,
-                'amountIn':          eth_amount_wei,
-                'amountOutMinimum':  0,  # accept any amount (slippage via deadline)
+            tx = router_v3.functions.exactInputSingle({
+                'tokenIn': weth, 'tokenOut': token, 'fee': pool_fee,
+                'recipient': addr, 'deadline': deadline,
+                'amountIn': eth_amount_wei, 'amountOutMinimum': 0,
                 'sqrtPriceLimitX96': 0,
             }).build_transaction({
-                'from':                 addr,
-                'value':                eth_amount_wei,
-                'gas':                  250000,
-                'maxFeePerGas':         max_fee,
-                'maxPriorityFeePerGas': priority_fee,
-                'nonce':                w3.eth.get_transaction_count(addr),
-                'chainId':              CHAIN_IDS[chain],
-                'type':                 2,
+                'from': addr, 'value': eth_amount_wei, 'gas': 250000,
+                'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
+                'nonce': w3.eth.get_transaction_count(addr),
+                'chainId': CHAIN_IDS[chain], 'type': 2,
             })
             signed = acct.sign_transaction(tx)
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             if receipt['status'] == 1:
                 return {'success': True, 'tx': tx_hash.hex(),
-                        'fee_tier': pool_fee, 'gas_used': receipt['gasUsed']}
-            last_error = f"TX reverted (fee={pool_fee})"
+                        'dex': f'Uniswap v3 ({pool_fee/10000:.2f}%)',
+                        'gas_used': receipt['gasUsed']}
+            errors.append(f"Uniswap v3 fee={pool_fee} reverted")
         except Exception as e:
-            last_error = str(e)
-            continue
+            errors.append(f"Uniswap v3 fee={pool_fee}: {str(e)[:60]}")
 
-    return {'success': False, 'error': last_error or 'All fee tiers failed'}
+    # Fallback to v2-style routers (Uniswap v2, Aerodrome, SushiSwap)
+    for dex in DEX_ROUTERS.get(chain, [])[1:]:  # skip index 0 (v3, already tried)
+        print(f"    Trying {dex['name']} fallback...")
+        result = _try_v2_buy(w3, chain, acct, addr, dex['router'], token_out, eth_amount_wei)
+        if result['success']:
+            result['dex'] = dex['name']
+            return result
+        errors.append(f"{dex['name']}: {result.get('error','')[:60]}")
+
+    return {'success': False, 'error': ' | '.join(errors[-3:])}
 
 def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei) -> dict:
-    """Sell token for ETH via Uniswap v3."""
+    """Sell token for ETH. Tries Uniswap v3 then v2 fallbacks."""
     weth = w3.to_checksum_address(WETH[chain])
     token = w3.to_checksum_address(token_in)
     router = w3.eth.contract(
@@ -476,8 +589,9 @@ def execute_evm_buy(symbol, chain, contract, usd) -> dict:
         price = (eth_amount * eth_price)  # rough — actual price from logs
         result['price'] = price
         result['eth_spent'] = eth_amount
+        dex_used = result.get('dex', 'DEX')
         _tg(f"✅ <b>BUY {symbol}</b> ({chain})\n"
-            f"💵 ${usd:.0f} | fee:{result['fee_tier']/10000:.2f}%\n"
+            f"💵 ${usd:.0f} via {dex_used}\n"
             f"🔗 {result['tx'][:16]}...")
     return result
 

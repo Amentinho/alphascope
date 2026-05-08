@@ -947,6 +947,14 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     monitor = run_price_monitor(portfolio, stop_loss, take_profit,
                                 duration_minutes=int(hours*60)+5)
 
+    # Start opportunity hunter (airdrops, presales, launchpads)
+    try:
+        from opportunity_hunter import start_hunter_thread
+        start_hunter_thread(interval_minutes=60)
+        print("  🔍 Opportunity hunter: active (airdrops + presales + launchpads)")
+    except Exception as _oh_err:
+        print(f"  ⚠️  Opportunity hunter: {_oh_err}")
+
     # Notify executor of sim start
     try:
         from executor import alert_start
