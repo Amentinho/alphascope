@@ -59,10 +59,24 @@ EVM_WALLET        = _env('EVM_WALLET_ADDRESS')
 
 # Chain config
 CHAIN_IDS = {'ethereum':1, 'base':8453, 'arbitrum':42161, 'bsc':56}
+# Primary RPCs — reliable, high rate limits
 RPCS = {
-    'ethereum': 'https://rpc.flashbots.net',  # MEV protection
+    'ethereum': 'https://eth.llamarpc.com',        # LlamaRPC — free, no rate limit
     'base':     'https://mainnet.base.org',
     'arbitrum': 'https://arb1.arbitrum.io/rpc',
+}
+# Fallback RPCs if primary fails
+RPCS_FALLBACK = {
+    'ethereum': [
+        'https://cloudflare-eth.com',
+        'https://1rpc.io/eth',
+        'https://rpc.ankr.com/eth',
+        'https://eth-mainnet.public.blastapi.io',
+    ],
+    'base': [
+        'https://1rpc.io/base',
+        'https://base.llamarpc.com',
+    ],
 }
 
 # Uniswap v3 — same address on ETH and BASE
@@ -96,14 +110,13 @@ DEX_ROUTERS = {
 UNISWAP_V2_ABI = [
     {
         "inputs": [
-            {"name": "amountIn",     "type": "uint256"},
             {"name": "amountOutMin", "type": "uint256"},
             {"name": "path",         "type": "address[]"},
             {"name": "to",           "type": "address"},
             {"name": "deadline",     "type": "uint256"},
         ],
         "name": "swapExactETHForTokensSupportingFeeOnTransferTokens",
-        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "outputs": [],
         "stateMutability": "payable", "type": "function"
     },
     {
@@ -115,7 +128,7 @@ UNISWAP_V2_ABI = [
             {"name": "deadline",     "type": "uint256"},
         ],
         "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
-        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "outputs": [],
         "stateMutability": "nonpayable", "type": "function"
     },
 ]
@@ -386,10 +399,17 @@ ERC20_ABI = [
 def _w3(chain):
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(RPCS[chain]))
-        if not w3.is_connected():
-            raise Exception(f"Cannot connect to {chain} RPC")
-        return w3
+        # Try primary RPC first, then fallbacks
+        rpcs_to_try = [RPCS[chain]] + RPCS_FALLBACK.get(chain, [])
+        for rpc_url in rpcs_to_try:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 15}))
+                if w3.is_connected():
+                    return w3
+            except Exception:
+                continue
+        print(f"  All RPCs failed for {chain}")
+        return None
     except ImportError:
         print("  executor: pip install web3")
         return None
@@ -453,7 +473,10 @@ def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -
     deadline = int(time.time()) + 300
     try:
         tx = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-            0, [weth, token], addr, deadline
+            0,           # amountOutMin — accept any
+            [weth, token],
+            addr,
+            deadline
         ).build_transaction({
             'from': addr, 'value': eth_amount_wei, 'gas': 200000,
             'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
