@@ -206,6 +206,29 @@ def _sol_keypair():
         print(f"  SOL keypair error: {e}")
         return None
 
+def _resolve_sol_mint(symbol) -> str:
+    """Look up SOL token mint address from Jupiter token list."""
+    try:
+        r = requests.get(
+            'https://api.jup.ag/tokens/v1/tagged/verified',
+            timeout=8)
+        if r.status_code == 200:
+            for token in r.json():
+                if token.get('symbol', '').upper() == symbol.upper():
+                    return token.get('address', '')
+        # Also try strict list
+        r2 = requests.get(
+            f'https://api.jup.ag/tokens/v1/search?query={symbol}',
+            timeout=8)
+        if r2.status_code == 200:
+            tokens = r2.json()
+            if tokens:
+                return tokens[0].get('address', '')
+    except Exception as e:
+        print(f"    mint lookup: {e}")
+    return ''
+
+
 def _jupiter_quote(input_mint, output_mint, amount_raw):
     try:
         r = requests.get(JUPITER_QUOTE, params={
@@ -229,6 +252,9 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
     if DRY_RUN: return {'success': False, 'mode': 'dry'}
     kp = _sol_keypair()
     if not kp: return {'success': False, 'error': 'No SOL keypair'}
+    # Try to resolve contract from Jupiter token list if missing
+    if not contract or len(contract) < 30:
+        contract = _resolve_sol_mint(symbol)
     if not contract or len(contract) < 30:
         return {'success': False, 'error': f'No contract for {symbol}'}
     sol_price = _sol_price()

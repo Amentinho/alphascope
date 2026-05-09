@@ -431,7 +431,7 @@ class SimPortfolio:
     def can_buy(self, chain, usd):
         return self.cash.get(chain, 0) >= usd
 
-    def buy(self, symbol, chain, usd, price, source='agent'):
+    def buy(self, symbol, chain, usd, price, source='agent', contract=''):
         if price <= 0:
             return False, f"price is zero"
         if not self.can_buy(chain, usd):
@@ -443,6 +443,7 @@ class SimPortfolio:
             'symbol': symbol, 'chain': chain, 'amount': tokens,
             'buy_price': price, 'buy_time': datetime.now().isoformat(),
             'usd_spent': usd, 'source': source,
+            'coin_id': contract,  # mint address for real execution
             'is_real': False, '_zero_count': 0,
         }
         self.trades.append({
@@ -452,7 +453,6 @@ class SimPortfolio:
         })
         try:
             from executor import on_buy
-            contract = self.holdings.get(f"{symbol}_{chain}", {}).get('coin_id', '')
             cash_left = sum(self.cash.values())
             on_buy(symbol, chain, usd, price, source, contract, cash_left=cash_left)
         except Exception:
@@ -943,7 +943,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             print(f'    SKIP {sym} -- price dust (${price:.2e})')
             continue
 
-        ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'))
+        ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'),
+                              contract=p.get('coin_id', ''))
         if ok:
             print(f"    BUY {sym} ${trade_usd:.0f} @ ${price:.8f} | {str(p.get('reasons', ''))[:50]}")
             chain_counts[chain] = chain_counts.get(chain, 0) + 1

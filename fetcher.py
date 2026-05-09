@@ -87,6 +87,7 @@ REDDIT_SUBS = [
     'lowcap','CryptoHints','SatoshiStreetBets',
     # AI & DePIN
     'artificial','MachineLearning','depin','render_network',
+    'Cryptocurrency_Daily',
     # RWA
     'RealWorldAssets',
 ]

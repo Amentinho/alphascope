@@ -248,7 +248,7 @@ def scan_airdrops():
         if table:
             rows = main_conn.execute(f"""
                 SELECT project_name, legitimacy_score, deadline, reward_estimate,
-                       qualification_steps, project_url, status
+                       qualification_steps, website_url, status
                 FROM {table}
                 WHERE legitimacy_score >= ?
                 AND (status IS NULL OR status NOT IN ('DONE','SKIP','EXPIRED'))
@@ -381,16 +381,20 @@ def scan_presales():
     """Scan project_watchlist and pre-launch gems for presale opportunities."""
     try:
         main_conn = sqlite3.connect(MAIN_DB, timeout=10)
-        # Check project_watchlist for presale flags
-        rows = main_conn.execute("""
-            SELECT symbol, name, chain, current_price, presale_found,
-                   alert_detail, updated_at
-            FROM project_watchlist
-            WHERE presale_found = 1
-            AND updated_at >= datetime('now', '-24 hours')
-            ORDER BY updated_at DESC
-            LIMIT 10
-        """).fetchall()
+        # Check project_watchlist for presale flags (table may not exist)
+        rows = []
+        try:
+            rows = main_conn.execute("""
+                SELECT symbol, name, chain, current_price, presale_found,
+                       alert_detail, updated_at
+                FROM project_watchlist
+                WHERE presale_found = 1
+                AND updated_at >= datetime('now', '-24 hours')
+                ORDER BY updated_at DESC
+                LIMIT 10
+            """).fetchall()
+        except Exception:
+            pass
 
         # Also check pre-launch gems
         pre_rows = main_conn.execute("""

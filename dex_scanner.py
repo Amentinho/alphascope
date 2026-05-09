@@ -193,7 +193,13 @@ def process_pair(pair, now_ts, enriched):
         symbol = base.get('symbol', '').upper()
         addr   = base.get('address', '')
 
-        if not name or not addr:
+        if not name:
+            return
+        # If token address is empty (GeckoTerminal), use pair address as key
+        # Real token address will be resolved via DexScreener enrichment
+        if not addr:
+            addr = pair.get('pairAddress', '')
+        if not addr:
             return
 
         # Skip stablecoins, wrapped tokens, and non-ASCII symbols
@@ -361,7 +367,7 @@ def fetch_birdeye_trending():
                         'chainId': chain,
                         'dexId': attrs.get('dex_id', 'unknown'),
                         'pairAddress': pool.get('id', '').split('_')[-1],
-                        'baseToken': {'address': '', 'name': base_token, 'symbol': symbol},
+                        'baseToken': {'address': attrs.get('base_token_mint_address', '') or attrs.get('base_token_address', '') or '', 'name': base_token, 'symbol': symbol},
                         'priceUsd': str(attrs.get('base_token_price_usd', 0) or 0),
                         'liquidity': {'usd': liq},
                         'volume': {'h24': float(attrs.get('volume_usd', {}).get('h24', 0) or 0)},
