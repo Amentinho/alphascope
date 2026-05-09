@@ -121,15 +121,35 @@ def scan_airdrops():
     """Read airdrop_intel data from DB and alert on high-score new ones."""
     try:
         main_conn = sqlite3.connect(MAIN_DB, timeout=10)
-        rows = main_conn.execute("""
-            SELECT project_name, legitimacy_score, deadline, reward_estimate,
-                   qualification_steps, project_url, status
-            FROM airdrop_intel
-            WHERE legitimacy_score >= ?
-            AND status NOT IN ('DONE', 'SKIP', 'EXPIRED')
-            ORDER BY legitimacy_score DESC
-            LIMIT 20
-        """, (MIN_AIRDROP_SCORE,)).fetchall()
+        # Try airdrop_projects first (airdrop_intel.py output), then signals fallback
+        table = 'airdrop_projects'
+        try:
+            main_conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+        except Exception:
+            table = None
+
+        if table:
+            rows = main_conn.execute(f"""
+                SELECT project_name, legitimacy_score, deadline, reward_estimate,
+                       qualification_steps, project_url, status
+                FROM {table}
+                WHERE legitimacy_score >= ?
+                AND (status IS NULL OR status NOT IN ('DONE','SKIP','EXPIRED'))
+                ORDER BY legitimacy_score DESC
+                LIMIT 20
+            """, (MIN_AIRDROP_SCORE,)).fetchall()
+        else:
+            # Fallback: read AIRDROP signals directly
+            rows_raw = main_conn.execute("""
+                SELECT DISTINCT title, 7, NULL, 'Unknown reward',
+                       content, url, 'NEW'
+                FROM signals
+                WHERE signal_type = 'AIRDROP'
+                AND fetched_at >= datetime('now', '-48 hours')
+                ORDER BY engagement DESC
+                LIMIT 15
+            """).fetchall()
+            rows = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows_raw]
         main_conn.close()
     except Exception as e:
         print(f"  airdrop scan error: {e}")
@@ -177,6 +197,38 @@ def scan_airdrops():
         _alert_airdrop(name, score, deadline or 'TBD', reward or 'TBD', steps, url or '')
         alerted += 1
         time.sleep(1)  # don't spam Telegram
+
+    # Also scan signals table for recent AIRDROP signal types
+    try:
+        main_conn2 = sqlite3.connect(MAIN_DB, timeout=10)
+        sig_rows = main_conn2.execute("""
+            SELECT DISTINCT title, 7, NULL, 'Check details',
+                   content, url, 'NEW'
+            FROM signals
+            WHERE signal_type = 'AIRDROP'
+            AND fetched_at >= datetime('now', '-24 hours')
+            ORDER BY engagement DESC LIMIT 10
+        """).fetchall()
+        main_conn2.close()
+        for row in sig_rows:
+            name = row[0][:60] if row[0] else 'Unknown'
+            if not name: continue
+            existing = conn.execute(
+                "SELECT id FROM tracked_opportunities WHERE name=? AND type='AIRDROP'",
+                (name,)).fetchone()
+            if existing: continue
+            steps = ['Connect wallet', 'Complete tasks on project website', 'Claim airdrop']
+            conn.execute("""
+                INSERT OR IGNORE INTO tracked_opportunities
+                (type,name,score,steps,url,detected_at,alerted_at,updated_at,status)
+                VALUES ('AIRDROP',?,7,?,?,?,?,?,'ALERTED')
+            """, (name, json.dumps(steps), row[5] or '', now, now, now))
+            conn.commit()
+            _alert_airdrop(name, 7, 'TBD', 'TBD', steps, row[5] or '')
+            alerted += 1
+            time.sleep(1)
+    except Exception as e:
+        print(f"  airdrop signals scan: {e}")
 
     conn.close()
     if alerted:

@@ -976,6 +976,14 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     except Exception as _oh_err:
         print(f"  ⚠️  Opportunity hunter: {_oh_err}")
 
+    # Start source discovery (finds new Telegram/Reddit/Twitter sources weekly)
+    try:
+        from source_discovery import start_discovery_thread
+        start_discovery_thread(interval_hours=168)  # once per week
+        print("  📡 Source discovery: active (weekly auto-expand)")
+    except Exception as _sd_err:
+        print(f"  ⚠️  Source discovery: {_sd_err}")
+
     # Notify executor of sim start
     try:
         from executor import alert_start

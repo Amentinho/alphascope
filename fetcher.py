@@ -31,18 +31,89 @@ from coin_registry import registry
 # ============================================================
 # CONFIG — Sources only, no fixed coins
 # ============================================================
-TELEGRAM_CHANNELS = ['whale_alert_io', 'crypto', 'blockchain',
-                     'CoinTelegraph', 'AirdropOfficial', 'FatPigSignals']
+TELEGRAM_CHANNELS = [
+    # Whale & on-chain
+    'whale_alert_io','lookonchain','spotonchain','onchain_lens','chainbuzz',
+    # News
+    'CoinTelegraph','DecryptMedia','theblockresearch','CryptoNewsIO',
+    'bitcoinmagazine','cryptopanic','cryptobriefing','blockchainmedia',
+    # Signals & alpha
+    'AirdropOfficial','FatPigSignals','CryptoSignals_org','binance_killers',
+    'CryptoCurrencyTrading','PhoenixSignals','Crypto_Signals_Calls',
+    # DeFi
+    'defisignals','defi_movers','uniswap','AaveAave','GMXio','HyperliquidX',
+    # SOL ecosystem
+    'solana','solananews','JupiterExchange','raydiumprotocol','JitoLabs',
+    # BASE ecosystem
+    'base','Aerodrome_Finance','alienbasefinance',
+    # ETH ecosystem
+    'ethereum','eigenlayer','LidoFinance','rocketpool',
+    # Airdrops
+    'CryptoAirdrops','airdrop_alert','airdropking','AirdropDetective',
+    'defi_airdrops','cryptoairdropshunter','freecryptoairdrops',
+    # Macro & market
+    'crypto','blockchain','CryptoCapitalVenture','altcoindaily',
+    'glassnode','coinmetrics','cryptoquant_official',
+    # Layer 2
+    'arbitrum','Optimism','polygonnetwork','zkSync','StarkNetEco','lineaBuild',
+    # AI & DePIN
+    'rendernetwork','fetch_ai','SingularityNET','akashnet',
+    # RWA
+    'ChainlinkOfficial','ondo_finance',
+    # Gems & meme
+    'dexscreener','pepecoineth','shibainuarmy',
+]
 
-REDDIT_SUBS = ['cryptocurrency', 'bitcoin', 'ethereum', 'solana',
-               'CryptoMarkets', 'ethfinance', 'SatoshiStreetBets',
-               'CryptoMoonShots', 'altcoin', 'defi',
-               'cosmosnetwork', 'algorand', 'cardano']
+REDDIT_SUBS = [
+    # Core
+    'cryptocurrency','bitcoin','ethereum','solana','CryptoMarkets',
+    'ethfinance','SatoshiStreetBets','CryptoMoonShots','altcoin','defi',
+    # Specific coins
+    'cardano','algorand','cosmosnetwork','Chainlink','avalanche',
+    'near','BNBChain','arbitrum','optimismCollective','0xPolygon',
+    'zkSync','starknet','Polkadot','fantom','injective',
+    # Trading
+    'CryptoTechnology','CryptoCurrencyTrading','CryptoInvesting',
+    'BitcoinBeginners','LitecoinMarkets','XRP',
+    # DeFi
+    'UniSwap','Aave_Protocol','MakerDAO','yearn_finance','GMX_io',
+    'HyperLiquid','curve_fi','balancer',
+    # SOL ecosystem
+    'solanadev','solanaNFT','SolanaGaming','raydium',
+    # NFT & gaming
+    'NFT','opensea','axieinfinity','PlayToEarn','CryptoGaming',
+    # Gems & airdrops
+    'airdropalert','CryptoAirdrops','CryptoGemDiscovery',
+    'lowcap','CryptoHints','SatoshiStreetBets',
+    # AI & DePIN
+    'artificial','MachineLearning','depin','render_network',
+    # RWA
+    'RealWorldAssets',
+]
 
-AIRDROP_SUBS = ['airdropalert', 'CryptoAirdrops', 'cosmosnetwork']
+AIRDROP_SUBS = [
+    'airdropalert','CryptoAirdrops','cosmosnetwork',
+    'defi','ethereum','solana','CryptoMoonShots',
+    'arbitrum','optimismCollective','starknet','zkSync',
+]
 
 TWITTER_API_KEY = "new1_1597ef833361479ba82c88ff32b2fb8c"
-CASHTAGS = ['$BTC', '$ETH', '$SOL', '$LINK', '$ARB', '$SUI', '$DOGE', '$AVAX']
+CASHTAGS = [
+    # Majors
+    '$BTC','$ETH','$SOL','$BNB','$XRP','$DOGE','$AVAX','$NEAR',
+    # DeFi
+    '$LINK','$AAVE','$UNI','$CRV','$GMX','$HYPE','$ARB','$OP',
+    # SOL ecosystem
+    '$JUP','$WIF','$BONK','$PYTH','$RENDER','$RAY',
+    # L2 & infra
+    '$MATIC','$STRK','$ZK','$TIA','$SUI','$APT','$SEI','$INJ',
+    # AI tokens
+    '$FET','$AGIX','$TAO','$OCEAN','$NMR',
+    # RWA
+    '$ONDO','$CFG','$MPL',
+    # Meme
+    '$PEPE','$SHIB','$FLOKI','$BRETT','$TRUMP',
+]
 
 NARRATIVE_KEYWORDS = {
     'AI': ['ai ', 'artificial intelligence', 'machine learning', 'gpu', 'compute', 'render', 'bittensor'],
