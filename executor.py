@@ -29,16 +29,25 @@ from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
 def _env(key, default=''):
-    val = os.environ.get(key, default)
+    val = os.environ.get(key, '')
     if val: return val
     try:
+        last = default
         for line in open('.env'):
-            if line.strip().startswith(f'{key}='):
-                return line.strip().split('=',1)[1].strip()
-    except Exception: pass
+            line = line.strip()
+            if line.startswith(f'{key}='):
+                last = line.split('=', 1)[1].strip()
+        return last if last != default or True else default
+    except Exception:
+        pass
     return default
 
-DRY_RUN           = _env('EXECUTOR_DRY_RUN','true').lower() != 'false'
+def _is_dry_run():
+    """Read DRY_RUN fresh every call — never cached."""
+    val = _env('EXECUTOR_DRY_RUN', 'true').lower().strip()
+    return val != 'false'
+
+DRY_RUN = _is_dry_run()
 MAX_SOL_PER_TRADE = float(_env('EXECUTOR_MAX_SOL_PER_TRADE','0.5'))
 MAX_ETH_PER_TRADE = float(_env('EXECUTOR_MAX_ETH_PER_TRADE','0.02'))
 SLIPPAGE_BPS      = int(_env('EXECUTOR_SLIPPAGE_BPS','300'))
@@ -630,15 +639,19 @@ def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18) -> dict
 
 
 # ── Unified interface called by simulation.py ─────────────────────────────────
+MAX_TRADE_USD = 20.0  # Phase 2 safety cap — never spend more than $20 real money
+
 def on_buy(symbol, chain, usd, price, source='', contract='', cash_left=None):
     """Called by simulation on every BUY."""
-    alert_buy(symbol, chain, usd, price, source, dry=DRY_RUN, cash_left=cash_left)
+    # Hard safety cap — never exceed $20 in real execution regardless of sim amount
+    real_usd = min(usd, MAX_TRADE_USD)
+    alert_buy(symbol, chain, real_usd, price, source, dry=DRY_RUN, cash_left=cash_left)
     if DRY_RUN:
         return {'success': True, 'mode': 'paper', 'price': price}
     if chain == 'solana':
-        result = execute_sol_buy(symbol, contract, usd)
+        result = execute_sol_buy(symbol, contract, real_usd)
     elif chain in ('base', 'ethereum'):
-        result = execute_evm_buy(symbol, chain, contract, usd)
+        result = execute_evm_buy(symbol, chain, contract, real_usd)
     else:
         # BSC/ARB — paper only for now
         return {'success': True, 'mode': 'paper', 'price': price}

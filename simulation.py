@@ -742,7 +742,7 @@ def _load_dex_proposals(portfolio):
             if liq < liq_min:
                 continue
             # Size by chain
-            trade_usd = 40 if chain in ('solana','bsc') else 50
+            trade_usd = 20  # Phase 2: $20 max per trade
             proposals.append({
                 'action': 'BUY',
                 'symbol': sym,
@@ -905,7 +905,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         chain    = p.get('chain', 'solana')
         action   = p.get('action', '')
         cat      = p.get('category', '')
-        trade_usd = min(p.get('trade_usd', 40), 75)
+        trade_usd = min(p.get('trade_usd', 20), 20)  # Phase 2 hard cap: $20
 
         if not sym or action not in ('BUY', 'ACCUMULATE'):
             continue
