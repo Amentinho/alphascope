@@ -290,8 +290,11 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
         bundle = _jito_submit(base64.b64encode(bytes(tx)).decode())
         out = int(quote.get('outAmount', 0))
         price = (lamports / 1e9 * sol_price) / max(out, 1)
+        sol_url = f"https://solscan.io/tx/{bundle}"
+        _tg(f"✅ <b>SOL BUY {symbol}</b>\n"
+            f'🔗 <a href="{sol_url}">{bundle[:16]}...</a>')
         return {'success': True, 'tx': bundle, 'price': price,
-                'sol_spent': lamports/1e9, 'impact': impact}
+                'sol_spent': lamports/1e9, 'impact': impact, 'url': sol_url}
     except ImportError:
         return {'success': False, 'error': 'pip install solana solders base58'}
     except Exception as e:
@@ -336,8 +339,12 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
         tx.sign([kp])
         bundle = _jito_submit(base64.b64encode(bytes(tx)).decode())
         sol_out = int(quote.get('outAmount', 0)) / 1e9
+        sol_url = f"https://solscan.io/tx/{bundle}"
+        _tg(f"✅ <b>SOL SELL {symbol}</b>\n"
+            f"💵 {sol_out:.4f} SOL received\n"
+            f'🔗 <a href="{sol_url}">{bundle[:16]}...</a>')
         return {'success': True, 'tx': bundle,
-                'sol_received': sol_out, 'usd_received': sol_out * _sol_price()}
+                'sol_received': sol_out, 'usd_received': sol_out * _sol_price(), 'url': sol_url}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
@@ -648,9 +655,12 @@ def execute_evm_buy(symbol, chain, contract, usd) -> dict:
         result['price'] = price
         result['eth_spent'] = eth_amount
         dex_used = result.get('dex', 'DEX')
+        tx = result['tx']
+        explorer = {'ethereum': 'https://etherscan.io/tx/',
+                    'base': 'https://basescan.org/tx/'}.get(chain, 'https://basescan.org/tx/')
         _tg(f"✅ <b>BUY {symbol}</b> ({chain})\n"
             f"💵 ${usd:.0f} via {dex_used}\n"
-            f"🔗 {result['tx'][:16]}...")
+            f'🔗 <a href="{explorer}{tx}">{tx[:16]}...</a>')
     return result
 
 def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18) -> dict:
@@ -681,9 +691,12 @@ def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18) -> dict
             pass
         usd_out = eth_out * _eth_price()
         result['usd_received'] = usd_out
+        tx = result['tx']
+        explorer = {'ethereum': 'https://etherscan.io/tx/',
+                    'base': 'https://basescan.org/tx/'}.get(chain, 'https://basescan.org/tx/')
         _tg(f"✅ <b>SELL {symbol}</b> ({chain})\n"
             f"📋 fee:{result['fee_tier']/10000:.2f}%\n"
-            f"🔗 {result['tx'][:16]}...")
+            f'🔗 <a href="{explorer}{tx}">{tx[:16]}...</a>')
     return result
 
 

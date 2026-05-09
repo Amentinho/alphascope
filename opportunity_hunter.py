@@ -84,6 +84,20 @@ def _tg(msg):
     threading.Thread(target=_send, daemon=True).start()
 
 
+def _tg_airdrop(msg):
+    """Send to dedicated airdrop bot. Falls back to main bot if not configured."""
+    token = _AIRDROP_TOKEN
+    if not token or not TELEGRAM_CHAT: return
+    def _send():
+        try:
+            requests.post(
+                f'https://api.telegram.org/bot{token}/sendMessage',
+                json={'chat_id': TELEGRAM_CHAT, 'text': msg, 'parse_mode': 'HTML'},
+                timeout=8)
+        except Exception: pass
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def _alert_airdrop(name, score, deadline, reward, steps, url):
     steps_text = '\n'.join(f"  {i+1}. {s}" for i, s in enumerate(steps[:5]))
     deadline_str = f"⏰ Deadline: {deadline}" if deadline else ""
