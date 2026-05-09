@@ -715,5 +715,18 @@ if __name__ == '__main__':
         run_social_monitoring()
         from portfolio import run_portfolio_signals
         run_portfolio_signals()
+        # Airdrop processing — always run even in quick mode
+        try:
+            from airdrop_intel import process_new_airdrops
+            process_new_airdrops()
+        except Exception:
+            pass
+        # Opportunity hunter — alert on new airdrops/presales immediately
+        try:
+            from opportunity_hunter import alert_new_airdrop_signals, scan_presales
+            alert_new_airdrop_signals()  # fast path — fires Telegram directly from signals
+            scan_presales()
+        except Exception:
+            pass
     else:
         fetch_all()

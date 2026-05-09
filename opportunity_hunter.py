@@ -38,9 +38,9 @@ MAIN_DB         = 'alphascope.db'
 HUNTER_DB       = 'hunter.db'
 
 # Minimum scores to alert
-MIN_AIRDROP_SCORE   = 6   # out of 10
-MIN_PRESALE_SCORE   = 7   # stricter — real money at stake
-MIN_LAUNCHPAD_SCORE = 7
+MIN_AIRDROP_SCORE   = 4   # out of 10
+MIN_PRESALE_SCORE   = 5   # stricter — real money at stake
+MIN_LAUNCHPAD_SCORE = 6
 
 
 # ── DB ─────────────────────────────────────────────────────────────────────────
@@ -117,6 +117,123 @@ def _alert_launchpad(name, chain, platform, score, launch_time, url):
 
 
 # ── Airdrop scanner ───────────────────────────────────────────────────────────
+def alert_new_airdrop_signals():
+    """
+    Fast path — reads signals table directly and fires Telegram immediately.
+    Called every cycle from fetcher --quick mode.
+    No score threshold — all AIRDROP signals alert.
+    """
+    try:
+        main_conn = sqlite3.connect(MAIN_DB, timeout=10)
+        rows = main_conn.execute("""
+            SELECT DISTINCT title, content, source_detail, engagement, url
+            FROM signals
+            WHERE signal_type = 'AIRDROP'
+            AND fetched_at >= datetime('now', '-35 minutes')
+            ORDER BY engagement DESC
+            LIMIT 10
+        """).fetchall()
+        main_conn.close()
+    except Exception as e:
+        print(f"  airdrop signal check: {e}")
+        return
+
+    if not rows:
+        return
+
+    conn = _get_db()
+    now = datetime.now().isoformat()
+    alerted = 0
+
+    for title, content_txt, source, engagement, url in rows:
+        name = (title or '')[:80]
+        if not name:
+            continue
+        # Skip if already alerted
+        existing = conn.execute(
+            "SELECT id FROM tracked_opportunities WHERE name=?", (name,)).fetchone()
+        if existing:
+            continue
+
+        # Fire Telegram immediately
+        snippet = (content_txt or '')[:200]
+        link_line = ("\n\U0001f517 " + url) if url else ""
+        _tg("\U0001fa82 <b>AIRDROP SIGNAL</b>\n"
+            + "\U0001f4cb " + name + "\n"
+            + "\U0001f4e1 Source: " + (source or "") + "\n"
+            + "\U0001f4ac " + snippet + link_line + "\n"
+            + "\U0001f550 " + datetime.now().strftime("%H:%M:%S"))
+        print(f"  Airdrop alert: {name[:50]} ({source})")
+
+        conn.execute("""
+            INSERT OR IGNORE INTO tracked_opportunities
+            (type, name, score, url, detected_at, alerted_at, updated_at, status)
+            VALUES ('AIRDROP', ?, 5, ?, ?, ?, ?, 'ALERTED')
+        """, (name, url or '', now, now, now))
+        conn.commit()
+        alerted += 1
+        time.sleep(0.5)
+
+    conn.close()
+    if alerted:
+        print(f"  🪂 Fired {alerted} airdrop alerts")
+
+
+def alert_new_airdrop_signals():
+    """Fast path — reads signals table and fires Telegram immediately."""
+    try:
+        main_conn = sqlite3.connect(MAIN_DB, timeout=10)
+        rows = main_conn.execute(
+            """SELECT DISTINCT title, content, source_detail, engagement, url
+               FROM signals
+               WHERE signal_type = 'AIRDROP'
+               AND fetched_at >= datetime('now', '-35 minutes')
+               ORDER BY engagement DESC LIMIT 10""").fetchall()
+        main_conn.close()
+    except Exception as e:
+        print(f"  airdrop signal check: {e}")
+        return
+
+    if not rows:
+        return
+
+    conn = _get_db()
+    now = datetime.now().isoformat()
+    alerted = 0
+
+    for title, content_txt, source, engagement, url in rows:
+        name = (title or '')[:80]
+        if not name:
+            continue
+        existing = conn.execute(
+            "SELECT id FROM tracked_opportunities WHERE name=?", (name,)).fetchone()
+        if existing:
+            continue
+        snippet = (content_txt or '')[:200]
+        link = ("\n🔗 " + url) if url else ""
+        msg = (
+            "\U0001fa82 <b>AIRDROP SIGNAL</b>\n"
+            "\U0001f4cb " + name + "\n"
+            "\U0001f4e1 Source: " + (source or "") + "\n"
+            "\U0001f4ac " + snippet + link + "\n"
+            "\U0001f550 " + datetime.now().strftime("%H:%M:%S")
+        )
+        _tg(msg)
+        print(f"  \U0001fa82 Airdrop alert: {name[:50]} ({source})")
+        conn.execute(
+            """INSERT OR IGNORE INTO tracked_opportunities
+               (type, name, score, url, detected_at, alerted_at, updated_at, status)
+               VALUES ('AIRDROP', ?, 5, ?, ?, ?, ?, 'ALERTED')""",
+            (name, url or '', now, now, now))
+        conn.commit()
+        alerted += 1
+        time.sleep(0.5)
+
+    conn.close()
+    if alerted:
+        print(f"  \U0001fa82 Fired {alerted} airdrop alerts")
+
+
 def scan_airdrops():
     """Read airdrop_intel data from DB and alert on high-score new ones."""
     try:
