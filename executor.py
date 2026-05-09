@@ -349,6 +349,29 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
+def _get_sol_token_balance(wallet_pubkey: str, mint_address: str) -> int:
+    """Get actual raw token balance from Solana wallet. Returns raw amount (with decimals)."""
+    try:
+        r = requests.post('https://api.mainnet-beta.solana.com', json={
+            'jsonrpc': '2.0', 'id': 1,
+            'method': 'getTokenAccountsByOwner',
+            'params': [
+                wallet_pubkey,
+                {'mint': mint_address},
+                {'encoding': 'jsonParsed'}
+            ]
+        }, timeout=10)
+        if r.status_code == 200:
+            accounts = r.json().get('result', {}).get('value', [])
+            if accounts:
+                amount = accounts[0].get('account', {}).get('data', {}).get(
+                    'parsed', {}).get('info', {}).get('tokenAmount', {}).get('amount', '0')
+                return int(amount)
+    except Exception as e:
+        print(f"    balance lookup error: {e}")
+    return 0
+
+
 def _get_spl_decimals(mint_address) -> int:
     """Fetch SPL token decimals from Solana RPC."""
     try:
@@ -370,9 +393,15 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
     if not kp: return {'success': False, 'error': 'No SOL keypair'}
     if not contract or len(contract) < 30:
         return {'success': False, 'error': f'No contract for {symbol}'}
-    # Fetch actual decimals from chain — never assume
+    # Get actual token balance from wallet — more reliable than sim calculation
     decimals = _get_spl_decimals(contract)
-    raw = int(token_amount * (10 ** decimals))
+    kp_pub = str(kp.pubkey())
+    raw = _get_sol_token_balance(kp_pub, contract)
+    if not raw or raw == 0:
+        # Fallback to sim calculation
+        raw = int(token_amount * (10 ** decimals))
+    if not raw or raw == 0:
+        return {'success': False, 'error': f'No {symbol} balance in wallet'}
     quote = _jupiter_quote(contract, WSOL_MINT, raw)
     if not quote: return {'success': False, 'error': 'Jupiter quote failed'}
     try:
@@ -685,6 +714,37 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei) -> dict:
 
     return {'success': False, 'error': last_error or 'All fee tiers failed'}
 
+def _check_uniswap_pool(w3, chain, token_address) -> str:
+    """Check if token has a Uniswap v3 pool. Returns fee tier or '' if none."""
+    try:
+        # Uniswap v3 Factory
+        factory_addr = {
+            'ethereum': '0x1F98431c8aD98523631AE4a59f267346ea31F984',
+            'base':     '0x33128a8fC17869897dcE68Ed026d694621f6FDfD',
+        }.get(chain, '')
+        if not factory_addr:
+            return '3000'  # assume pool exists for other chains
+        factory_abi = [{"inputs":[{"name":"tokenA","type":"address"},
+                                   {"name":"tokenB","type":"address"},
+                                   {"name":"fee","type":"uint24"}],
+                        "name":"getPool","outputs":[{"name":"","type":"address"}],
+                        "stateMutability":"view","type":"function"}]
+        factory = w3.eth.contract(
+            address=w3.to_checksum_address(factory_addr), abi=factory_abi)
+        weth = w3.to_checksum_address(WETH[chain])
+        token = w3.to_checksum_address(token_address)
+        for fee in [3000, 10000, 500]:
+            try:
+                pool = factory.functions.getPool(weth, token, fee).call()
+                if pool and pool != '0x' + '0'*40:
+                    return str(fee)
+            except Exception:
+                continue
+        return ''  # no pool found
+    except Exception:
+        return '3000'  # optimistic fallback
+
+
 def execute_evm_buy(symbol, chain, contract, usd) -> dict:
     if DRY_RUN: return {'success': False, 'mode': 'dry'}
     if chain not in CHAIN_IDS or chain not in WETH:
@@ -697,6 +757,14 @@ def execute_evm_buy(symbol, chain, contract, usd) -> dict:
     eth_price = _eth_price()
     eth_amount = min(usd / eth_price, MAX_ETH_PER_TRADE)
     eth_amount_wei = int(eth_amount * 1e18)
+
+    # Pre-check: verify token has a DEX pool before wasting gas
+    w3_check = _w3(chain)
+    if w3_check:
+        pool_fee = _check_uniswap_pool(w3_check, chain, contract)
+        if not pool_fee:
+            return {'success': False,
+                    'error': f'No Uniswap pool found for {symbol} on {chain}'}
 
     # Check ETH balance
     w3 = _w3(chain)
