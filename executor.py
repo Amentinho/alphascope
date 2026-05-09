@@ -229,25 +229,67 @@ def _sol_keypair():
         return None
 
 def _resolve_sol_mint(symbol) -> str:
-    """Look up SOL token mint address from Jupiter token list."""
+    """Look up SOL token mint address. Tries Jupiter, DexScreener, CoinGecko."""
+    sym_upper = symbol.upper()
+
+    # 1. Jupiter token search
     try:
         r = requests.get(
-            'https://api.jup.ag/tokens/v1/tagged/verified',
-            timeout=8)
-        if r.status_code == 200:
-            for token in r.json():
-                if token.get('symbol', '').upper() == symbol.upper():
-                    return token.get('address', '')
-        # Also try strict list
-        r2 = requests.get(
             f'https://api.jup.ag/tokens/v1/search?query={symbol}',
             timeout=8)
-        if r2.status_code == 200:
-            tokens = r2.json()
-            if tokens:
-                return tokens[0].get('address', '')
-    except Exception as e:
-        print(f"    mint lookup: {e}")
+        if r.status_code == 200:
+            tokens = r.json() if isinstance(r.json(), list) else r.json().get('tokens', [])
+            for t in tokens[:5]:
+                if t.get('symbol', '').upper() == sym_upper:
+                    addr = t.get('address', '') or t.get('mint', '')
+                    if addr and len(addr) > 30:
+                        print(f"    mint found via Jupiter: {symbol} = {addr[:16]}...")
+                        return addr
+    except Exception:
+        pass
+
+    # 2. DexScreener search on Solana
+    try:
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/search?q={symbol}',
+            timeout=8)
+        if r.status_code == 200:
+            pairs = r.json().get('pairs', [])
+            for pair in pairs[:10]:
+                if pair.get('chainId') != 'solana':
+                    continue
+                base = pair.get('baseToken', {})
+                if base.get('symbol', '').upper() == sym_upper:
+                    addr = base.get('address', '')
+                    if addr and len(addr) > 30:
+                        print(f"    mint found via DexScreener: {symbol} = {addr[:16]}...")
+                        return addr
+    except Exception:
+        pass
+
+    # 3. CoinGecko — for established tokens like PENGU
+    try:
+        r = requests.get(
+            f'https://api.coingecko.com/api/v3/search?query={symbol}',
+            timeout=8)
+        if r.status_code == 200:
+            coins = r.json().get('coins', [])
+            for coin in coins[:3]:
+                if coin.get('symbol', '').upper() == sym_upper:
+                    cid = coin.get('id', '')
+                    r2 = requests.get(
+                        f'https://api.coingecko.com/api/v3/coins/{cid}',
+                        timeout=8)
+                    if r2.status_code == 200:
+                        platforms = r2.json().get('platforms', {})
+                        addr = platforms.get('solana', '')
+                        if addr and len(addr) > 30:
+                            print(f"    mint found via CoinGecko: {symbol} = {addr[:16]}...")
+                            return addr
+    except Exception:
+        pass
+
+    print(f"    mint not found for {symbol}")
     return ''
 
 
