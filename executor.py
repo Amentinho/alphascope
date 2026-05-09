@@ -252,10 +252,13 @@ def _resolve_sol_mint(symbol) -> str:
 
 
 def _jupiter_quote(input_mint, output_mint, amount_raw):
+    return _jupiter_quote_slippage(input_mint, output_mint, amount_raw, SLIPPAGE_BPS)
+
+def _jupiter_quote_slippage(input_mint, output_mint, amount_raw, slippage_bps):
     try:
         r = requests.get(JUPITER_QUOTE, params={
             'inputMint': input_mint, 'outputMint': output_mint,
-            'amount': amount_raw, 'slippageBps': SLIPPAGE_BPS,
+            'amount': amount_raw, 'slippageBps': slippage_bps,
         }, timeout=10)
         if r.status_code == 200: return r.json()
         print(f"    Jupiter {r.status_code}: {r.text[:200]}")
@@ -402,14 +405,21 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
         raw = int(token_amount * (10 ** decimals))
     if not raw or raw == 0:
         return {'success': False, 'error': f'No {symbol} balance in wallet'}
-    quote = _jupiter_quote(contract, WSOL_MINT, raw)
+    # Try with increasing slippage — sells need high tolerance on micro-caps
+    quote = None
+    for slippage in [500, 1000, 3000, 5000]:  # 5%, 10%, 30%, 50%
+        q = _jupiter_quote_slippage(contract, WSOL_MINT, raw, slippage)
+        if q:
+            quote = q
+            break
     if not quote: return {'success': False, 'error': 'Jupiter quote failed'}
     try:
         import base64
         from solders.transaction import VersionedTransaction
         swap = requests.post(JUPITER_SWAP, json={
             'quoteResponse': quote, 'userPublicKey': str(kp.pubkey()),
-            'wrapAndUnwrapSol': True, 'useJitoBundle': True, 'jitoTipLamports': 3000,
+            'wrapAndUnwrapSol': True, 'useJitoBundle': True, 'jitoTipLamports': 5000,
+            'dynamicSlippage': True,  # let Jupiter optimize slippage
         }, timeout=15).json()
         tx_b64 = swap.get('swapTransaction', '')
         if not tx_b64: return {'success': False, 'error': 'No swap tx'}
@@ -434,7 +444,36 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
         return {'success': True, 'tx': bundle,
                 'sol_received': sol_out, 'usd_received': sol_out * _sol_price(), 'url': sol_url}
     except Exception as e:
-        return {'success': False, 'error': str(e)}
+        err = str(e)
+        # Slippage error — quote is stale, retry with fresh quote
+        if '6025' in err or '6024' in err or 'slippage' in err.lower():
+            print(f"    Slippage error on sell — retrying with fresh quote")
+            try:
+                fresh_quote = _jupiter_quote_slippage(contract, WSOL_MINT, raw, 5000)
+                if fresh_quote:
+                    swap2 = requests.post(JUPITER_SWAP, json={
+                        'quoteResponse': fresh_quote,
+                        'userPublicKey': str(kp.pubkey()),
+                        'wrapAndUnwrapSol': True,
+                        'useJitoBundle': True,
+                        'jitoTipLamports': 10000,
+                        'dynamicSlippage': True,
+                    }, timeout=15).json()
+                    tx_b64_2 = swap2.get('swapTransaction', '')
+                    if tx_b64_2:
+                        tx2 = VersionedTransaction.from_bytes(base64.b64decode(tx_b64_2))
+                        try:
+                            signed2 = VersionedTransaction(tx2.message, [kp])
+                        except Exception:
+                            signed2 = tx2
+                        bundle2 = _jito_submit(base64.b64encode(bytes(signed2)).decode())
+                        sol_out2 = int(fresh_quote.get('outAmount', 0)) / 1e9
+                        return {'success': True, 'tx': bundle2,
+                                'sol_received': sol_out2,
+                                'usd_received': sol_out2 * _sol_price()}
+            except Exception as e2:
+                return {'success': False, 'error': f'Retry failed: {e2}'}
+        return {'success': False, 'error': err}
 
 
 # ── EVM: Uniswap v3 (BASE + ETH, no API key) ─────────────────────────────────
