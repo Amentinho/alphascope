@@ -137,7 +137,15 @@ UNISWAP_V2_ABI = [
 # Jupiter / Jito
 JUPITER_QUOTE = 'https://api.jup.ag/swap/v1/quote'
 JUPITER_SWAP  = 'https://api.jup.ag/swap/v1/swap'
-JITO_ENDPOINT = 'https://mainnet.block-engine.jito.labs.io/api/v1/bundles'
+# Jito endpoints — multiple regions, fallback to direct RPC
+JITO_ENDPOINTS = [
+    'https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles',
+    'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles',
+    'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles',
+    'https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles',
+]
+JITO_ENDPOINT = JITO_ENDPOINTS[0]  # kept for compatibility
+SOL_RPC_DIRECT = 'https://api.mainnet-beta.solana.com'  # fallback if Jito fails
 WSOL_MINT     = 'So11111111111111111111111111111111111111112'
 
 
@@ -255,12 +263,38 @@ def _jupiter_quote(input_mint, output_mint, amount_raw):
     return None
 
 def _jito_submit(signed_b64):
-    r = requests.post(JITO_ENDPOINT, json={
-        'jsonrpc': '2.0', 'id': 1,
-        'method': 'sendBundle', 'params': [[signed_b64]]
-    }, headers={'Content-Type': 'application/json'}, timeout=15)
-    if r.status_code == 200: return r.json().get('result', '')
-    raise Exception(f"Jito {r.status_code}: {r.text[:200]}")
+    """Submit tx bundle. Tries all Jito endpoints, falls back to direct Solana RPC."""
+    # Try all Jito endpoints
+    for endpoint in JITO_ENDPOINTS:
+        try:
+            r = requests.post(endpoint, json={
+                'jsonrpc': '2.0', 'id': 1,
+                'method': 'sendBundle', 'params': [[signed_b64]]
+            }, headers={'Content-Type': 'application/json'}, timeout=10)
+            if r.status_code == 200:
+                return r.json().get('result', 'submitted')
+        except Exception:
+            continue
+
+    # Fallback: submit directly to Solana RPC (no MEV protection but tx lands)
+    print("    Jito unavailable — submitting direct to Solana RPC")
+    try:
+        r = requests.post(SOL_RPC_DIRECT, json={
+            'jsonrpc': '2.0', 'id': 1,
+            'method': 'sendTransaction',
+            'params': [signed_b64, {'encoding': 'base64',
+                                     'skipPreflight': False,
+                                     'maxRetries': 3}]
+        }, headers={'Content-Type': 'application/json'}, timeout=15)
+        if r.status_code == 200:
+            result = r.json()
+            if 'result' in result:
+                return result['result']
+            if 'error' in result:
+                raise Exception(f"RPC error: {result['error']}")
+    except Exception as e:
+        raise Exception(f"All SOL submission methods failed: {e}")
+    raise Exception("SOL tx submission failed")
 
 def execute_sol_buy(symbol, contract, usd) -> dict:
     if DRY_RUN: return {'success': False, 'mode': 'dry'}
@@ -473,7 +507,7 @@ def _approve_token(w3, chain, token_address, amount_wei, acct, addr):
             w3.to_checksum_address(UNISWAP_ROUTER), amount_wei
         ).build_transaction({
             'from': addr,
-            'nonce': w3.eth.get_transaction_count(addr),
+            'nonce': w3.eth.get_transaction_count(addr, 'pending'),
             'gas': 60000,
             'maxFeePerGas': w3.to_wei(10, 'gwei'),
             'maxPriorityFeePerGas': w3.to_wei(2, 'gwei'),
@@ -512,7 +546,7 @@ def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -
         ).build_transaction({
             'from': addr, 'value': eth_amount_wei, 'gas': 200000,
             'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
-            'nonce': w3.eth.get_transaction_count(addr),
+            'nonce': w3.eth.get_transaction_count(addr, 'pending'),
             'chainId': CHAIN_IDS[chain], 'type': 2,
         })
         signed = acct.sign_transaction(tx)
@@ -538,7 +572,7 @@ def _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> di
         ).build_transaction({
             'from': addr, 'value': 0, 'gas': 200000,
             'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
-            'nonce': w3.eth.get_transaction_count(addr),
+            'nonce': w3.eth.get_transaction_count(addr, 'pending'),
             'chainId': CHAIN_IDS[chain], 'type': 2,
         })
         signed = acct.sign_transaction(tx)
@@ -575,7 +609,7 @@ def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei) -> dict:
             }).build_transaction({
                 'from': addr, 'value': eth_amount_wei, 'gas': 250000,
                 'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
-                'nonce': w3.eth.get_transaction_count(addr),
+                'nonce': w3.eth.get_transaction_count(addr, 'pending'),
                 'chainId': CHAIN_IDS[chain], 'type': 2,
             })
             signed = acct.sign_transaction(tx)
@@ -634,7 +668,7 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei) -> dict:
                 'gas':                  250000,
                 'maxFeePerGas':         max_fee,
                 'maxPriorityFeePerGas': priority_fee,
-                'nonce':                w3.eth.get_transaction_count(addr),
+                'nonce':                w3.eth.get_transaction_count(addr, 'pending'),
                 'chainId':              CHAIN_IDS[chain],
                 'type':                 2,
             })
@@ -744,6 +778,22 @@ def on_buy(symbol, chain, usd, price, source='', contract='', cash_left=None):
         return {'success': True, 'mode': 'paper', 'price': price}
     if not result.get('success'):
         alert_error(f"BUY {symbol} ({chain}) FAILED: {result.get('error','')}")
+        # If all DEX routers failed, token likely has no pool — skip in future
+        if 'reverted' in str(result.get('error','')) or 'No pool' in str(result.get('error','')):
+            try:
+                import json as _j
+                bl_file = 'sim_ban_list.json'
+                try:
+                    bl = _j.load(open(bl_file))
+                except Exception:
+                    bl = []
+                key = f"{symbol}_{chain}"
+                if key not in bl:
+                    bl.append(key)
+                    _j.dump(bl, open(bl_file,'w'))
+                    print(f"    Auto-banned {key} — no DEX pool")
+            except Exception:
+                pass
     return result
 
 def on_sell(symbol, chain, price, pnl_pct, reason,
