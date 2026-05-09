@@ -31,8 +31,10 @@ def _env(key, default=''):
     except Exception: pass
     return default
 
-TELEGRAM_TOKEN  = _env('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT   = _env('TELEGRAM_CHAT_ID')
+TELEGRAM_TOKEN         = _env('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT          = _env('TELEGRAM_CHAT_ID')
+TELEGRAM_AIRDROP_TOKEN = _env('TELEGRAM_AIRDROP_TOKEN', '')
+_AIRDROP_TOKEN         = TELEGRAM_AIRDROP_TOKEN or TELEGRAM_TOKEN
 DRY_RUN         = _env('EXECUTOR_DRY_RUN', 'true').lower() != 'false'
 MAIN_DB         = 'alphascope.db'
 HUNTER_DB       = 'hunter.db'
@@ -85,7 +87,7 @@ def _tg(msg):
 def _alert_airdrop(name, score, deadline, reward, steps, url):
     steps_text = '\n'.join(f"  {i+1}. {s}" for i, s in enumerate(steps[:5]))
     deadline_str = f"⏰ Deadline: {deadline}" if deadline else ""
-    _tg(f"🪂 <b>AIRDROP ALERT: {name}</b>\n"
+    _tg_airdrop(f"🪂 <b>AIRDROP ALERT: {name}</b>\n"
         f"⭐ Score: {score}/10 | 💰 {reward}\n"
         f"{deadline_str}\n"
         f"📋 Steps:\n{steps_text}\n"
@@ -158,7 +160,7 @@ def alert_new_airdrop_signals():
         # Fire Telegram immediately
         snippet = (content_txt or '')[:200]
         link_line = ("\n\U0001f517 " + url) if url else ""
-        _tg("\U0001fa82 <b>AIRDROP SIGNAL</b>\n"
+        _tg_airdrop("\U0001fa82 <b>AIRDROP SIGNAL</b>\n"
             + "\U0001f4cb " + name + "\n"
             + "\U0001f4e1 Source: " + (source or "") + "\n"
             + "\U0001f4ac " + snippet + link_line + "\n"
