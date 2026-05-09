@@ -61,21 +61,22 @@ EVM_WALLET        = _env('EVM_WALLET_ADDRESS')
 CHAIN_IDS = {'ethereum':1, 'base':8453, 'arbitrum':42161, 'bsc':56}
 # Primary RPCs — reliable, high rate limits
 RPCS = {
-    'ethereum': 'https://eth.llamarpc.com',        # LlamaRPC — free, no rate limit
+    'ethereum': 'https://rpc.ankr.com/eth',        # Ankr — reliable free tier
     'base':     'https://mainnet.base.org',
     'arbitrum': 'https://arb1.arbitrum.io/rpc',
 }
-# Fallback RPCs if primary fails
 RPCS_FALLBACK = {
     'ethereum': [
-        'https://cloudflare-eth.com',
         'https://1rpc.io/eth',
-        'https://rpc.ankr.com/eth',
+        'https://cloudflare-eth.com',
+        'https://eth.llamarpc.com',
         'https://eth-mainnet.public.blastapi.io',
+        'https://rpc.flashbots.net',
     ],
     'base': [
         'https://1rpc.io/base',
         'https://base.llamarpc.com',
+        'https://base-mainnet.public.blastapi.io',
     ],
 }
 
@@ -285,9 +286,23 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
         }, timeout=15).json()
         tx_b64 = swap.get('swapTransaction', '')
         if not tx_b64: return {'success': False, 'error': 'No swap tx from Jupiter'}
-        tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
-        tx.sign([kp])
-        bundle = _jito_submit(base64.b64encode(bytes(tx)).decode())
+        raw_tx = base64.b64decode(tx_b64)
+        tx = VersionedTransaction.from_bytes(raw_tx)
+        # solders VersionedTransaction signing
+        try:
+            # New solders API
+            signed_tx = VersionedTransaction(tx.message, [kp])
+        except Exception:
+            try:
+                # Fallback: use keypair to sign message directly
+                from solders.keypair import Keypair as _KP
+                msg_bytes = bytes(tx.message)
+                sig = kp.sign_message(msg_bytes)
+                tx.signatures[0] = sig
+                signed_tx = tx
+            except Exception as _se:
+                return {'success': False, 'error': f'SOL signing failed: {_se}'}
+        bundle = _jito_submit(base64.b64encode(bytes(signed_tx)).decode())
         out = int(quote.get('outAmount', 0))
         price = (lamports / 1e9 * sol_price) / max(out, 1)
         sol_url = f"https://solscan.io/tx/{bundle}"
@@ -335,9 +350,19 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
         }, timeout=15).json()
         tx_b64 = swap.get('swapTransaction', '')
         if not tx_b64: return {'success': False, 'error': 'No swap tx'}
-        tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
-        tx.sign([kp])
-        bundle = _jito_submit(base64.b64encode(bytes(tx)).decode())
+        raw_tx = base64.b64decode(tx_b64)
+        tx = VersionedTransaction.from_bytes(raw_tx)
+        try:
+            signed_tx = VersionedTransaction(tx.message, [kp])
+        except Exception:
+            try:
+                msg_bytes = bytes(tx.message)
+                sig = kp.sign_message(msg_bytes)
+                tx.signatures[0] = sig
+                signed_tx = tx
+            except Exception as _se:
+                return {'success': False, 'error': f'SOL signing failed: {_se}'}
+        bundle = _jito_submit(base64.b64encode(bytes(signed_tx)).decode())
         sol_out = int(quote.get('outAmount', 0)) / 1e9
         sol_url = f"https://solscan.io/tx/{bundle}"
         _tg(f"✅ <b>SOL SELL {symbol}</b>\n"

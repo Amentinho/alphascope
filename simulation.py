@@ -923,6 +923,12 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if any(t in sym.lower() for t in _BLOCKED_TERMS):
             continue
 
+        # Block obvious low-quality / scam name patterns
+        _SCAM_PATTERNS = ['nocoin','noscam','rugpull','honeypot','scamcoin',
+                          'ponzi','fakeusd','fakebtc','fakeeth','fakesol']
+        if any(p in sym.lower() for p in _SCAM_PATTERNS):
+            continue
+
         key = f"{sym}_{chain}"
         if key in portfolio.holdings:
             continue
