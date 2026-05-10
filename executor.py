@@ -307,15 +307,28 @@ def alert_start(sim_id, hours, capital):
         try:
             if EVM_WALLET:
                 from web3 import Web3
-                for chain, label, emoji in [('ethereum','ETH','🔵'),('base','BASE','🔷')]:
-                    try:
-                        w3 = Web3(Web3.HTTPProvider(RPCS.get(chain,'')))
-                        bal = w3.eth.get_balance(w3.to_checksum_address(EVM_WALLET))/1e18
-                        if chain == 'ethereum':
-                            eth_line = f"\n{emoji} ETH: {bal:.4f} ETH (${bal*_eth_price():.0f})"
-                        else:
-                            base_line = f"\n{emoji} BASE: {bal:.4f} ETH (${bal*_eth_price():.0f})"
-                    except Exception: pass
+                eth_price = _eth_price()
+                # Try multiple RPCs per chain
+                chain_rpcs = {
+                    'ethereum': ['https://rpc.ankr.com/eth','https://1rpc.io/eth','https://cloudflare-eth.com'],
+                    'base':     ['https://mainnet.base.org','https://1rpc.io/base'],
+                }
+                emojis = {'ethereum': '🔵', 'base': '🔷'}
+                for chain in ['ethereum', 'base']:
+                    for rpc in chain_rpcs[chain]:
+                        try:
+                            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 6}))
+                            bal = w3.eth.get_balance(w3.to_checksum_address(EVM_WALLET))/1e18
+                            emoji = emojis[chain]
+                            label = 'ETH' if chain == 'ethereum' else 'BASE'
+                            line = f"\n{emoji} {label}: {bal:.4f} ETH (${bal*eth_price:.0f})"
+                            if chain == 'ethereum':
+                                eth_line = line
+                            else:
+                                base_line = line
+                            break
+                        except Exception:
+                            continue
         except Exception: pass
         _tg(f"🤖 <b>AlphaScope {mode}</b>\n📋 {sim_id} | {hours}h"
             f"{sol_line}{eth_line}{base_line}"
