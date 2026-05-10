@@ -22,12 +22,15 @@ from datetime import datetime, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
 def _env(key, default=''):
-    val = os.environ.get(key, default)
+    val = os.environ.get(key, '')
     if val: return val
     try:
+        last = default
         for line in open('.env'):
-            if line.strip().startswith(f'{key}='):
-                return line.strip().split('=', 1)[1].strip()
+            line = line.strip()
+            if line.startswith(f'{key}='):
+                last = line.split('=', 1)[1].strip()
+        return last
     except Exception: pass
     return default
 
@@ -262,9 +265,12 @@ def scan_airdrops():
             table = None
 
         if table:
+            # Get column names first to handle schema differences
+            cols = [c[1] for c in main_conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            url_col = 'website_url' if 'website_url' in cols else ('project_url' if 'project_url' in cols else 'NULL')
             rows = main_conn.execute(f"""
                 SELECT project_name, legitimacy_score, deadline, reward_estimate,
-                       qualification_steps, website_url, status
+                       qualification_steps, {url_col}, status
                 FROM {table}
                 WHERE legitimacy_score >= ?
                 AND (status IS NULL OR status NOT IN ('DONE','SKIP','EXPIRED'))
@@ -401,7 +407,9 @@ def scan_presales():
         rows = []
         try:
             rows = main_conn.execute("""
-                SELECT symbol, name, chain, current_price, presale_found,
+                SELECT symbol, name,
+                       CASE WHEN chain IS NULL THEN '?' ELSE chain END,
+                       current_price, presale_found,
                        alert_detail, updated_at
                 FROM project_watchlist
                 WHERE presale_found = 1

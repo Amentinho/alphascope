@@ -70,30 +70,28 @@ REDDIT_SUBS = [
     'ethfinance','SatoshiStreetBets','CryptoMoonShots','altcoin','defi',
     # Specific coins
     'cardano','algorand','cosmosnetwork','Chainlink','avalanche',
-    'near','BNBChain','arbitrum','optimismCollective','0xPolygon',
+'BNBChain','arbitrum','optimismCollective','0xPolygon',
     'zkSync','starknet','Polkadot','fantom','injective',
     # Trading
     'CryptoTechnology','CryptoCurrencyTrading','CryptoInvesting',
     'BitcoinBeginners','LitecoinMarkets','XRP',
     # DeFi
     'UniSwap','Aave_Protocol','MakerDAO','yearn_finance','GMX_io',
-    'HyperLiquid','curve_fi','balancer',
+'curve_fi','balancer',
     # SOL ecosystem
     'solanadev','solanaNFT','SolanaGaming','raydium',
     # NFT & gaming
     'NFT','opensea','axieinfinity','PlayToEarn','CryptoGaming',
     # Gems & airdrops
-    'airdropalert','CryptoAirdrops','CryptoGemDiscovery',
+'CryptoAirdrops','CryptoGemDiscovery',
     'lowcap','CryptoHints','SatoshiStreetBets',
     # AI & DePIN
     'artificial','MachineLearning','depin','render_network',
-    'Cryptocurrency_Daily',
     # RWA
-    'RealWorldAssets',
 ]
 
 AIRDROP_SUBS = [
-    'airdropalert','CryptoAirdrops','cosmosnetwork',
+'CryptoAirdrops','cosmosnetwork',
     'defi','ethereum','solana','CryptoMoonShots',
     'arbitrum','optimismCollective','starknet','zkSync',
 ]

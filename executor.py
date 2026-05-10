@@ -355,7 +355,16 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
     quote = _jupiter_quote(WSOL_MINT, contract, lamports)
     if not quote: return {'success': False, 'error': 'Jupiter quote failed'}
     impact = float(quote.get('priceImpactPct', 0)) * 100
-    if impact > 5: return {'success': False, 'error': f'Impact too high: {impact:.1f}%'}
+    if impact > 15:
+        return {'success': False, 'error': f'Impact too high: {impact:.1f}%'}
+    if impact > 5:
+        # Reduce trade size to bring impact under 5%
+        reduction = 5.0 / impact
+        lamports = int(lamports * reduction)
+        print(f"    Impact {impact:.1f}% — reducing trade size by {(1-reduction)*100:.0f}%")
+        quote = _jupiter_quote(WSOL_MINT, contract, lamports)
+        if not quote: return {'success': False, 'error': 'Jupiter quote failed after resize'}
+        impact = float(quote.get('priceImpactPct', 0)) * 100
     try:
         import base64
         from solders.transaction import VersionedTransaction
@@ -451,10 +460,18 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
     quote = None
     for slippage in [500, 1000, 3000, 5000]:  # 5%, 10%, 30%, 50%
         q = _jupiter_quote_slippage(contract, WSOL_MINT, raw, slippage)
-        if q:
+        if q and not q.get('error'):
             quote = q
             break
-    if not quote: return {'success': False, 'error': 'Jupiter quote failed'}
+    # If no direct SOL route, try routing through USDC as intermediate
+    if not quote:
+        USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+        for slippage in [1000, 5000]:
+            q = _jupiter_quote_slippage(contract, USDC_MINT, raw, slippage)
+            if q and not q.get('error'):
+                quote = q
+                break
+    if not quote: return {'success': False, 'error': 'Jupiter: no route found (token may be illiquid)'}
     try:
         import base64
         from solders.transaction import VersionedTransaction
@@ -795,6 +812,28 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei) -> dict:
 
     return {'success': False, 'error': last_error or 'All fee tiers failed'}
 
+def _get_token_dex_info(contract, chain) -> dict:
+    """Get DEX info for a token via DexScreener. Returns dex name, pair address etc."""
+    try:
+        chain_map = {'ethereum': 'ethereum', 'base': 'base', 'solana': 'solana', 'bsc': 'bsc'}
+        chain_id = chain_map.get(chain, chain)
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{contract}',
+            timeout=8)
+        if r.status_code == 200:
+            pairs = r.json().get('pairs', [])
+            for p in pairs:
+                if p.get('chainId', '').lower() == chain_id:
+                    return {
+                        'dex': p.get('dexId', 'unknown'),
+                        'pair': p.get('pairAddress', ''),
+                        'liq': p.get('liquidity', {}).get('usd', 0),
+                    }
+    except Exception:
+        pass
+    return {}
+
+
 def _check_uniswap_pool(w3, chain, token_address) -> str:
     """Check if token has a Uniswap v3 pool. Returns fee tier or '' if none."""
     try:
@@ -841,11 +880,17 @@ def execute_evm_buy(symbol, chain, contract, usd) -> dict:
 
     # Pre-check: verify token has a DEX pool before wasting gas
     w3_check = _w3(chain)
+    dex_info = _get_token_dex_info(contract, chain)
     if w3_check:
         pool_fee = _check_uniswap_pool(w3_check, chain, contract)
         if not pool_fee:
+            # No Uniswap pool — check if it's on another DEX via DexScreener
+            if not dex_info:
+                return {'success': False,
+                        'error': f'No Uniswap pool found for {symbol} on {chain}'}
+            print(f"    {symbol} on {dex_info.get('dex','unknown DEX')} — no Uniswap pool, paper trade only")
             return {'success': False,
-                    'error': f'No Uniswap pool found for {symbol} on {chain}'}
+                    'error': f'{symbol} only on {dex_info.get("dex","custom DEX")} — not yet supported'}
 
     # Check ETH balance
     w3 = _w3(chain)

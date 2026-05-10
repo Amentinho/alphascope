@@ -100,7 +100,7 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
     # Cache for 4 minutes within a cycle
     if use_cache and cache_key in _price_cache:
         cached_price, cached_time = _price_cache[cache_key]
-        if time.time() - cached_time < 240 and cached_price > 0:
+        if time.time() - cached_time < 30 and cached_price > 0:
             return cached_price
 
     # 0. DB first — fetcher writes fresh prices here every cycle
@@ -622,7 +622,7 @@ class SimPortfolio:
 
 # ── Price monitor (background thread) ────────────────────────────────────────
 def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT,
-                      duration_minutes=370, interval_seconds=60):
+                      duration_minutes=370, interval_seconds=15):
     """Checks open positions every 60s -- catches rugs before next cycle."""
     def _loop():
         end = time.time() + duration_minutes * 60
@@ -641,7 +641,8 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                     if not buy_price:
                         continue
                     try:
-                        price = resolve_price(sym, chain=chain, use_cache=False)
+                        # Use 30s cache in monitor to avoid API rate limits
+                        price = resolve_price(sym, chain=chain, use_cache=True)
                     except Exception:
                         price = 0
                     if not price or price <= 0:
