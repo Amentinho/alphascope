@@ -173,28 +173,59 @@ AERODROME_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da'
 
 # Uniswap v2 router ABI (minimal)
 UNISWAP_V2_ABI = [
+    # Buy: ETH -> Token (fee-on-transfer safe)
     {
         "inputs": [
-            {"name": "amountOutMin", "type": "uint256"},
-            {"name": "path",         "type": "address[]"},
-            {"name": "to",           "type": "address"},
-            {"name": "deadline",     "type": "uint256"},
+            {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+            {"internalType": "address[]", "name": "path", "type": "address[]"},
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"}
         ],
         "name": "swapExactETHForTokensSupportingFeeOnTransferTokens",
         "outputs": [],
-        "stateMutability": "payable", "type": "function"
+        "stateMutability": "payable",
+        "type": "function"
     },
+    # Buy: ETH -> Token (standard, fallback)
     {
         "inputs": [
-            {"name": "amountIn",     "type": "uint256"},
-            {"name": "amountOutMin", "type": "uint256"},
-            {"name": "path",         "type": "address[]"},
-            {"name": "to",           "type": "address"},
-            {"name": "deadline",     "type": "uint256"},
+            {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+            {"internalType": "address[]", "name": "path", "type": "address[]"},
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+        ],
+        "name": "swapExactETHForTokens",
+        "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    # Sell: Token -> ETH (fee-on-transfer safe)
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+            {"internalType": "address[]", "name": "path", "type": "address[]"},
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"}
         ],
         "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
         "outputs": [],
-        "stateMutability": "nonpayable", "type": "function"
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    # Sell: Token -> ETH (standard, fallback)
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+            {"internalType": "address[]", "name": "path", "type": "address[]"},
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+        ],
+        "name": "swapExactTokensForETH",
+        "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "nonpayable",
+        "type": "function"
     },
 ]
 
@@ -227,7 +258,12 @@ def _tg(msg):
 
 def alert_buy(symbol, chain, usd, price, reason='', dry=True, cash_left=None):
     mode = '🔵 DRY' if dry else '✅ LIVE'
-    budget_line = f"💼 Cash left: ${cash_left:.0f}\n" if cash_left is not None else ""
+    # Show real wallet balance for live trades
+    if not dry:
+        wallet_bal = _get_real_wallet_balance(chain)
+        budget_line = f"💼 Wallet: {wallet_bal}\n" if wallet_bal else ""
+    else:
+        budget_line = f"💼 Sim cash: ${cash_left:.0f}\n" if cash_left is not None else ""
     _tg(f"{mode} <b>BUY {symbol}</b> ({chain.upper()})\n"
         f"💵 ${usd:.0f} @ ${price:.6g}\n"
         f"{budget_line}"
@@ -269,6 +305,29 @@ def _sol_price():
             'https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT',
             timeout=5).json().get('price', 89))
     except Exception: return 89.0
+
+
+def _get_real_wallet_balance(chain) -> str:
+    """Get real wallet balance for display in Telegram."""
+    try:
+        if chain == 'solana':
+            kp = _sol_keypair()
+            if not kp: return ''
+            r = requests.post('https://api.mainnet-beta.solana.com', json={
+                'jsonrpc':'2.0','id':1,'method':'getBalance',
+                'params':[str(kp.pubkey())]}, timeout=5)
+            bal = r.json().get('result',{}).get('value',0)/1e9
+            return f"{bal:.3f} SOL (${bal*_sol_price():.0f})"
+        elif chain in ('ethereum','base'):
+            if not EVM_WALLET: return ''
+            from web3 import Web3
+            w3 = _w3(chain)
+            if not w3: return ''
+            bal = w3.eth.get_balance(w3.to_checksum_address(EVM_WALLET))/1e18
+            return f"{bal:.4f} ETH (${bal*_eth_price():.0f})"
+    except Exception:
+        pass
+    return 
 
 def _eth_price():
     try:
@@ -826,12 +885,14 @@ def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -
     max_fee, priority_fee = _gas_params(w3)
     deadline = int(time.time()) + 300
     try:
-        tx = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-            0,           # amountOutMin — accept any
-            [weth, token],
-            addr,
-            deadline
-        ).build_transaction({
+        # Try fee-on-transfer version first (works for tax tokens), then standard
+        try:
+            swap_fn = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+                0, [weth, token], addr, deadline)
+        except Exception:
+            swap_fn = router.functions.swapExactETHForTokens(
+                0, [weth, token], addr, deadline)
+        tx = swap_fn.build_transaction({
             'from': addr, 'value': eth_amount_wei, 'gas': 200000,
             'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
             'nonce': w3.eth.get_transaction_count(addr, 'pending'),
@@ -855,9 +916,13 @@ def _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> di
     max_fee, priority_fee = _gas_params(w3)
     deadline = int(time.time()) + 300
     try:
-        tx = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
-            amount_wei, 0, [token, weth], addr, deadline
-        ).build_transaction({
+        try:
+            swap_fn = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
+                amount_wei, 0, [token, weth], addr, deadline)
+        except Exception:
+            swap_fn = router.functions.swapExactTokensForETH(
+                amount_wei, 0, [token, weth], addr, deadline)
+        tx = swap_fn.build_transaction({
             'from': addr, 'value': 0, 'gas': 200000,
             'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
             'nonce': w3.eth.get_transaction_count(addr, 'pending'),

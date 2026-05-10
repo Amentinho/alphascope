@@ -237,7 +237,7 @@ def alert_new_airdrop_signals():
             "\U0001f4ac " + snippet + link + "\n"
             "\U0001f550 " + datetime.now().strftime("%H:%M:%S")
         )
-        _tg(msg)
+        _tg_airdrop(msg)
         print(f"  \U0001fa82 Airdrop alert: {name[:50]} ({source})")
         conn.execute(
             """INSERT OR IGNORE INTO tracked_opportunities
@@ -569,7 +569,7 @@ def send_daily_summary():
             lines.append(f"{emoji} {name} (⭐{score}){dl}")
             if reward: lines.append(f"   💰 {reward}")
 
-        _tg('\n'.join(lines))
+        _tg_airdrop('\n'.join(lines))
     except Exception as e:
         print(f"  summary error: {e}")
 
