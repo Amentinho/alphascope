@@ -26,7 +26,7 @@ STOP_LOSS_PCT        = -30.0
 TAKE_PROFIT_PCT      = 150.0
 MIN_SIGNAL_CONF      = 65
 
-CHAINS = ['solana', 'bsc', 'base', 'arbitrum', 'ethereum']
+CHAINS = ['solana', 'base', 'ethereum']  # BSC/ARB removed — no wallet configured
 ETH_BUDGET_USD = 800.0   # ETH mainnet gets more — real gems live here
 NATIVE_TOKENS = {
     'solana':   ('SOL', 'solana'),
@@ -323,7 +323,8 @@ class SimPortfolio:
         # Capture T=0 live prices for intra-sim PnL reference
         self.t0_prices = self._snapshot_prices()
         self.starting_real = self._real_cost_basis()
-        self.starting_trading = (STARTING_BALANCE_USD * (len(CHAINS) - 1)) + ETH_BUDGET_USD
+        # SOL + BASE each get STARTING_BALANCE_USD, ETH gets ETH_BUDGET_USD
+        self.starting_trading = (STARTING_BALANCE_USD * 2) + ETH_BUDGET_USD
         self.starting_total = self.starting_trading + self.starting_real
         # Snapshot real wallet balances at T=0
         self.wallet_balances = self._snapshot_wallet_balances()
@@ -817,20 +818,15 @@ def _load_dex_proposals(portfolio):
             liq = liq or 0
             age = age or 99
             # Liquidity minimums per chain
-            liq_min = {'solana':25000,'bsc':30000,'base':35000,
-                       'arbitrum':35000,'ethereum':50000}.get(chain, 30000)
+            liq_min = {'solana':50000,'base':35000,'ethereum':50000}.get(chain, 35000)  # raised SOL min to 50k
             if liq < liq_min:
                 continue
             # Size by chain
             # Phase 2 trade sizes — based on available wallet balance per chain
             if chain == 'solana':
-                trade_usd = 10   # Only $60 SOL left — conservative
-            elif chain in ('base', 'ethereum'):
-                trade_usd = 20   # Enough ETH on both
-            elif chain == 'bsc':
-                trade_usd = 15   # Paper only anyway
+                trade_usd = 10   # ~$60 SOL left — conservative
             else:
-                trade_usd = 15
+                trade_usd = 20   # BASE + ETH
             proposals.append({
                 'action': 'BUY',
                 'symbol': sym,
@@ -951,12 +947,6 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         proposals = proposals + established
     except Exception as _ep:
         print(f"  established proposals error: {_ep}")
-    # Add established coin proposals (sentiment-driven)
-    try:
-        established = _load_established_proposals(portfolio)
-        proposals = proposals + established
-    except Exception as _ep:
-        print(f"  established proposals error: {_ep}")
 
     # 3b. Supplement with wallet_agent for non-DEX signals (listings, pre-launch etc)
     try:
@@ -1006,7 +996,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         action   = p.get('action', '')
         cat      = p.get('category', '')
         # Per-chain hard caps
-        chain_caps = {'solana': 10, 'base': 20, 'ethereum': 20, 'bsc': 15, 'arbitrum': 15}
+        chain_caps = {'solana': 10, 'base': 20, 'ethereum': 20}
         trade_usd = min(p.get('trade_usd', 20), chain_caps.get(chain, 20))
 
         if not sym or action not in ('BUY', 'ACCUMULATE'):
@@ -1389,3 +1379,90 @@ if __name__ == '__main__':
         display_results()
     else:
         run_simulation(args.hours, args.cycle, args.stop_loss, args.take_profit)
+
+
+def _load_established_proposals(portfolio):
+    """Sentiment-driven proposals for established native coins per chain."""
+    import sqlite3 as _sq
+    ESTABLISHED = [
+        # SOL native tokens
+        {'symbol':'JUP',  'chain':'solana',   'sl':-6.0, 'tp':12.0, 'max_usd':10,
+         'coin_id':'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN'},
+        {'symbol':'RAY',  'chain':'solana',   'sl':-6.0, 'tp':12.0, 'max_usd':10,
+         'coin_id':'4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R'},
+        {'symbol':'BONK', 'chain':'solana',   'sl':-8.0, 'tp':15.0, 'max_usd':10,
+         'coin_id':'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'},
+        # ETH native ERC20s (not BTC — wBTC is synthetic)
+        {'symbol':'LINK', 'chain':'ethereum', 'sl':-5.0, 'tp':10.0, 'max_usd':20,
+         'coin_id':'0x514910771AF9Ca656af840dff83E8264EcF986CA'},
+        {'symbol':'AAVE', 'chain':'ethereum', 'sl':-5.0, 'tp':10.0, 'max_usd':20,
+         'coin_id':'0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9'},
+        {'symbol':'UNI',  'chain':'ethereum', 'sl':-5.0, 'tp':10.0, 'max_usd':20,
+         'coin_id':'0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984'},
+        # BASE native
+        {'symbol':'AERO', 'chain':'base',     'sl':-6.0, 'tp':12.0, 'max_usd':20,
+         'coin_id':'0x940181a94A35A4569E4529A3CDfB74e38FD98631'},
+    ]
+    real_holdings = {pos['symbol'] for positions in REAL_PORTFOLIO.values()
+                     for pos in positions}
+    proposals = []
+    try:
+        conn = _sq.connect(MAIN_DB, timeout=10)
+        BINANCE_IDS = {
+            'JUP':'JUPUSDT','RAY':'RAYUSDT','BONK':'BONKUSDT',
+            'LINK':'LINKUSDT','AAVE':'AAVEUSDT','UNI':'UNIUSDT','AERO':'AEROUSDT',
+        }
+        for coin in ESTABLISHED:
+            sym  = coin['symbol']
+            chain = coin['chain']
+            if sym in real_holdings: continue
+            if f"{sym}_{chain}" in portfolio.holdings: continue
+            if chain not in CHAINS: continue
+            try:
+                # coin_buzz: coin, mention_count, total_engagement, avg_sentiment, fetched_at
+                row = conn.execute(
+                    "SELECT avg_sentiment, mention_count FROM coin_buzz "
+                    "WHERE coin=? ORDER BY fetched_at DESC LIMIT 1", (sym,)).fetchone()
+                if not row: continue
+                sentiment, mentions = float(row[0] or 0), int(row[1] or 0)
+                if sentiment < 0.35 or mentions < 5: continue
+                # Get price from Binance (always fresh)
+                price = 0.0
+                if sym in BINANCE_IDS:
+                    try:
+                        r = requests.get(
+                            f'https://api.binance.com/api/v3/ticker/price?symbol={BINANCE_IDS[sym]}',
+                            timeout=5)
+                        price = float(r.json().get('price', 0))
+                    except Exception: pass
+                if price <= 0: continue
+                # Skip overextended (up >8% today) or falling knife (down >10%)
+                try:
+                    r2 = requests.get(
+                        f'https://api.binance.com/api/v3/ticker/24hr?symbol={BINANCE_IDS[sym]}',
+                        timeout=5)
+                    chg = float(r2.json().get('priceChangePercent', 0))
+                    if chg > 8 or chg < -10: continue
+                except Exception: pass
+                proposals.append({
+                    'symbol': sym, 'chain': chain,
+                    'coin_id': coin['coin_id'], 'price': price,
+                    'trade_usd': coin['max_usd'],
+                    'stop_loss_override': coin['sl'],
+                    'take_profit_override': coin['tp'],
+                    'alpha_score': 75, 'cross_score': 8,
+                    'sources': f'buzz:sent={sentiment:.2f},n={mentions}',
+                    'reasons': [f'established_{sym}'],
+                    'category': 'ESTABLISHED',
+                    'liquidity_usd': 999_000_000, 'age_hours': 0,
+                })
+            except Exception: continue
+        conn.close()
+    except Exception as e:
+        print(f"  established error: {e}")
+    if proposals:
+        print(f"    📊 Established: {', '.join(p['symbol'] for p in proposals)}")
+    return proposals
+
+
+
