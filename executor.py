@@ -310,8 +310,11 @@ def alert_start(sim_id, hours, capital):
                 eth_price = _eth_price()
                 # Try multiple RPCs per chain
                 chain_rpcs = {
-                    'ethereum': ['https://rpc.ankr.com/eth','https://1rpc.io/eth','https://cloudflare-eth.com'],
-                    'base':     ['https://mainnet.base.org','https://1rpc.io/base'],
+                    'ethereum': ['https://rpc.ankr.com/eth','https://cloudflare-eth.com',
+                                 'https://1rpc.io/eth','https://eth.llamarpc.com',
+                                 'https://eth-mainnet.public.blastapi.io'],
+                    'base':     ['https://mainnet.base.org','https://base.llamarpc.com',
+                                 'https://1rpc.io/base'],
                 }
                 emojis = {'ethereum': '🔵', 'base': '🔷'}
                 for chain in ['ethereum', 'base']:
@@ -330,9 +333,11 @@ def alert_start(sim_id, hours, capital):
                         except Exception:
                             continue
         except Exception: pass
-        _tg(f"🤖 <b>AlphaScope {mode}</b>\n📋 {sim_id} | {hours}h"
-            f"{sol_line}{eth_line}{base_line}"
-            f"\n⚠️ BSC/ARB: paper only")
+        lines = [f"🤖 <b>AlphaScope {mode}</b>", f"📋 {sim_id} | {hours}h"]
+        if sol_line: lines.append(sol_line.strip())
+        if eth_line: lines.append(eth_line.strip())
+        if base_line: lines.append(base_line.strip())
+        _tg('\n'.join(lines))
     else:
         _tg(f"🤖 <b>AlphaScope {mode}</b>\n📋 {sim_id} | {hours}h\n💰 ${capital:.0f} paper")
 

@@ -406,17 +406,18 @@ def scan_presales():
         # Check project_watchlist for presale flags (table may not exist)
         rows = []
         try:
-            rows = main_conn.execute("""
-                SELECT symbol, name,
-                       CASE WHEN chain IS NULL THEN '?' ELSE chain END,
-                       current_price, presale_found,
-                       alert_detail, updated_at
-                FROM project_watchlist
-                WHERE presale_found = 1
-                AND updated_at >= datetime('now', '-24 hours')
-                ORDER BY updated_at DESC
-                LIMIT 10
-            """).fetchall()
+            try:
+                rows = main_conn.execute("""
+                    SELECT symbol, name, '?' as chain,
+                           current_price, presale_found,
+                           alert_detail, updated_at
+                    FROM project_watchlist
+                    WHERE presale_found = 1
+                    AND updated_at >= datetime('now', '-24 hours')
+                    ORDER BY updated_at DESC LIMIT 10
+                """).fetchall()
+            except Exception:
+                rows = []
         except Exception:
             pass
 
