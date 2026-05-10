@@ -1064,6 +1064,15 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     print(f"  Sim ID: {sim_id}")
     print(f"  Trading capital: ${portfolio.starting_trading:.0f} "
           f"(SOL/BSC/BASE/ARB: ${STARTING_BALANCE_USD:.0f} each | ETH: ${ETH_BUDGET_USD:.0f})")
+    try:
+        from executor import DRY_RUN as _DR
+        if not _DR:
+            print(f"  🟢 LIVE chains: SOL + BASE + ETH")
+            print(f"  📄 Paper chains: BSC + ARB (no wallet configured)")
+        else:
+            print(f"  📄 DRY RUN — all chains paper")
+    except Exception:
+        pass
     print(f"  Real portfolio cost basis: ${portfolio.starting_real:,.2f}")
     print(f"  Real portfolio T=0 value:  ${portfolio._real_value():,.2f}")
     print(f"  Duration: {hours}h | Cycle: {cycle_min}min | "

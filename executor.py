@@ -290,7 +290,38 @@ def alert_error(msg):
 
 def alert_start(sim_id, hours, capital):
     mode = '🔵 DRY RUN' if DRY_RUN else '🚀 LIVE'
-    _tg(f"🤖 <b>AlphaScope {mode}</b>\n📋 {sim_id} | {hours}h\n💰 ${capital:.0f}")
+    if not DRY_RUN:
+        # Show real wallet balances
+        sol_line = ''
+        eth_line = ''
+        base_line = ''
+        try:
+            kp = _sol_keypair()
+            if kp:
+                r = requests.post('https://api.mainnet-beta.solana.com', json={
+                    'jsonrpc':'2.0','id':1,'method':'getBalance',
+                    'params':[str(kp.pubkey())]}, timeout=6)
+                sol = r.json().get('result',{}).get('value',0)/1e9
+                sol_line = f"\n🟣 SOL: {sol:.3f} SOL (${sol*_sol_price():.0f})"
+        except Exception: pass
+        try:
+            if EVM_WALLET:
+                from web3 import Web3
+                for chain, label, emoji in [('ethereum','ETH','🔵'),('base','BASE','🔷')]:
+                    try:
+                        w3 = Web3(Web3.HTTPProvider(RPCS.get(chain,'')))
+                        bal = w3.eth.get_balance(w3.to_checksum_address(EVM_WALLET))/1e18
+                        if chain == 'ethereum':
+                            eth_line = f"\n{emoji} ETH: {bal:.4f} ETH (${bal*_eth_price():.0f})"
+                        else:
+                            base_line = f"\n{emoji} BASE: {bal:.4f} ETH (${bal*_eth_price():.0f})"
+                    except Exception: pass
+        except Exception: pass
+        _tg(f"🤖 <b>AlphaScope {mode}</b>\n📋 {sim_id} | {hours}h"
+            f"{sol_line}{eth_line}{base_line}"
+            f"\n⚠️ BSC/ARB: paper only")
+    else:
+        _tg(f"🤖 <b>AlphaScope {mode}</b>\n📋 {sim_id} | {hours}h\n💰 ${capital:.0f} paper")
 
 def alert_complete(sim_id, pnl_pct, wins, losses, best):
     emoji = '🟢' if pnl_pct >= 0 else '🔴'
@@ -1232,7 +1263,9 @@ def on_buy(symbol, chain, usd, price, source='', contract='', cash_left=None):
     elif chain in ('base', 'ethereum'):
         result = execute_evm_buy(symbol, chain, contract, real_usd)
     else:
-        # BSC/ARB — paper only for now
+        # BSC/ARB — no wallet configured, paper trade only
+        # BSC requires separate PancakeSwap routing setup
+        # ARB requires separate Camelot/Uniswap ARB wallet
         return {'success': True, 'mode': 'paper', 'price': price}
     if not result.get('success'):
         alert_error(f"BUY {symbol} ({chain}) FAILED: {result.get('error','')}")
