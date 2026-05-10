@@ -322,9 +322,58 @@ class SimPortfolio:
         self._seed_real()
         # Capture T=0 live prices for intra-sim PnL reference
         self.t0_prices = self._snapshot_prices()
-        self.starting_real = self._real_cost_basis()  # Fixed reference: your original purchase cost
+        self.starting_real = self._real_cost_basis()
         self.starting_trading = (STARTING_BALANCE_USD * (len(CHAINS) - 1)) + ETH_BUDGET_USD
         self.starting_total = self.starting_trading + self.starting_real
+        # Snapshot real wallet balances at T=0
+        self.wallet_balances = self._snapshot_wallet_balances()
+        self.wallet_balances_t0 = dict(self.wallet_balances)
+
+    def _snapshot_wallet_balances(self) -> dict:
+        """Get real on-chain wallet balances. Called at start and after each tx."""
+        balances = {}
+        try:
+            from executor import _sol_keypair, _sol_price, _eth_price, _w3, EVM_WALLET, RPCS
+            # SOL balance
+            kp = _sol_keypair()
+            if kp:
+                r = requests.get(
+                    'https://api.mainnet-beta.solana.com',
+                    timeout=5)
+                r2 = requests.post('https://api.mainnet-beta.solana.com', json={
+                    'jsonrpc':'2.0','id':1,'method':'getBalance',
+                    'params':[str(kp.pubkey())]}, timeout=6)
+                sol_bal = r2.json().get('result',{}).get('value',0)/1e9
+                balances['solana'] = {'amount': sol_bal, 'symbol': 'SOL',
+                                      'usd': sol_bal * _sol_price()}
+            # EVM balances (BASE + ETH same wallet)
+            if EVM_WALLET:
+                from web3 import Web3
+                for chain in ('ethereum', 'base'):
+                    try:
+                        w3 = Web3(Web3.HTTPProvider(RPCS.get(chain,'')))
+                        bal = w3.eth.get_balance(w3.to_checksum_address(EVM_WALLET))/1e18
+                        balances[chain] = {'amount': bal, 'symbol': 'ETH',
+                                           'usd': bal * _eth_price()}
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"    wallet snapshot error: {e}")
+        return balances
+
+    def _refresh_wallet_balance(self, chain):
+        """Refresh single chain balance after a transaction."""
+        try:
+            new_bals = self._snapshot_wallet_balances()
+            if chain in new_bals:
+                old = self.wallet_balances.get(chain, {}).get('usd', 0)
+                new = new_bals[chain]['usd']
+                diff = new - old
+                self.wallet_balances[chain] = new_bals[chain]
+                return diff
+        except Exception:
+            pass
+        return 0
 
     def _seed_real(self):
         for chain, positions in REAL_PORTFOLIO.items():
@@ -452,9 +501,16 @@ class SimPortfolio:
             'time': datetime.now().isoformat(), 'source': source,
         })
         try:
-            from executor import on_buy
-            cash_left = sum(self.cash.values())
-            on_buy(symbol, chain, usd, price, source, contract, cash_left=cash_left)
+            from executor import on_buy, DRY_RUN
+            # Show real wallet balance in alerts
+            real_bal = self.wallet_balances.get(chain, {})
+            cash_left = real_bal.get('usd', sum(self.cash.values())) if not DRY_RUN else sum(self.cash.values())
+            result = on_buy(symbol, chain, usd, price, source, contract, cash_left=cash_left)
+            # Refresh wallet balance after real tx
+            if not DRY_RUN and result and result.get('success'):
+                diff = self._refresh_wallet_balance(chain)
+                if diff != 0:
+                    print(f"    Wallet {chain}: {diff:+.4f} ETH/SOL change")
         except Exception:
             pass
         return True, f"bought {tokens:.4f} {symbol} @ ${price:.8f}"
@@ -483,15 +539,20 @@ class SimPortfolio:
             'time': datetime.now().isoformat(),
         })
         try:
-            from executor import on_sell
+            from executor import on_sell, DRY_RUN
             trading_total = self._trading_value()
             trading_pct = (trading_total - self.starting_trading) / max(self.starting_trading, 1) * 100
-            on_sell(symbol, chain, price, pnl_pct, reason,
+            result = on_sell(symbol, chain, price, pnl_pct, reason,
                     token_amount=pos.get('amount', 0),
                     contract=pos.get('coin_id', ''),
                     pnl_usd=pnl,
                     trading_total=trading_total,
                     trading_pct=trading_pct)
+            # Refresh wallet balance after real sell
+            if not DRY_RUN and result and result.get('success'):
+                diff = self._refresh_wallet_balance(chain)
+                if diff != 0:
+                    print(f"    Wallet {chain} after sell: {diff:+.4f} change")
         except Exception:
             pass
         return True, f"sold {symbol} @ ${price:.8f} | P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
@@ -1010,6 +1071,15 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     print(f"  Price monitor: every 60s (catches rugs fast)")
     print(f"  End: {end_time.strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*60}\n")
+
+    # Print real wallet balances at T=0
+    if portfolio.wallet_balances:
+        print("  Real wallet balances (T=0):")
+        for chain, b in portfolio.wallet_balances.items():
+            print(f"    {chain}: {b['amount']:.4f} {b['symbol']} = ${b['usd']:.2f}")
+        total_wallet = sum(b['usd'] for b in portfolio.wallet_balances.values())
+        print(f"    Total on-chain: ${total_wallet:.2f}")
+        print()
 
     cycle = 0
     while datetime.now(timezone.utc) < end_time:

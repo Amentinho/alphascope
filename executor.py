@@ -475,23 +475,30 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
         return {'success': False, 'error': f'No contract for {symbol}'}
     sol_price = _sol_price()
     lamports = int(min(usd / sol_price, MAX_SOL_PER_TRADE) * 1e9)
-    # Try buy with explicit routing options
+    # Pre-check: can Jupiter actually route this token?
     quote = None
-    for slippage in [SLIPPAGE_BPS, 500, 1000]:
+    for slippage in [SLIPPAGE_BPS, 500, 1000, 3000]:
         try:
             r = requests.get(JUPITER_QUOTE, params={
                 'inputMint': WSOL_MINT, 'outputMint': contract,
                 'amount': lamports, 'slippageBps': slippage,
                 'onlyDirectRoutes': 'false',
+                'maxAccounts': '64',
             }, timeout=10)
             if r.status_code == 200:
                 q = r.json()
-                if q and not q.get('error') and int(q.get('outAmount', 0)) > 0:
+                err = q.get('error','') or q.get('errorCode','')
+                if err:
+                    print(f"    Jupiter: {err}")
+                    if 'liquidity' in str(err).lower() or 'route' in str(err).lower():
+                        return {'success': False, 'error': f'No Jupiter route for {symbol} — token illiquid'}
+                elif int(q.get('outAmount', 0)) > 0:
                     quote = q
                     break
         except Exception:
             pass
-    if not quote: return {'success': False, 'error': 'Jupiter quote failed — no route'}
+    if not quote:
+        return {'success': False, 'error': f'Jupiter quote failed — no route for {symbol}'}
     impact = float(quote.get('priceImpactPct', 0)) * 100
     if impact > 15:
         return {'success': False, 'error': f'Impact too high: {impact:.1f}%'}
