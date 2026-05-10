@@ -502,7 +502,6 @@ class SimPortfolio:
         })
         try:
             from executor import on_buy, DRY_RUN
-            # Show real wallet balance in alerts
             real_bal = self.wallet_balances.get(chain, {})
             cash_left = real_bal.get('usd', sum(self.cash.values())) if not DRY_RUN else sum(self.cash.values())
             result = on_buy(symbol, chain, usd, price, source, contract, cash_left=cash_left)
@@ -510,7 +509,17 @@ class SimPortfolio:
             if not DRY_RUN and result and result.get('success'):
                 diff = self._refresh_wallet_balance(chain)
                 if diff != 0:
-                    print(f"    Wallet {chain}: {diff:+.4f} ETH/SOL change")
+                    print(f"    Wallet {chain}: {diff:+.4f} change")
+            # If real tx failed, reverse the sim trade
+            if not DRY_RUN and result and not result.get('success') and result.get('mode') != 'paper':
+                # Undo the buy — refund cash, remove holding
+                self.cash[chain] = self.cash.get(chain, 0) + usd
+                key = f"{symbol}_{chain}"
+                if key in self.holdings:
+                    del self.holdings[key]
+                if self.trades and self.trades[-1].get('symbol') == symbol:
+                    self.trades.pop()
+                print(f"    ↩️  Reversed sim buy {symbol} — real tx failed")
         except Exception:
             pass
         return True, f"bought {tokens:.4f} {symbol} @ ${price:.8f}"
@@ -584,10 +593,14 @@ class SimPortfolio:
                 pos['_last_price'] = price
             pnl_pct = (price - buy_price) / buy_price * 100
             # SOL/BSC: fast rugs, tight stop. BASE/ETH/ARB: more volatile, wider stop
-            effective_stop = {
-                'solana': -20.0, 'bsc': -20.0,
-                'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
-            }.get(chain, -30.0)
+            pos_data = self.holdings.get(key, {})
+            if 'stop_loss_override' in pos_data:
+                effective_stop = pos_data['stop_loss_override']
+            else:
+                effective_stop = {
+                    'solana': -20.0, 'bsc': -20.0,
+                    'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
+                }.get(chain, -30.0)
             if pnl_pct <= effective_stop:
                 ok, msg = self.sell(sym, chain, price, 'stop_loss')
                 if ok:
@@ -718,10 +731,15 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                         pos['_zero_count'] = 0
                         pos['_last_price'] = price  # track last known price
                     pnl_pct = (price - buy_price) / buy_price * 100
-                    effective_stop = {
-                        'solana': -20.0, 'bsc': -20.0,
-                        'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
-                    }.get(chain, stop_loss)
+                    # Use per-position override if set (established coins have tight stops)
+                    pos_data = portfolio.holdings.get(f"{sym}_{chain}", {})
+                    if 'stop_loss_override' in pos_data:
+                        effective_stop = pos_data['stop_loss_override']
+                    else:
+                        effective_stop = {
+                            'solana': -20.0, 'bsc': -20.0,
+                            'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
+                        }.get(chain, stop_loss)
                     if pnl_pct <= effective_stop:
                         ok, msg = portfolio.sell(sym, chain, price, 'stop_loss')
                         if ok:
@@ -804,7 +822,15 @@ def _load_dex_proposals(portfolio):
             if liq < liq_min:
                 continue
             # Size by chain
-            trade_usd = 20  # Phase 2: $20 max per trade
+            # Phase 2 trade sizes — based on available wallet balance per chain
+            if chain == 'solana':
+                trade_usd = 10   # Only $60 SOL left — conservative
+            elif chain in ('base', 'ethereum'):
+                trade_usd = 20   # Enough ETH on both
+            elif chain == 'bsc':
+                trade_usd = 15   # Paper only anyway
+            else:
+                trade_usd = 15
             proposals.append({
                 'action': 'BUY',
                 'symbol': sym,
@@ -919,6 +945,18 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
 
     # 3. DEX gem proposals — load directly from DB, bypassing wallet_agent chain confusion
     proposals = _load_dex_proposals(portfolio)
+    # Add established coin proposals (sentiment-driven)
+    try:
+        established = _load_established_proposals(portfolio)
+        proposals = proposals + established
+    except Exception as _ep:
+        print(f"  established proposals error: {_ep}")
+    # Add established coin proposals (sentiment-driven)
+    try:
+        established = _load_established_proposals(portfolio)
+        proposals = proposals + established
+    except Exception as _ep:
+        print(f"  established proposals error: {_ep}")
 
     # 3b. Supplement with wallet_agent for non-DEX signals (listings, pre-launch etc)
     try:
@@ -967,7 +1005,9 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         chain    = p.get('chain', 'solana')
         action   = p.get('action', '')
         cat      = p.get('category', '')
-        trade_usd = min(p.get('trade_usd', 20), 20)  # Phase 2 hard cap: $20
+        # Per-chain hard caps
+        chain_caps = {'solana': 10, 'base': 20, 'ethereum': 20, 'bsc': 15, 'arbitrum': 15}
+        trade_usd = min(p.get('trade_usd', 20), chain_caps.get(chain, 20))
 
         if not sym or action not in ('BUY', 'ACCUMULATE'):
             continue
@@ -991,7 +1031,19 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if any(p in sym.lower() for p in _SCAM_PATTERNS):
             continue
 
-        key = f"{sym}_{chain}"
+        # SOL live mode: skip PumpFun bonding curve tokens — can't sell via Jupiter
+        if chain == 'solana' and not DRY_RUN_FLAG:
+            coin_id = proposal.get('coin_id', '')
+            if coin_id and len(coin_id) > 30:
+                try:
+                    from executor import _is_pumpfun_graduated as _grad
+                    if not _grad(coin_id):
+                        print(f"    SKIP {sym} — PumpFun bonding curve (not graduated to Raydium)")
+                        continue
+                except Exception:
+                    pass
+
+
         if key in portfolio.holdings:
             continue
         if sym in stop_lossed_syms:
@@ -1013,6 +1065,12 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
 
         ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'),
                               contract=p.get('coin_id', ''))
+        # Store override stop-loss/take-profit for established coins
+        if ok and p.get('stop_loss_override'):
+            key = f"{sym}_{chain}"
+            if key in portfolio.holdings:
+                portfolio.holdings[key]['stop_loss_override'] = p['stop_loss_override']
+                portfolio.holdings[key]['take_profit_override'] = p.get('take_profit_override', TAKE_PROFIT_PCT)
         if ok:
             print(f"    BUY {sym} ${trade_usd:.0f} @ ${price:.8f} | {str(p.get('reasons', ''))[:50]}")
             chain_counts[chain] = chain_counts.get(chain, 0) + 1

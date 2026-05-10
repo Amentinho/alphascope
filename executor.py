@@ -512,6 +512,74 @@ def _jupiter_quote_slippage(input_mint, output_mint, amount_raw, slippage_bps):
     except Exception as e: print(f"    Jupiter: {e}")
     return None
 
+def _pumpfun_sell(kp, contract, raw_amount) -> dict:
+    """
+    Sell a PumpFun bonding curve token directly via PumpFun's trade API.
+    Used when token hasn't graduated to Raydium yet.
+    """
+    try:
+        import base64
+        from solders.transaction import VersionedTransaction
+
+        pubkey = str(kp.pubkey())
+
+        # Step 1: Get quote from PumpFun API
+        r = requests.post('https://pumpportal.fun/api/trade-local', json={
+            'publicKey': pubkey,
+            'action': 'sell',
+            'mint': contract,
+            'amount': str(raw_amount),  # exact token amount to sell
+            'denominatedInSol': 'false',  # we're selling tokens not SOL
+            'slippage': 50,  # 50% slippage tolerance for illiquid tokens
+            'priorityFee': 0.001,
+            'pool': 'pump',
+        }, timeout=15)
+
+        if r.status_code != 200:
+            return {'success': False, 'error': f'PumpFun API {r.status_code}: {r.text[:100]}'}
+
+        # Step 2: Sign and submit the transaction
+        tx_bytes = r.content
+        if not tx_bytes:
+            return {'success': False, 'error': 'PumpFun returned empty transaction'}
+
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        try:
+            signed_tx = VersionedTransaction(tx.message, [kp])
+        except Exception:
+            signed_tx = tx
+
+        # Submit directly to Solana RPC (PumpFun API already built the tx)
+        import base64 as _b64
+        encoded = _b64.b64encode(bytes(signed_tx)).decode()
+        r2 = requests.post('https://api.mainnet-beta.solana.com', json={
+            'jsonrpc': '2.0', 'id': 1,
+            'method': 'sendTransaction',
+            'params': [encoded, {
+                'encoding': 'base64',
+                'skipPreflight': False,
+                'maxRetries': 3,
+                'preflightCommitment': 'confirmed',
+            }]
+        }, headers={'Content-Type': 'application/json'}, timeout=20)
+
+        result = r2.json()
+        if 'result' in result and result['result']:
+            tx_hash = result['result']
+            sol_url = f"https://solscan.io/tx/{tx_hash}"
+            print(f"    PumpFun sell submitted: {tx_hash[:16]}...")
+            return {'success': True, 'tx': tx_hash, 'url': sol_url, 'method': 'pumpfun'}
+        elif 'error' in result:
+            return {'success': False, 'error': f"PumpFun RPC error: {result['error']}"}
+
+    except ImportError:
+        return {'success': False, 'error': 'pip install solana solders'}
+    except Exception as e:
+        return {'success': False, 'error': f'PumpFun sell error: {e}'}
+
+    return {'success': False, 'error': 'PumpFun sell failed'}
+
+
 def _jito_submit(signed_b64):
     """Submit tx bundle. Tries all Jito endpoints, falls back to direct Solana RPC."""
     # Try all Jito endpoints
@@ -582,10 +650,10 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
     if not quote:
         return {'success': False, 'error': f'Jupiter quote failed — no route for {symbol}'}
     # Check if PumpFun token has graduated to Raydium
-    # Ungraduated tokens fail with 0x1771 (NotEnoughLiquidity on bonding curve)
+    # Ungraduated tokens fail with 0x1771 on Jupiter — skip buy entirely
     if not _is_pumpfun_graduated(contract):
         return {'success': False,
-                'error': f'{symbol} still on PumpFun bonding curve — not yet tradeable via Jupiter'}
+                'error': f'{symbol} still on PumpFun bonding curve — wait for Raydium graduation'}
 
     impact = float(quote.get('priceImpactPct', 0)) * 100
     if impact > 25:
@@ -791,6 +859,18 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
                 'sol_received': sol_out, 'usd_received': sol_out * _sol_price(), 'url': sol_url}
     except Exception as e:
         err = str(e)
+        # PumpFun bonding curve error — token not graduated, use PumpFun direct sell
+        if '6001' in err or '0x1771' in err or 'NotEnoughLiquidity' in err.lower():
+            print(f"    Jupiter failed (PumpFun token) — trying PumpFun direct sell")
+            pf_result = _pumpfun_sell(kp, contract, raw)
+            if pf_result.get('success'):
+                tx = pf_result['tx']
+                sol_url = f"https://solscan.io/tx/{tx}"
+                _tg(f"✅ <b>SOL SELL {symbol}</b> (PumpFun direct)\n"
+                    f'🔗 <a href="{sol_url}">{tx[:16]}...</a>')
+                return pf_result
+            return {'success': False,
+                    'error': f'PumpFun sell failed: {pf_result.get("error","")}'}
         # Slippage error — quote is stale, retry with fresh quote
         if '6025' in err or '6024' in err or 'slippage' in err.lower():
             print(f"    Slippage error on sell — retrying with fresh quote")
