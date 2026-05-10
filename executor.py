@@ -93,19 +93,83 @@ WETH = {
 # Uniswap v3 pool fees (try 0.3% first, then 1%, then 0.05%)
 POOL_FEES = [3000, 10000, 500]
 
-# Additional DEX routers — fallback chain if Uniswap v3 has no pool
+# Comprehensive DEX router registry — all major legit DEXes
+# Ordered by volume/reliability — tried in sequence until one works
 DEX_ROUTERS = {
     'ethereum': [
-        {'name': 'Uniswap v3',  'type': 'v3', 'router': '0xE592427A0AEce92De3Edee1F18E0157C05861564'},
-        {'name': 'Uniswap v2',  'type': 'v2', 'router': '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D'},
-        {'name': 'SushiSwap',   'type': 'v2', 'router': '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F'},
+        # Uniswap — largest by volume, try all fee tiers
+        {'name': 'Uniswap v3',      'type': 'v3',  'router': '0xE592427A0AEce92De3Edee1F18E0157C05861564'},
+        {'name': 'Uniswap v2',      'type': 'v2',  'router': '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D'},
+        # SushiSwap — 2nd largest, many long-tail tokens
+        {'name': 'SushiSwap v2',    'type': 'v2',  'router': '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F'},
+        {'name': 'SushiSwap v3',    'type': 'v3',  'router': '0x2c7a51A357d5739C5C74Bf3C96816849d2c9F726'},
+        # PancakeSwap v3 on ETH — growing fast
+        {'name': 'PancakeSwap v3',  'type': 'v3',  'router': '0x1b81D678ffb9C0263b24A97847620C99d213eB14'},
+        {'name': 'PancakeSwap v2',  'type': 'v2',  'router': '0xEfF92A263d31888d860bD50809A8D171709b7b1c'},
+        # Balancer v2 — good for multi-token pools
+        {'name': 'Balancer v2',     'type': 'balancer', 'router': '0xBA12222222228d8Ba445958a75a0704d566BF2C8'},
     ],
     'base': [
-        {'name': 'Uniswap v3',  'type': 'v3', 'router': '0xE592427A0AEce92De3Edee1F18E0157C05861564'},
-        {'name': 'Aerodrome',   'type': 'v2', 'router': '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43'},
-        {'name': 'Uniswap v2',  'type': 'v2', 'router': '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24'},
+        # Uniswap — deployed on Base
+        {'name': 'Uniswap v3',      'type': 'v3',  'router': '0x2626664c2603336E57B271c5C0b26F421741e481'},
+        {'name': 'Uniswap v2',      'type': 'v2',  'router': '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24'},
+        # Aerodrome — dominant on Base by volume
+        {'name': 'Aerodrome v2',    'type': 'aero', 'router': '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43'},
+        {'name': 'Aerodrome v1',    'type': 'v2',   'router': '0x420DD381b31aEf6683db6B902084cB0FFECe40Da'},
+        # PancakeSwap on Base
+        {'name': 'PancakeSwap v3',  'type': 'v3',  'router': '0x1b81D678ffb9C0263b24A97847620C99d213eB14'},
+        {'name': 'PancakeSwap v2',  'type': 'v2',  'router': '0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb'},
+        # BaseSwap — Base-native DEX
+        {'name': 'BaseSwap',        'type': 'v2',  'router': '0x327Df1E6de05895d2ab08513aaDD9313Fe505d86'},
+        # SushiSwap on Base
+        {'name': 'SushiSwap v3',    'type': 'v3',  'router': '0x2c7a51A357d5739C5C74Bf3C96816849d2c9F726'},
+    ],
+    'arbitrum': [
+        {'name': 'Uniswap v3',      'type': 'v3',  'router': '0xE592427A0AEce92De3Edee1F18E0157C05861564'},
+        {'name': 'Camelot',         'type': 'v2',  'router': '0xc873fEcbd354f5A56E00E710B90EF4201db2448d'},
+        {'name': 'SushiSwap v3',    'type': 'v3',  'router': '0x2c7a51A357d5739C5C74Bf3C96816849d2c9F726'},
+        {'name': 'PancakeSwap v3',  'type': 'v3',  'router': '0x1b81D678ffb9C0263b24A97847620C99d213eB14'},
     ],
 }
+
+# Aerodrome router ABI (same as Uniswap v2 but with different function names)
+AERODROME_ABI = [
+    {
+        "inputs": [
+            {"name": "amountOutMin", "type": "uint256"},
+            {"components": [
+                {"name": "from", "type": "address"},
+                {"name": "to", "type": "address"},
+                {"name": "stable", "type": "bool"},
+                {"name": "factory", "type": "address"},
+            ], "name": "routes", "type": "tuple[]"},
+            {"name": "to", "type": "address"},
+            {"name": "deadline", "type": "uint256"},
+        ],
+        "name": "swapExactETHForTokens",
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "payable", "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "amountOutMin", "type": "uint256"},
+            {"components": [
+                {"name": "from", "type": "address"},
+                {"name": "to", "type": "address"},
+                {"name": "stable", "type": "bool"},
+                {"name": "factory", "type": "address"},
+            ], "name": "routes", "type": "tuple[]"},
+            {"name": "to", "type": "address"},
+            {"name": "deadline", "type": "uint256"},
+        ],
+        "name": "swapExactTokensForETH",
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "nonpayable", "type": "function"
+    },
+]
+# Aerodrome factory address on Base
+AERODROME_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da'
 
 # Uniswap v2 router ABI (minimal)
 UNISWAP_V2_ABI = [
@@ -657,8 +721,66 @@ def _gas_params(w3):
     return base_fee * 2 + priority_fee, priority_fee
 
 
+def _try_aerodrome_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -> dict:
+    """Buy via Aerodrome router on Base — uses routes struct instead of path array."""
+    weth = w3.to_checksum_address(WETH[chain])
+    token = w3.to_checksum_address(token_out)
+    router = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=AERODROME_ABI)
+    max_fee, priority_fee = _gas_params(w3)
+    deadline = int(time.time()) + 300
+    # Try volatile pool first (stable=False), then stable pool
+    for stable in [False, True]:
+        try:
+            routes = [{'from': weth, 'to': token, 'stable': stable, 'factory': AERODROME_FACTORY}]
+            tx = router.functions.swapExactETHForTokens(
+                0, routes, addr, deadline
+            ).build_transaction({
+                'from': addr, 'value': eth_amount_wei, 'gas': 300000,
+                'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
+                'nonce': w3.eth.get_transaction_count(addr, 'pending'),
+                'chainId': CHAIN_IDS[chain], 'type': 2,
+            })
+            signed = acct.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt['status'] == 1:
+                return {'success': True, 'tx': tx_hash.hex(), 'gas_used': receipt['gasUsed']}
+        except Exception as e:
+            continue
+    return {'success': False, 'error': 'Aerodrome: both stable/volatile pools failed'}
+
+
+def _try_aerodrome_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> dict:
+    """Sell via Aerodrome router on Base."""
+    weth = w3.to_checksum_address(WETH[chain])
+    token = w3.to_checksum_address(token_in)
+    router = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=AERODROME_ABI)
+    _approve_token(w3, chain, token, amount_wei, acct, addr)
+    max_fee, priority_fee = _gas_params(w3)
+    deadline = int(time.time()) + 300
+    for stable in [False, True]:
+        try:
+            routes = [{'from': token, 'to': weth, 'stable': stable, 'factory': AERODROME_FACTORY}]
+            tx = router.functions.swapExactTokensForETH(
+                amount_wei, 0, routes, addr, deadline
+            ).build_transaction({
+                'from': addr, 'value': 0, 'gas': 300000,
+                'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
+                'nonce': w3.eth.get_transaction_count(addr, 'pending'),
+                'chainId': CHAIN_IDS[chain], 'type': 2,
+            })
+            signed = acct.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt['status'] == 1:
+                return {'success': True, 'tx': tx_hash.hex()}
+        except Exception:
+            continue
+    return {'success': False, 'error': 'Aerodrome sell failed'}
+
+
 def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -> dict:
-    """Buy via Uniswap v2 style router (also works for Aerodrome, SushiSwap)."""
+    """Buy via Uniswap v2 style router (also works for SushiSwap, PancakeSwap, BaseSwap)."""
     weth = w3.to_checksum_address(WETH[chain])
     token = w3.to_checksum_address(token_out)
     router = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=UNISWAP_V2_ABI)
@@ -750,16 +872,51 @@ def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei) -> dict:
         except Exception as e:
             errors.append(f"Uniswap v3 fee={pool_fee}: {str(e)[:60]}")
 
-    # Fallback to v2-style routers (Uniswap v2, Aerodrome, SushiSwap)
+    # Fallback to all other DEX routers in order
     for dex in DEX_ROUTERS.get(chain, [])[1:]:  # skip index 0 (v3, already tried)
-        print(f"    Trying {dex['name']} fallback...")
-        result = _try_v2_buy(w3, chain, acct, addr, dex['router'], token_out, eth_amount_wei)
-        if result['success']:
-            result['dex'] = dex['name']
-            return result
-        errors.append(f"{dex['name']}: {result.get('error','')[:60]}")
+        dex_type = dex.get('type', 'v2')
+        print(f"    Trying {dex['name']}...")
+        try:
+            if dex_type == 'aero':
+                result = _try_aerodrome_buy(w3, chain, acct, addr, dex['router'], token_out, eth_amount_wei)
+            elif dex_type == 'v3':
+                # Try as v3 with all fee tiers
+                result = {'success': False, 'error': 'v3 already tried'}
+                for fee in POOL_FEES:
+                    try:
+                        r3 = w3.eth.contract(address=w3.to_checksum_address(dex['router']), abi=UNISWAP_ABI)
+                        fee_hist = w3.eth.fee_history(1, 'latest', [50])
+                        bf = fee_hist['baseFeePerGas'][-1]
+                        pf = w3.to_wei(2, 'gwei')
+                        tx = r3.functions.exactInputSingle({
+                            'tokenIn': weth, 'tokenOut': token, 'fee': fee,
+                            'recipient': addr, 'deadline': deadline,
+                            'amountIn': eth_amount_wei, 'amountOutMinimum': 0, 'sqrtPriceLimitX96': 0,
+                        }).build_transaction({
+                            'from': addr, 'value': eth_amount_wei, 'gas': 250000,
+                            'maxFeePerGas': bf*2+pf, 'maxPriorityFeePerGas': pf,
+                            'nonce': w3.eth.get_transaction_count(addr, 'pending'),
+                            'chainId': CHAIN_IDS[chain], 'type': 2,
+                        })
+                        signed = acct.sign_transaction(tx)
+                        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                        if receipt['status'] == 1:
+                            result = {'success': True, 'tx': tx_hash.hex(), 'dex': dex['name']}
+                            break
+                    except Exception:
+                        continue
+            else:
+                result = _try_v2_buy(w3, chain, acct, addr, dex['router'], token_out, eth_amount_wei)
 
-    return {'success': False, 'error': ' | '.join(errors[-3:])}
+            if result.get('success'):
+                result['dex'] = dex['name']
+                return result
+            errors.append(f"{dex['name']}: {result.get('error','')[:60]}")
+        except Exception as e:
+            errors.append(f"{dex['name']}: {str(e)[:60]}")
+
+    return {'success': False, 'error': ' | '.join(errors[-4:])}
 
 def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei) -> dict:
     """Sell token for ETH. Tries Uniswap v3 then v2 fallbacks."""
