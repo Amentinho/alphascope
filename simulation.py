@@ -963,6 +963,13 @@ def _load_established_proposals(portfolio):
         print(f"    📊 Established: {', '.join(p['symbol'] for p in proposals)}")
     return proposals
 
+# Dry run flag — checked in agent cycle and proposal loading
+try:
+    from executor import DRY_RUN as DRY_RUN_FLAG
+except Exception:
+    DRY_RUN_FLAG = True
+
+
 def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
     actions = 0
 
@@ -1078,15 +1085,14 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if any(p in sym.lower() for p in _SCAM_PATTERNS):
             continue
 
-        # SOL live mode: skip PumpFun bonding curve tokens — can't sell via Jupiter
+        # SOL: warn on PumpFun tokens (executor will handle rejection)
         if chain == 'solana' and not DRY_RUN_FLAG:
-            coin_id = proposal.get('coin_id', '')
+            coin_id = p.get('coin_id', '')
             if coin_id and len(coin_id) > 30:
                 try:
                     from executor import _is_pumpfun_graduated as _grad
                     if not _grad(coin_id):
-                        print(f"    SKIP {sym} — PumpFun bonding curve (not graduated to Raydium)")
-                        continue
+                        print(f"    NOTE {sym} — PumpFun token (executor will check graduation)")
                 except Exception:
                     pass
 
@@ -1168,7 +1174,7 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     print(f"  AlphaScope Trade Simulation v2.3")
     print(f"  Sim ID: {sim_id}")
     print(f"  Trading capital: ${portfolio.starting_trading:.0f} "
-          f"(SOL/BSC/BASE/ARB: ${STARTING_BALANCE_USD:.0f} each | ETH: ${ETH_BUDGET_USD:.0f})")
+          f"(SOL: ${STARTING_BALANCE_USD:.0f} | BASE: ${STARTING_BALANCE_USD:.0f} | ETH: ${ETH_BUDGET_USD:.0f})")
     try:
         from executor import DRY_RUN as _DR
         if not _DR:
