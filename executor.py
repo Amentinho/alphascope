@@ -500,13 +500,18 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
     if not quote:
         return {'success': False, 'error': f'Jupiter quote failed — no route for {symbol}'}
     impact = float(quote.get('priceImpactPct', 0)) * 100
-    if impact > 15:
-        return {'success': False, 'error': f'Impact too high: {impact:.1f}%'}
-    if impact > 5:
-        # Reduce trade size to bring impact under 5%
-        reduction = 5.0 / impact
-        lamports = int(lamports * reduction)
-        print(f"    Impact {impact:.1f}% — reducing trade size by {(1-reduction)*100:.0f}%")
+    if impact > 25:
+        # Truly illiquid — skip entirely
+        return {'success': False, 'error': f'Impact too high: {impact:.1f}% — token illiquid'}
+    if impact > 3:
+        # Reduce trade size to bring impact to ~3%
+        reduction = 3.0 / impact
+        new_lamports = int(lamports * reduction)
+        min_lamports = int(0.02 * 1e9)  # minimum $2 trade
+        if new_lamports < min_lamports:
+            return {'success': False, 'error': f'Impact {impact:.1f}% — trade too small after resize'}
+        lamports = new_lamports
+        print(f"    Impact {impact:.1f}% — resizing trade to ${lamports/1e9*_sol_price():.1f}")
         quote = _jupiter_quote(WSOL_MINT, contract, lamports)
         if not quote: return {'success': False, 'error': 'Jupiter quote failed after resize'}
         impact = float(quote.get('priceImpactPct', 0)) * 100
