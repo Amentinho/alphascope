@@ -395,6 +395,44 @@ def _sol_keypair():
         print(f"  SOL keypair error: {e}")
         return None
 
+PUMP_FUN_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'
+PUMP_FUN_GRADUATION_MCAP = 69000  # ~$69k market cap to graduate to Raydium
+
+
+def _is_pumpfun_graduated(mint_address) -> bool:
+    """
+    Check if a PumpFun token has graduated to Raydium.
+    Ungraduated tokens can't be bought via Jupiter — they need PumpFun's own UI.
+    Returns True if safe to trade via Jupiter, False if still on bonding curve.
+    """
+    try:
+        # Check DexScreener — graduated tokens show Raydium as DEX
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{mint_address}',
+            timeout=6)
+        if r.status_code == 200:
+            pairs = r.json().get('pairs', [])
+            for pair in pairs:
+                if pair.get('chainId') != 'solana':
+                    continue
+                dex = pair.get('dexId', '').lower()
+                # If on Raydium or Orca = graduated, safe to trade
+                if dex in ('raydium', 'orca', 'meteora', 'lifinity'):
+                    return True
+                # If only on pump.fun = not graduated
+                if dex in ('pump.fun', 'pumpfun', 'pump'):
+                    return False
+        # Check Jupiter token list — graduated tokens appear here
+        r2 = requests.get(
+            f'https://api.jup.ag/tokens/v1/token/{mint_address}',
+            timeout=6)
+        if r2.status_code == 200:
+            return True  # In Jupiter's list = tradeable
+    except Exception:
+        pass
+    return True  # Default to allowing — let Jupiter handle it
+
+
 def _resolve_sol_mint(symbol) -> str:
     """Look up SOL token mint address. Tries Jupiter, DexScreener, CoinGecko."""
     sym_upper = symbol.upper()
@@ -543,6 +581,12 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
             pass
     if not quote:
         return {'success': False, 'error': f'Jupiter quote failed — no route for {symbol}'}
+    # Check if PumpFun token has graduated to Raydium
+    # Ungraduated tokens fail with 0x1771 (NotEnoughLiquidity on bonding curve)
+    if not _is_pumpfun_graduated(contract):
+        return {'success': False,
+                'error': f'{symbol} still on PumpFun bonding curve — not yet tradeable via Jupiter'}
+
     impact = float(quote.get('priceImpactPct', 0)) * 100
     if impact > 25:
         # Truly illiquid — skip entirely
