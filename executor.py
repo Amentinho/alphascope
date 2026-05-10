@@ -642,41 +642,61 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
         return {'success': False, 'error': str(e)}
 
 def _get_sol_token_balance(wallet_pubkey: str, mint_address: str) -> int:
-    """Get actual raw token balance from Solana wallet. Returns raw amount (with decimals)."""
-    try:
-        r = requests.post('https://api.mainnet-beta.solana.com', json={
-            'jsonrpc': '2.0', 'id': 1,
-            'method': 'getTokenAccountsByOwner',
-            'params': [
-                wallet_pubkey,
-                {'mint': mint_address},
-                {'encoding': 'jsonParsed'}
-            ]
-        }, timeout=10)
-        if r.status_code == 200:
-            accounts = r.json().get('result', {}).get('value', [])
-            if accounts:
-                amount = accounts[0].get('account', {}).get('data', {}).get(
-                    'parsed', {}).get('info', {}).get('tokenAmount', {}).get('amount', '0')
-                return int(amount)
-    except Exception as e:
-        print(f"    balance lookup error: {e}")
+    """Get actual raw token balance from Solana wallet. Tries multiple RPCs."""
+    sol_rpcs = [
+        'https://api.mainnet-beta.solana.com',
+        'https://solana-mainnet.g.alchemy.com/v2/demo',
+        'https://rpc.ankr.com/solana',
+    ]
+    for rpc in sol_rpcs:
+        try:
+            r = requests.post(rpc, json={
+                'jsonrpc': '2.0', 'id': 1,
+                'method': 'getTokenAccountsByOwner',
+                'params': [
+                    wallet_pubkey,
+                    {'mint': mint_address},
+                    {'encoding': 'jsonParsed'}
+                ]
+            }, timeout=8)
+            if r.status_code == 200:
+                result = r.json()
+                if 'error' in result:
+                    continue
+                accounts = result.get('result', {}).get('value', [])
+                if accounts:
+                    amount = (accounts[0].get('account', {})
+                              .get('data', {}).get('parsed', {})
+                              .get('info', {}).get('tokenAmount', {})
+                              .get('amount', '0'))
+                    bal = int(amount)
+                    if bal > 0:
+                        print(f"    Token balance: {bal} raw units")
+                        return bal
+        except Exception as e:
+            continue
+    print(f"    Token balance: 0 (not found in wallet)")
     return 0
 
 
 def _get_spl_decimals(mint_address) -> int:
-    """Fetch SPL token decimals from Solana RPC."""
-    try:
-        r = requests.post('https://api.mainnet-beta.solana.com', json={
-            'jsonrpc': '2.0', 'id': 1,
-            'method': 'getAccountInfo',
-            'params': [mint_address, {'encoding': 'jsonParsed'}]
-        }, timeout=8)
-        info = r.json().get('result', {}).get('value', {})
-        decimals = info.get('data', {}).get('parsed', {}).get('info', {}).get('decimals', 6)
-        return int(decimals)
-    except Exception:
-        return 6  # safe default for most SPL tokens
+    """Fetch SPL token decimals from Solana RPC. Handles both SPL and Token-2022."""
+    for rpc in ['https://api.mainnet-beta.solana.com', 'https://rpc.ankr.com/solana']:
+        try:
+            r = requests.post(rpc, json={
+                'jsonrpc': '2.0', 'id': 1,
+                'method': 'getAccountInfo',
+                'params': [mint_address, {'encoding': 'jsonParsed'}]
+            }, timeout=8)
+            if r.status_code == 200:
+                info = r.json().get('result', {}).get('value', {})
+                decimals = (info.get('data', {}).get('parsed', {})
+                           .get('info', {}).get('decimals'))
+                if decimals is not None:
+                    return int(decimals)
+        except Exception:
+            continue
+    return 6  # default for most SPL tokens
 
 
 def execute_sol_sell(symbol, contract, token_amount) -> dict:
@@ -685,15 +705,20 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
     if not kp: return {'success': False, 'error': 'No SOL keypair'}
     if not contract or len(contract) < 30:
         return {'success': False, 'error': f'No contract for {symbol}'}
-    # Get actual token balance from wallet — more reliable than sim calculation
+    # Get actual token balance from wallet — NEVER use sim calculation
     decimals = _get_spl_decimals(contract)
     kp_pub = str(kp.pubkey())
     raw = _get_sol_token_balance(kp_pub, contract)
     if not raw or raw == 0:
-        # Fallback to sim calculation
-        raw = int(token_amount * (10 ** decimals))
+        # Double-check with decimals from chain
+        decimals = _get_spl_decimals(contract)
+        raw = _get_sol_token_balance(kp_pub, contract)
     if not raw or raw == 0:
-        return {'success': False, 'error': f'No {symbol} balance in wallet'}
+        return {'success': False,
+                'error': f'No {symbol} balance found in wallet — already sold or wrong account'}
+    # Safety check: don't send more than we have (causes 0x11 InsufficientFunds)
+    # Use 99% of balance to account for fees
+    raw = int(raw * 0.999)
     # Try sell routes with increasing slippage
     quote = None
     USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
