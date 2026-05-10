@@ -416,8 +416,23 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
         return {'success': False, 'error': f'No contract for {symbol}'}
     sol_price = _sol_price()
     lamports = int(min(usd / sol_price, MAX_SOL_PER_TRADE) * 1e9)
-    quote = _jupiter_quote(WSOL_MINT, contract, lamports)
-    if not quote: return {'success': False, 'error': 'Jupiter quote failed'}
+    # Try buy with explicit routing options
+    quote = None
+    for slippage in [SLIPPAGE_BPS, 500, 1000]:
+        try:
+            r = requests.get(JUPITER_QUOTE, params={
+                'inputMint': WSOL_MINT, 'outputMint': contract,
+                'amount': lamports, 'slippageBps': slippage,
+                'onlyDirectRoutes': 'false',
+            }, timeout=10)
+            if r.status_code == 200:
+                q = r.json()
+                if q and not q.get('error') and int(q.get('outAmount', 0)) > 0:
+                    quote = q
+                    break
+        except Exception:
+            pass
+    if not quote: return {'success': False, 'error': 'Jupiter quote failed — no route'}
     impact = float(quote.get('priceImpactPct', 0)) * 100
     if impact > 15:
         return {'success': False, 'error': f'Impact too high: {impact:.1f}%'}
@@ -520,22 +535,46 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
         raw = int(token_amount * (10 ** decimals))
     if not raw or raw == 0:
         return {'success': False, 'error': f'No {symbol} balance in wallet'}
-    # Try with increasing slippage — sells need high tolerance on micro-caps
+    # Try sell routes with increasing slippage
     quote = None
-    for slippage in [500, 1000, 3000, 5000]:  # 5%, 10%, 30%, 50%
-        q = _jupiter_quote_slippage(contract, WSOL_MINT, raw, slippage)
-        if q and not q.get('error'):
-            quote = q
-            break
-    # If no direct SOL route, try routing through USDC as intermediate
+    USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+
+    # Try direct SOL route first
+    for slippage in [300, 500, 1000, 3000, 5000]:
+        try:
+            r = requests.get(JUPITER_QUOTE, params={
+                'inputMint': contract, 'outputMint': WSOL_MINT,
+                'amount': raw, 'slippageBps': slippage,
+                'onlyDirectRoutes': 'false',
+                'asLegacyTransaction': 'false',
+            }, timeout=10)
+            if r.status_code == 200:
+                q = r.json()
+                if q and not q.get('error') and int(q.get('outAmount', 0)) > 0:
+                    quote = q
+                    break
+        except Exception:
+            pass
+
+    # Try USDC route if SOL fails
     if not quote:
-        USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
         for slippage in [1000, 5000]:
-            q = _jupiter_quote_slippage(contract, USDC_MINT, raw, slippage)
-            if q and not q.get('error'):
-                quote = q
-                break
-    if not quote: return {'success': False, 'error': 'Jupiter: no route found (token may be illiquid)'}
+            try:
+                r = requests.get(JUPITER_QUOTE, params={
+                    'inputMint': contract, 'outputMint': USDC_MINT,
+                    'amount': raw, 'slippageBps': slippage,
+                    'onlyDirectRoutes': 'false',
+                }, timeout=10)
+                if r.status_code == 200:
+                    q = r.json()
+                    if q and not q.get('error') and int(q.get('outAmount', 0)) > 0:
+                        quote = q
+                        break
+            except Exception:
+                pass
+
+    if not quote:
+        return {'success': False, 'error': 'Jupiter: no route found — token may be fully illiquid'}
     try:
         import base64
         from solders.transaction import VersionedTransaction
@@ -1035,19 +1074,10 @@ def execute_evm_buy(symbol, chain, contract, usd) -> dict:
     eth_amount = min(usd / eth_price, MAX_ETH_PER_TRADE)
     eth_amount_wei = int(eth_amount * 1e18)
 
-    # Pre-check: verify token has a DEX pool before wasting gas
-    w3_check = _w3(chain)
+    # Light pre-check: get DEX info for routing hints (non-blocking)
     dex_info = _get_token_dex_info(contract, chain)
-    if w3_check:
-        pool_fee = _check_uniswap_pool(w3_check, chain, contract)
-        if not pool_fee:
-            # No Uniswap pool — check if it's on another DEX via DexScreener
-            if not dex_info:
-                return {'success': False,
-                        'error': f'No Uniswap pool found for {symbol} on {chain}'}
-            print(f"    {symbol} on {dex_info.get('dex','unknown DEX')} — no Uniswap pool, paper trade only")
-            return {'success': False,
-                    'error': f'{symbol} only on {dex_info.get("dex","custom DEX")} — not yet supported'}
+    if dex_info:
+        print(f"    {symbol} DEX: {dex_info.get('dex','?')} liq:${dex_info.get('liq',0)/1000:.0f}k")
 
     # Check ETH balance
     w3 = _w3(chain)

@@ -15,8 +15,16 @@ import json
 app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "AlphaScope"
 
+import os as _os
+_BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+MAIN_DB = _os.path.join(_BASE_DIR, 'alphascope.db')
+SIM_DB  = _os.path.join(_BASE_DIR, 'sim.db')
+
 def get_db():
-    return sqlite3.connect('alphascope.db', timeout=30)
+    return sqlite3.connect(MAIN_DB, timeout=30)
+
+def get_sim_db():
+    return sqlite3.connect(SIM_DB, timeout=30)
 
 # ============================================================
 # DATA LOADERS
@@ -128,7 +136,7 @@ def load_sentiment():
 
 def load_sim_portfolio():
     try:
-        conn = get_db()
+        conn = get_sim_db()
         row = conn.execute("SELECT sim_id FROM sim_runs ORDER BY start_time DESC LIMIT 1").fetchone()
         if not row:
             conn.close()
@@ -149,7 +157,7 @@ def load_sim_portfolio():
 
 def load_agent_trades():
     try:
-        conn = get_db()
+        conn = get_sim_db()
         df = pd.read_sql_query(
             """SELECT symbol, chain, action, amount_usd, price_usd, signal_confidence,
                       mode, status, pnl_usd, notes, created_at
@@ -312,7 +320,7 @@ app.layout = html.Div(style={
         dcc.Markdown(id='ai-text', style={'color': '#ccc', 'lineHeight': '1.6', 'fontSize': '13px'}),
     ]),
 
-    dcc.Interval(id='refresh', interval=1800*1000, n_intervals=0),
+    dcc.Interval(id='refresh', interval=1800*1000, n_intervals=1),
 
     # ══════════════════════════════════════════════════════════
     # THREE MAIN BOXES
@@ -567,14 +575,14 @@ def update_main(_):
 @app.callback(
     [Output('detail-panel', 'children'), Output('detail-panel', 'style')],
     [Input(f'tab-{t}', 'n_clicks') for t in ['portfolio','agent','watchlist','dexgems','alpha','airdrops2','buzz','narratives','listings','whales','news','macro','reddit','x']],
-    prevent_initial_call=True
 )
 def show_detail(*clicks):
     ctx = callback_context
-    if not ctx.triggered:
-        return [], {**CARD, 'display': 'none'}
-    
-    tab = ctx.triggered[0]['prop_id'].split('.')[0].replace('tab-', '')
+    if not ctx.triggered or not any(clicks):
+        # Default: show buzz tab on load
+        tab = 'buzz'
+    else:
+        tab = ctx.triggered[0]['prop_id'].split('.')[0].replace('tab-', '')
     style = {**CARD, 'display': 'block', 'marginBottom': '20px'}
     
     if tab == 'portfolio':
