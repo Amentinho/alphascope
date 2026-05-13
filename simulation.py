@@ -274,6 +274,7 @@ SIM_GEM_MAX_USD = float(_env('SIM_GEM_MAX_USD', '0.75'))
 SIM_LISTING_MAX_USD = float(_env('SIM_LISTING_MAX_USD', '1.0'))
 SIM_MIN_ALLOC_SCORE = float(_env('SIM_MIN_ALLOC_SCORE', '58'))
 SIM_MAX_NEW_BUYS_PER_CYCLE = int(_env('SIM_MAX_NEW_BUYS_PER_CYCLE', '4'))
+SIM_LIQUIDATE_ON_END = _env('SIM_LIQUIDATE_ON_END', 'dry').lower().strip()
 
 # ── Single-writer DB queue ─────────────────────────────────────────────────────
 import queue as _queue
@@ -1676,6 +1677,17 @@ def _ai_risk_gate(p):
         return False, f'AI/token validator failed closed: {str(e)[:80]}'
 
 
+def _should_liquidate_on_end():
+    """End-of-run liquidation is useful for dry-run scoring, dangerous live."""
+    mode = SIM_LIQUIDATE_ON_END
+    if mode in ('true', '1', 'yes', 'always'):
+        return True
+    if mode in ('false', '0', 'no', 'never'):
+        return False
+    # Default "dry": close paper sessions, keep live positions managed by exits.
+    return _executor_dry_run()
+
+
 def _proposal_family(p):
     """Normalize proposal categories into portfolio allocation buckets."""
     cat = (p.get('category') or '').upper()
@@ -2353,8 +2365,11 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
             try:
                 time.sleep(cycle_min * 60)
             except KeyboardInterrupt:
-                print("\n  Stopped by user — selling all open positions...")
-                _sell_all_gems(portfolio)
+                if _should_liquidate_on_end():
+                    print("\n  Stopped by user — selling all open positions...")
+                    _sell_all_gems(portfolio)
+                else:
+                    print("\n  Stopped by user — keeping open positions for live management")
                 print(f"\n{'='*60}")
                 print(f"  COMPLETE -- {sim_id}")
                 portfolio.print_status()
@@ -2363,7 +2378,10 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
                 return
 
     # ── Natural end of session ───────────────────────────────────────
-    _sell_all_gems(portfolio)
+    if _should_liquidate_on_end():
+        _sell_all_gems(portfolio)
+    else:
+        print("\n  Session ended — keeping open positions for live management")
     print(f"\n{'='*60}")
     print(f"  COMPLETE -- {sim_id}")
     portfolio.print_status()

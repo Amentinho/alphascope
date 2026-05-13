@@ -1872,7 +1872,7 @@ def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18,
 
 
 # ── Unified interface called by simulation.py ─────────────────────────────────
-MAX_TRADE_USD = 2.0   # HARD CAP — max $2 per live trade
+MAX_TRADE_USD = float(_env('EXECUTOR_MAX_TRADE_USD', '2.0'))  # live hard cap
 
 # BASE/ETH live execution disabled — RPC unreliable, tokens not received
 # Set to True only after confirming RPC works end-to-end
