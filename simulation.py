@@ -89,10 +89,41 @@ BINANCE_SYMBOLS = {
 }
 
 
-def resolve_price(symbol, coin_id='', chain='', use_cache=True):
+def _dex_pair_price(chain, dex_url='', symbol=''):
+    """Resolve price from the exact DexScreener pair URL/address we bought."""
+    if not dex_url:
+        return 0.0
+    try:
+        pair_id = str(dex_url).rstrip('/').split('/')[-1]
+        if not pair_id or len(pair_id) < 20:
+            return 0.0
+        chain_id = {'ethereum': 'ethereum', 'base': 'base',
+                    'solana': 'solana', 'bsc': 'bsc',
+                    'arbitrum': 'arbitrum'}.get(chain, chain)
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/pairs/{chain_id}/{pair_id}',
+            timeout=6)
+        if r.status_code == 200:
+            pairs = r.json().get('pairs', []) or []
+            if not pairs:
+                pair = r.json().get('pair')
+                pairs = [pair] if pair else []
+            if pairs:
+                p = pairs[0]
+                if symbol:
+                    base_sym = p.get('baseToken', {}).get('symbol', '').upper()
+                    if base_sym and base_sym != symbol.upper():
+                        return 0.0
+                return float(p.get('priceUsd', 0) or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def resolve_price(symbol, coin_id='', chain='', use_cache=True, dex_url=''):
     """Fetch live price. Multiple sources with fallback chain."""
     sym = symbol.upper()
-    cache_key = f"{sym}_{chain}"
+    cache_key = f"{sym}_{chain}_{str(coin_id)[:16]}_{str(dex_url)[-16:]}"
 
     # Cache for 4 minutes within a cycle
     if use_cache and cache_key in _price_cache:
@@ -100,7 +131,15 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
         if time.time() - cached_time < 30 and cached_price > 0:
             return cached_price
 
-    # 0. DB first — only for known majors (Binance symbols)
+    # 0. Exact pair first for microcaps. This avoids symbol collisions such as
+    # SHEKEL/NO/NOGUY where a different pair can report a wildly different price.
+    if dex_url:
+        price = _dex_pair_price(chain, dex_url, sym)
+        if price > 0:
+            _price_cache[cache_key] = (price, time.time())
+            return price
+
+    # 1. DB first — only for known majors (Binance symbols)
     # Micro-cap tokens use contract address via DexScreener to avoid stale prices
     if sym in BINANCE_SYMBOLS:
         price = _db_price(sym)
@@ -225,6 +264,7 @@ MIN_WATCHLIST_SEEN = int(_env('SIM_MIN_WATCHLIST_SEEN', '2'))
 MIN_WATCHLIST_AGE_MIN = float(_env('SIM_MIN_WATCHLIST_AGE_MIN', '5'))
 ENABLE_AI_RISK_VETO = _env('ENABLE_AI_RISK_VETO', 'false').lower().strip() == 'true'
 AI_MIN_TOTAL_SCORE = int(_env('AI_MIN_TOTAL_SCORE', '16'))
+ESTABLISHED_ALLOW_TOPUPS = _env('SIM_ESTABLISHED_ALLOW_TOPUPS', 'false').lower().strip() == 'true'
 
 # ── Single-writer DB queue ─────────────────────────────────────────────────────
 import queue as _queue
@@ -511,8 +551,6 @@ class SimPortfolio:
 
     def _real_value(self):
         """Current live value."""
-        if self.wallet_balances:
-            return sum(b['usd'] for b in self.wallet_balances.values())
         BINANCE_IDS = {
             'LINK':'LINKUSDT','ETH':'ETHUSDT','BTC':'BTCUSDT',
             'SOL':'SOLUSDT','HYPE':'HYPEUSDT','BNB':'BNBUSDT',
@@ -554,14 +592,16 @@ class SimPortfolio:
         for key, pos in self.holdings.items():
             if pos.get('is_real'):
                 continue
-            p = resolve_price(pos['symbol'], chain=pos['chain'])
+            p = resolve_price(pos['symbol'], coin_id=pos.get('coin_id', ''),
+                              chain=pos['chain'], dex_url=pos.get('dex_url', ''))
             total += pos['amount'] * (p or pos['buy_price'])
         return total
 
     def can_buy(self, chain, usd):
         return self.cash.get(chain, 0) >= usd
 
-    def buy(self, symbol, chain, usd, price, source='agent', contract=''):
+    def buy(self, symbol, chain, usd, price, source='agent', contract='',
+            dex_url=''):
         if price <= 0:
             return False, f"price is zero"
         if not self.can_buy(chain, usd):
@@ -589,12 +629,14 @@ class SimPortfolio:
             'buy_price': price, 'buy_time': datetime.now().isoformat(),
             'usd_spent': usd, 'source': source,
             'coin_id': contract,  # mint address for real execution
+            'dex_url': dex_url,
             'is_real': False, '_zero_count': 0,
         }
         self.trades.append({
             'action': 'BUY', 'symbol': symbol, 'chain': chain,
             'usd': usd, 'price': price, 'tokens': tokens,
             'time': datetime.now().isoformat(), 'source': source,
+            'coin_id': contract, 'dex_url': dex_url,
         })
         try:
             if is_dry:
@@ -673,7 +715,9 @@ class SimPortfolio:
             if not buy_price:
                 continue
             try:
-                price = resolve_price(sym, chain=chain, use_cache=False)
+                price = resolve_price(sym, coin_id=pos.get('coin_id', ''),
+                                      chain=chain, use_cache=False,
+                                      dex_url=pos.get('dex_url', ''))
             except Exception:
                 price = 0
             if not price or price <= 0:
@@ -734,7 +778,9 @@ class SimPortfolio:
         if open_pos:
             print(f"  Open positions:")
             for key, pos in open_pos:
-                p = resolve_price(pos['symbol'], chain=pos['chain'])
+                p = resolve_price(pos['symbol'], coin_id=pos.get('coin_id', ''),
+                                  chain=pos['chain'],
+                                  dex_url=pos.get('dex_url', ''))
                 pct = (p - pos['buy_price']) / pos['buy_price'] * 100 if p and pos['buy_price'] else 0
                 val = pos['amount'] * (p or pos['buy_price'])
                 direction = 'UP' if pct >= 0 else 'DN'
@@ -812,7 +858,9 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                     try:
                         # Pass contract so resolve_price uses exact address not symbol search
                         contract = pos.get('contract', pos.get('coin_id', ''))
-                        price = resolve_price(sym, coin_id=contract, chain=chain, use_cache=True)
+                        price = resolve_price(sym, coin_id=contract, chain=chain,
+                                              use_cache=True,
+                                              dex_url=pos.get('dex_url', ''))
                     except Exception:
                         price = 0
                     if not price or price <= 0:
@@ -947,6 +995,8 @@ def _load_dex_proposals(portfolio):
                 'category': 'DEX_GEM',
                 'price_change_24h': price_chg_24h,
                 'age_hours': age,
+                'dex_url': dex_url,
+                'liquidity_usd': liq,
             })
     except Exception as e:
         print(f"    dex_proposals error: {e}")
@@ -1194,13 +1244,9 @@ def _load_established_proposals(portfolio):
             if sym in macro_only:
                 continue
 
-            # Step 3: only act on positive signals
-            if signal not in ('BUY', 'STRONG_BUY'):
-                continue
-            if score < 0.1:
-                continue
-            if bear_regime and (signal != 'STRONG_BUY' or score < 0.35):
-                continue
+            # Step 3: intelligence BUYs are primary. Neutral curated tokens can
+            # still become small ACCUMULATE entries when the curve confirms.
+            intelligence_buy = signal in ('BUY', 'STRONG_BUY') and score >= 0.08
 
             # Step 4: must have a known tradeable contract — no guessing
             registry = _CONTRACT_REGISTRY.get(sym)
@@ -1210,7 +1256,7 @@ def _load_established_proposals(portfolio):
             chain = registry['chain']
             if chain not in CHAINS:
                 continue
-            if sym in real_syms:
+            if sym in real_syms and not ESTABLISHED_ALLOW_TOPUPS:
                 continue  # already holding in real wallet
             if f"{sym}_{chain}" in portfolio.holdings:
                 continue  # already in sim position
@@ -1238,23 +1284,37 @@ def _load_established_proposals(portfolio):
                     continue
                 if bear_regime and curve['chg_1h'] <= 0:
                     continue
+                technical_buy = (
+                    signal == 'NEUTRAL'
+                    and -6.0 <= chg <= 6.0
+                    and curve['chg_15m'] > -0.5
+                    and curve['chg_1h'] > 0.25
+                    and curve['chg_4h'] > -1.0
+                    and curve.get('volume_ratio', 0) >= 0.6
+                )
+                if not intelligence_buy and not technical_buy:
+                    continue
+                if bear_regime and not intelligence_buy:
+                    continue
             except Exception:
                 continue
 
             # Step 6: propose
+            trade_usd = registry['max_usd'] if intelligence_buy else min(1, registry['max_usd'])
+            setup_label = signal if intelligence_buy else 'TECHNICAL_ACCUMULATE'
             proposals.append({
-                'action': 'BUY',
+                'action': 'BUY' if intelligence_buy else 'ACCUMULATE',
                 'symbol': sym,
                 'chain': chain,
                 'coin_id': registry['coin_id'],
                 'price': price,
-                'trade_usd': registry['max_usd'],  # $2 hard cap from registry
+                'trade_usd': trade_usd,
                 'stop_loss_override': registry['sl'],
                 'take_profit_override': registry['tp'],
-                'alpha_score': min(95, 60 + int(score * 100)),
+                'alpha_score': min(95, 60 + int(max(score, 0.12) * 100)),
                 'cross_score': 8,
-                'sources': f'intel:score={score:.2f},sig={signal}',
-                'reasons': [f'intel_{sym}:{signal}:{notes[:40]} '
+                'sources': f'intel:score={score:.2f},sig={setup_label}',
+                'reasons': [f'intel_{sym}:{setup_label}:{notes[:40]} '
                             f"curve15m:{curve['chg_15m']:+.1f}% "
                             f"curve1h:{curve['chg_1h']:+.1f}% "
                             f"curve4h:{curve['chg_4h']:+.1f}%"],
@@ -1396,6 +1456,7 @@ def _market_snapshot(symbol, chain, coin_id, fallback_price=0):
         'h24': 0.0,
         'buy_sell_ratio': 0.0,
         'source': 'none',
+        'dex_url': '',
     }
     if pair:
         pc = pair.get('priceChange', {}) or {}
@@ -1414,6 +1475,7 @@ def _market_snapshot(symbol, chain, coin_id, fallback_price=0):
             'h24': float(pc.get('h24', 0) or 0),
             'buy_sell_ratio': buys / max(sells, 1),
             'source': pair.get('dexId', 'dexscreener'),
+            'dex_url': pair.get('url', ''),
         })
     try:
         _ensure_strategy_tables()
@@ -1441,7 +1503,7 @@ def _candidate_watchlist_gate(p, price, snapshot):
     if p.get('category') == 'ESTABLISHED':
         return True, 'established'
     _ensure_strategy_tables()
-    key = f"{p.get('symbol','')}_{p.get('chain','')}_{p.get('coin_id','')[:18]}"
+    key = f"{p.get('_sim_id','')}_{p.get('symbol','')}_{p.get('chain','')}_{p.get('coin_id','')[:18]}"
     now = datetime.now()
     try:
         conn = sqlite3.connect(SIM_DB, timeout=5)
@@ -1662,6 +1724,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
     # Ban by symbol across all chains — strip |date suffix from dated entries
     stop_lossed_syms = {t['symbol'] for t in portfolio.trades
                         if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
+    closed_this_session = {f"{t['symbol']}_{t['chain']}" for t in portfolio.trades
+                           if t['action'] == 'SELL'}
     try:
         with open('sim_ban_list.json') as _f:
             for entry in json.load(_f):
@@ -1729,6 +1793,9 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         key = f"{sym}_{chain}"
         if key in portfolio.holdings:
             continue
+        if key in closed_this_session:
+            _skip_proposal(p, 'already closed this session; no rebuy loop')
+            continue
         if sym in stop_lossed_syms:
             _skip_proposal(p, 'symbol in stop-loss/ban list')
             continue
@@ -1741,7 +1808,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             continue
 
         # Always fetch live price — never trust stale DB price_usd
-        price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain, use_cache=False)
+        price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain,
+                              use_cache=False, dex_url=p.get('dex_url', ''))
         if not price or price <= 0:
             _skip_proposal(p, f'price unavailable on {chain}')
             continue
@@ -1767,7 +1835,10 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if not market_ok:
             _skip_proposal(p, market_reason, price=price)
             continue
+        if market_snapshot.get('dex_url') and not p.get('dex_url'):
+            p['dex_url'] = market_snapshot['dex_url']
 
+        p['_sim_id'] = portfolio.sim_id
         watch_ok, watch_reason = _candidate_watchlist_gate(p, price, market_snapshot)
         if not watch_ok:
             _skip_proposal(p, watch_reason, price=price)
@@ -1779,7 +1850,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             continue
 
         ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'),
-                              contract=p.get('coin_id', ''))
+                              contract=p.get('coin_id', ''),
+                              dex_url=p.get('dex_url', ''))
         # Store override stop-loss/take-profit for established coins
         if ok and p.get('stop_loss_override'):
             key = f"{sym}_{chain}"
@@ -2137,7 +2209,8 @@ def _sell_all_gems(portfolio):
         sym      = pos['symbol']
         chain    = pos['chain']
         contract = pos.get('coin_id', '') or pos.get('contract', '')
-        price    = resolve_price(sym, coin_id=contract, chain=chain)
+        price    = resolve_price(sym, coin_id=contract, chain=chain,
+                                  dex_url=pos.get('dex_url', ''))
         if price <= 0:
             price = pos.get('_last_price', pos.get('buy_price', 0))
         pnl_pct  = ((price - pos['buy_price']) / pos['buy_price'] * 100
@@ -2167,7 +2240,8 @@ def _display_from_memory(portfolio):
             continue
         sym, chain = pos['symbol'], pos['chain']
         buy_p = pos.get('buy_price', 0)
-        now_p = resolve_price(sym, chain=chain) or buy_p
+        now_p = resolve_price(sym, coin_id=pos.get('coin_id', ''),
+                              chain=chain, dex_url=pos.get('dex_url', '')) or buy_p
         val_now = pos['amount'] * now_p
         val_in  = pos.get('usd_spent', 0)
         pnl = val_now - val_in

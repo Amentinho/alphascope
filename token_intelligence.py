@@ -202,8 +202,28 @@ def _get_trending_symbols() -> set:
 
 
 # ── Source 4: News sentiment via CryptoPanic ──────────────────────────────────
-def _score_news(symbol: str, cg_id: str) -> float:
+def _score_news(symbol: str, cg_id: str, conn=None) -> float:
     """Score news sentiment from CryptoPanic (free, no key needed for basic)."""
+    if conn is not None:
+        try:
+            rows = conn.execute("""
+                SELECT sentiment_score, engagement
+                FROM signals
+                WHERE signal_type IN ('NEWS','WHALE','PARTNERSHIP','LISTING')
+                AND (UPPER(coin)=? OR UPPER(coin) LIKE ? OR UPPER(title) LIKE ?)
+                AND fetched_at >= datetime('now', '-12 hours')
+                ORDER BY engagement DESC LIMIT 20
+            """, (symbol, f'%{symbol}%', f'%{symbol}%')).fetchall()
+            if rows:
+                weighted = 0.0
+                total_w = 0.0
+                for sent, engagement in rows:
+                    w = max(float(engagement or 0), 1.0)
+                    weighted += float(sent or 0) * w
+                    total_w += w
+                return max(-1.0, min(1.0, weighted / max(total_w, 1)))
+        except Exception:
+            pass
     try:
         r = requests.get(
             'https://cryptopanic.com/api/free/v1/posts/',
@@ -263,6 +283,33 @@ def _score_twitter(conn, symbol: str) -> float:
             return max(-1.0, min(1.0, float(row[0] or 0)))
     except Exception:
         pass
+    try:
+        row = conn.execute("""
+            SELECT sentiment_score, tweet_count, total_engagement
+            FROM x_sentiment
+            WHERE cashtag=?
+            AND fetched_at >= datetime('now', '-3 hours')
+            ORDER BY fetched_at DESC LIMIT 1
+        """, (f'${symbol}',)).fetchone()
+        if row:
+            sent = float(row[0] or 0)
+            tweets = int(row[1] or 0)
+            if tweets >= 3:
+                return max(-1.0, min(1.0, sent))
+    except Exception:
+        pass
+    try:
+        row = conn.execute("""
+            SELECT sentiment_score, tweet_count
+            FROM token_social_cache
+            WHERE symbol=?
+            AND cached_at >= datetime('now', '-3 hours')
+            ORDER BY cached_at DESC LIMIT 1
+        """, (symbol,)).fetchone()
+        if row and int(row[1] or 0) >= 3:
+            return max(-1.0, min(1.0, float(row[0] or 0)))
+    except Exception:
+        pass
     return 0.0
 
 
@@ -294,7 +341,7 @@ def run_token_intelligence():
             trend_score = 0.5 if symbol in trending_syms else 0.0
 
             # News
-            news_score = _score_news(symbol, meta['cg_id'])
+            news_score = _score_news(symbol, meta['cg_id'], conn=conn)
             time.sleep(0.3)
 
             # Reddit + Twitter from DB
