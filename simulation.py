@@ -139,9 +139,9 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True, dex_url=''):
             _price_cache[cache_key] = (price, time.time())
             return price
 
-    # 1. DB first — only for known majors (Binance symbols)
-    # Micro-cap tokens use contract address via DexScreener to avoid stale prices
-    if sym in BINANCE_SYMBOLS:
+    # 1. DB cache only when caller allows cached prices. Fresh calls
+    # (use_cache=False) must hit live APIs so T=0 never equals stale cost basis.
+    if use_cache and sym in BINANCE_SYMBOLS:
         price = _db_price(sym)
         if price > 0:
             _price_cache[cache_key] = (price, time.time())
@@ -515,39 +515,19 @@ class SimPortfolio:
                 }
 
     def _snapshot_prices(self):
-        """Capture prices at sim launch from DB (fetcher just ran) then API fallback."""
+        """Capture live prices at sim launch. DB is too stale for T=0."""
         snapshot = {}
-        import sqlite3 as _sq
-        try:
-            conn = _sq.connect(MAIN_DB, timeout=10)
-            for chain, positions in REAL_PORTFOLIO.items():
-                for pos in positions:
-                    sym = pos['symbol']
-                    cg_id = pos['coin_id']
-                    # Try DB first — fetcher wrote these seconds ago
-                    row = conn.execute(
-                        """SELECT price_usd FROM token_data
-                           WHERE (UPPER(symbol)=UPPER(?) OR coin_id=?)
-                           AND price_usd > 0
-                           ORDER BY fetched_at DESC LIMIT 1""",
-                        (sym, cg_id)).fetchone()
-                    p = float(row[0]) if row and row[0] else 0
-                    # API fallback
-                    if not p:
-                        p = resolve_price(sym, cg_id, chain, use_cache=False)
-                    if p and p > 0:
-                        snapshot[sym] = p
-                        print(f"    T=0 {sym} = ${p:,.4f} ({'db' if row else 'api'})")
-            conn.close()
-        except Exception as e:
-            print(f"    T=0 snapshot error: {e}")
-            # Full API fallback
-            for chain, positions in REAL_PORTFOLIO.items():
-                for pos in positions:
-                    p = resolve_price(pos['symbol'], pos['coin_id'], chain, use_cache=False)
-                    if p and p > 0:
-                        snapshot[pos['symbol']] = p
-                        print(f"    T=0 {pos['symbol']} = ${p:,.4f} (api)")
+        for chain, positions in REAL_PORTFOLIO.items():
+            for pos in positions:
+                sym = pos['symbol']
+                p = resolve_price(sym, pos['coin_id'], chain, use_cache=False)
+                source = 'live'
+                if not p:
+                    p = _db_price(sym)
+                    source = 'db-fallback'
+                if p and p > 0:
+                    snapshot[sym] = p
+                    print(f"    T=0 {sym} = ${p:,.4f} ({source})")
         return snapshot
 
     def _real_cost_basis(self):
