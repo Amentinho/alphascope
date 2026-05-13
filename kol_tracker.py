@@ -45,6 +45,19 @@ import requests
 
 import os
 
+def _env(key, default=''):
+    val = os.environ.get(key, '')
+    if val:
+        return val
+    try:
+        with open('.env') as f:
+            for line in f:
+                if line.strip().startswith(f'{key}='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
+
 # ── KOL Wallet Configuration ─────────────────────────────────────────────────
 # Wallets are loaded DYNAMICALLY — refreshed every 24h from:
 #   1. kolscan.io leaderboard (free, no key needed)
@@ -66,7 +79,7 @@ MAX_AUTO_WALLETS  = 30                    # cap on auto-discovered wallets
 REFRESH_HOURS     = 24                    # refresh interval
 
 # Paper mode — set KOL_PAPER_MODE=false in .env to go live
-PAPER_MODE = os.environ.get('KOL_PAPER_MODE', 'true').lower().strip() != 'false'
+PAPER_MODE = _env('KOL_PAPER_MODE', 'true').lower().strip() != 'false'
 
 # ── Seed wallets (used first time, before dynamic refresh runs) ───────────────
 # These are the top 20 from kolscan.io leaderboard as of May 2026.
@@ -323,9 +336,12 @@ def _refresh_kol_wallets():
 
 
 MAX_BUY_SOL    = 0.01    # we always cap at 0.01 SOL (~$1) regardless of KOL size
+MIN_BUY_SOL    = float(_env('KOL_MIN_BUY_SOL', '0.05'))
 COPY_DELAY_SEC = 0       # seconds to wait after detecting KOL buy (0 = immediate)
 MAX_COPIES_PER_HOUR = 5  # rate limit — don't copy more than 5 trades/hour
 SCORE_THRESHOLD = 40     # minimum token score to copy (less strict than pumpfun_stream)
+KOL_PUMPFUN_SLIPPAGE = int(_env('KOL_PUMPFUN_SLIPPAGE', '10'))
+KOL_PRIORITY_FEE_SOL = float(_env('KOL_PRIORITY_FEE_SOL', '0.0001'))
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _tracker_active = False
@@ -488,17 +504,15 @@ def _copy_buy(kol_wallet: str, kol_name: str, trade_data: dict):
     # Execute buy via PumpPortal /api/trade-local — exact pattern from docs
     try:
         from solders.transaction import VersionedTransaction  # type: ignore
-        from solders.keypair import Keypair                  # type: ignore
         from solders.commitment_config import CommitmentLevel  # type: ignore
         from solders.rpc.requests import SendVersionedTransaction  # type: ignore
         from solders.rpc.config import RpcSendTransactionConfig  # type: ignore
-        from executor import SOL_PRIVATE_KEY, SOL_RPC_FALLBACKS
+        from executor import SOL_RPC_FALLBACKS, _sol_keypair
 
-        if not SOL_PRIVATE_KEY:
+        kp = _sol_keypair()
+        if not kp:
             print("  [kol] No SOL_PRIVATE_KEY — cannot copy trade")
             return
-
-        kp = Keypair.from_base58_string(SOL_PRIVATE_KEY)
 
         r = requests.post(
             url='https://pumpportal.fun/api/trade-local',
@@ -508,8 +522,8 @@ def _copy_buy(kol_wallet: str, kol_name: str, trade_data: dict):
                 'mint':             mint,
                 'amount':           MAX_BUY_SOL,
                 'denominatedInSol': 'true',
-                'slippage':         30,
-                'priorityFee':      0.0005,
+                'slippage':         KOL_PUMPFUN_SLIPPAGE,
+                'priorityFee':      KOL_PRIORITY_FEE_SOL,
                 'pool':             'pump',
             },
             timeout=15,

@@ -550,6 +550,21 @@ class SimPortfolio:
         if not self.can_buy(chain, usd):
             return False, f"insufficient cash (${self.cash.get(chain,0):.2f})"
         tokens = usd / price
+        try:
+            from executor import on_buy, _is_dry_run
+            is_dry = _is_dry_run()
+            if not is_dry:
+                real_bal = self.wallet_balances.get(chain, {})
+                cash_left = real_bal.get('usd', sum(self.cash.values()))
+                result = on_buy(symbol, chain, usd, price, source, contract,
+                                cash_left=cash_left)
+                if result and not result.get('success') and result.get('mode') != 'paper':
+                    _write_persistent_ban(symbol, chain, result.get('error', 'tx failed'))
+                    return False, f"real buy failed: {result.get('error', 'unknown')}"
+        except Exception as e:
+            if not _executor_dry_run():
+                return False, f"executor buy error: {e}"
+            is_dry = True
         self.cash[chain] -= usd
         key = f"{symbol}_{chain}"
         self.holdings[key] = {
@@ -565,29 +580,17 @@ class SimPortfolio:
             'time': datetime.now().isoformat(), 'source': source,
         })
         try:
-            from executor import on_buy, DRY_RUN
-            real_bal = self.wallet_balances.get(chain, {})
-            cash_left = real_bal.get('usd', sum(self.cash.values())) if not DRY_RUN else sum(self.cash.values())
-            result = on_buy(symbol, chain, usd, price, source, contract, cash_left=cash_left)
+            if is_dry:
+                from executor import on_buy
+                on_buy(symbol, chain, usd, price, source, contract,
+                       cash_left=sum(self.cash.values()))
             # Refresh wallet balance after real tx
-            if not DRY_RUN and result and result.get('success'):
+            if not is_dry:
                 diff = self._refresh_wallet_balance(chain)
                 if diff != 0:
                     print(f"    Wallet {chain}: {diff:+.4f} change")
-            # If real tx failed, reverse the sim trade
-            if not DRY_RUN and result and not result.get('success') and result.get('mode') != 'paper':
-                # Undo the buy — refund cash, remove holding
-                self.cash[chain] = self.cash.get(chain, 0) + usd
-                key = f"{symbol}_{chain}"
-                if key in self.holdings:
-                    del self.holdings[key]
-                if self.trades and self.trades[-1].get('symbol') == symbol:
-                    self.trades.pop()
-                print(f"    ↩️  Reversed sim buy {symbol} — real tx failed")
-                # Persist ban so this token is never retried
-                _write_persistent_ban(symbol, chain, result.get('error', 'tx failed'))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"    executor buy alert/balance error: {e}")
         return True, f"bought {tokens:.4f} {symbol} @ ${price:.8f}"
 
     def sell(self, symbol, chain, price, reason='signal'):
@@ -604,6 +607,25 @@ class SimPortfolio:
         buy_val = tokens * pos['buy_price']
         pnl = sell_val - buy_val
         pnl_pct = (pnl / buy_val * 100) if buy_val > 0 else 0
+
+        try:
+            from executor import on_sell, _is_dry_run
+            is_dry = _is_dry_run()
+            trading_total = self._trading_value()
+            trading_pct = (trading_total - self.starting_trading) / max(self.starting_trading, 1) * 100
+            result = on_sell(symbol, chain, price, pnl_pct, reason,
+                    token_amount=pos.get('amount', 0),
+                    contract=pos.get('coin_id', ''),
+                    pnl_usd=pnl,
+                    trading_total=trading_total,
+                    trading_pct=trading_pct)
+            if not is_dry and result and not result.get('success') and result.get('mode') != 'paper':
+                return False, f"real sell failed: {result.get('error', 'unknown')}"
+        except Exception as e:
+            if not _executor_dry_run():
+                return False, f"executor sell error: {e}"
+            is_dry = True
+
         self.cash[chain] = self.cash.get(chain, 0) + sell_val
         del self.holdings[key]
         self.trades.append({
@@ -614,22 +636,13 @@ class SimPortfolio:
             'time': datetime.now().isoformat(),
         })
         try:
-            from executor import on_sell, DRY_RUN
-            trading_total = self._trading_value()
-            trading_pct = (trading_total - self.starting_trading) / max(self.starting_trading, 1) * 100
-            result = on_sell(symbol, chain, price, pnl_pct, reason,
-                    token_amount=pos.get('amount', 0),
-                    contract=pos.get('coin_id', ''),
-                    pnl_usd=pnl,
-                    trading_total=trading_total,
-                    trading_pct=trading_pct)
             # Refresh wallet balance after real sell
-            if not DRY_RUN and result and result.get('success'):
+            if not is_dry:
                 diff = self._refresh_wallet_balance(chain)
                 if diff != 0:
                     print(f"    Wallet {chain} after sell: {diff:+.4f} change")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"    executor sell balance error: {e}")
         return True, f"sold {symbol} @ ${price:.8f} | P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
 
     def check_exits(self, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
@@ -1198,11 +1211,14 @@ def _load_established_proposals(portfolio):
         print("    📊 Established: no BUY signals from intelligence")
     return proposals
 
-# Dry run flag — checked in agent cycle and proposal loading
-try:
-    from executor import DRY_RUN as DRY_RUN_FLAG
-except Exception:
-    DRY_RUN_FLAG = True
+# Dry-run state is read fresh so changing .env takes effect after restart/import
+# without relying on executor.DRY_RUN's import-time compatibility value.
+def _executor_dry_run():
+    try:
+        from executor import _is_dry_run
+        return _is_dry_run()
+    except Exception:
+        return True
 
 
 DAILY_LOSS_LIMIT_USD = 200.0   # Stop new buys if trading P&L drops below -$200
@@ -1350,7 +1366,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         # SOL: PumpFun tokens — executor now handles bonding curve directly
         # Ungraduated tokens go through _pumpfun_buy, graduated through Jupiter
         # No pre-filtering needed here — executor decides the route
-        if chain == 'solana' and not DRY_RUN_FLAG:
+        if chain == 'solana' and not _executor_dry_run():
             coin_id = p.get('coin_id', '')
             if coin_id and len(coin_id) > 30:
                 try:
@@ -1534,8 +1550,7 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
 
     # Gap 3: Dynamic cash sizing from live wallet balance (live mode only)
     try:
-        from executor import DRY_RUN as _DR_CHECK
-        if not _DR_CHECK and portfolio.wallet_balances:
+        if not _executor_dry_run() and portfolio.wallet_balances:
             for chain, bal in portfolio.wallet_balances.items():
                 if chain in CHAINS and bal.get('usd', 0) > 5:
                     # Use 15% of wallet per chain for trading, capped at STARTING_BALANCE_USD
@@ -1614,8 +1629,7 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     print(f"  AlphaScope Trade Simulation v2.3")
     print(f"  Sim ID: {sim_id}")
     try:
-        from executor import DRY_RUN as _DR
-        if not _DR:
+        if not _executor_dry_run():
             print(f"  🟢 LIVE chains: SOL + BASE + ETH")
             print(f"  📄 Paper chains: BSC + ARB (no wallet configured)")
         else:

@@ -51,6 +51,11 @@ DRY_RUN = _is_dry_run()
 MAX_SOL_PER_TRADE = float(_env('EXECUTOR_MAX_SOL_PER_TRADE','0.02'))
 MAX_ETH_PER_TRADE = float(_env('EXECUTOR_MAX_ETH_PER_TRADE','0.001'))
 SLIPPAGE_BPS      = int(_env('EXECUTOR_SLIPPAGE_BPS','300'))
+EVM_SLIPPAGE_BPS  = int(_env('EXECUTOR_EVM_SLIPPAGE_BPS', str(SLIPPAGE_BPS)))
+MAX_GAS_COST_PCT  = float(_env('EXECUTOR_MAX_GAS_COST_PCT', '15'))
+MAX_GAS_COST_USD  = float(_env('EXECUTOR_MAX_GAS_COST_USD', '1.00'))
+PUMPFUN_SLIPPAGE  = int(_env('EXECUTOR_PUMPFUN_SLIPPAGE', '15'))
+PUMPFUN_PRIORITY_FEE_SOL = float(_env('EXECUTOR_PUMPFUN_PRIORITY_FEE_SOL', '0.0001'))
 TELEGRAM_TOKEN    = _env('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT     = _env('TELEGRAM_CHAT_ID')
 SOL_PRIVATE_KEY   = _env('SOL_PRIVATE_KEY')
@@ -59,20 +64,20 @@ EVM_WALLET        = _env('EVM_WALLET_ADDRESS')
 
 # Chain config
 CHAIN_IDS = {'ethereum':1, 'base':8453, 'arbitrum':42161, 'bsc':56}
-# Primary RPCs — reliable, high rate limits
+# Primary RPCs. Use private paid endpoints via env vars; never hardcode keys.
 RPCS = {
-    'ethereum': 'https://eth-mainnet.g.alchemy.com/v2/kBaJQJ7o1Ptb9Pqhb0kW3',   # Alchemy
-    'base':     'https://base-mainnet.g.alchemy.com/v2/kBaJQJ7o1Ptb9Pqhb0kW3',  # Alchemy
-    'arbitrum': 'https://arb1.arbitrum.io/rpc',
+    'ethereum': _env('ETH_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
+    'base':     _env('BASE_RPC_URL', 'https://mainnet.base.org'),
+    'arbitrum': _env('ARBITRUM_RPC_URL', 'https://arb1.arbitrum.io/rpc'),
 }
 RPCS_FALLBACK = {
     'ethereum': [
-        'https://eth-mainnet.g.alchemy.com/v2/kBaJQJ7o1Ptb9Pqhb0kW3',
-        'https://rpc.ankr.com/eth',
         'https://cloudflare-eth.com',
         'https://rpc.flashbots.net',
+        'https://rpc.ankr.com/eth',
     ],
     'base': [
+        'https://base-rpc.publicnode.com',
         'https://1rpc.io/base',
         'https://base.llamarpc.com',
         'https://base-mainnet.public.blastapi.io',
@@ -81,7 +86,11 @@ RPCS_FALLBACK = {
 
 # Uniswap v3 — same address on ETH and BASE
 UNISWAP_ROUTER = '0xE592427A0AEce92De3Edee1F18E0157C05861564'  # SwapRouter02
-UNISWAP_QUOTER = '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6'  # Quoter v1
+UNISWAP_QUOTER = '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6'  # ETH Quoter v1
+UNISWAP_QUOTERS = {
+    'ethereum': '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6',
+    'base':     '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
+}
 
 # WETH address per chain
 WETH = {
@@ -160,6 +169,20 @@ AERODROME_ABI = [
         "outputs": [{"name": "amounts", "type": "uint256[]"}],
         "stateMutability": "nonpayable", "type": "function"
     },
+    {
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"components": [
+                {"name": "from", "type": "address"},
+                {"name": "to", "type": "address"},
+                {"name": "stable", "type": "bool"},
+                {"name": "factory", "type": "address"},
+            ], "name": "routes", "type": "tuple[]"},
+        ],
+        "name": "getAmountsOut",
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "view", "type": "function"
+    },
 ]
 # Aerodrome factory address on Base
 AERODROME_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da'
@@ -220,6 +243,16 @@ UNISWAP_V2_ABI = [
         "stateMutability": "nonpayable",
         "type": "function"
     },
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "address[]", "name": "path", "type": "address[]"},
+        ],
+        "name": "getAmountsOut",
+        "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
 ]
 
 # Jupiter / Jito
@@ -236,7 +269,7 @@ JITO_ENDPOINT = JITO_ENDPOINTS[0]  # kept for compatibility
 SOL_RPC_DIRECT = _env('SOL_RPC_URL', 'https://api.mainnet-beta.solana.com')
 SOL_RPC_FALLBACKS = [r for r in [
     _env('SOL_RPC_URL', ''),
-    'https://solana-mainnet.g.alchemy.com/v2/demo',
+    'https://solana-rpc.publicnode.com',
     'https://rpc.ankr.com/solana',
     'https://api.mainnet-beta.solana.com',
 ] if r]
@@ -309,8 +342,9 @@ def alert_error(msg):
     print(f"    ⚠️  {msg}")
 
 def alert_start(sim_id, hours, capital):
-    mode = '🔵 DRY RUN' if DRY_RUN else '🚀 LIVE'
-    if not DRY_RUN:
+    dry = _is_dry_run()
+    mode = '🔵 DRY RUN' if dry else '🚀 LIVE'
+    if not dry:
         # Show real wallet balances
         sol_line = ''
         eth_line = ''
@@ -363,7 +397,7 @@ def alert_start(sim_id, hours, capital):
 
 def alert_complete(sim_id, pnl_pct, wins, losses, best):
     emoji = '🟢' if pnl_pct >= 0 else '🔴'
-    _tg(f"{emoji} <b>Complete {'[DRY]' if DRY_RUN else '[LIVE]'}</b>\n"
+    _tg(f"{emoji} <b>Complete {'[DRY]' if _is_dry_run() else '[LIVE]'}</b>\n"
         f"📋 {sim_id}\n💰 {pnl_pct:+.1f}% | {wins}W/{losses}L\n🏆 {best}")
 
 
@@ -412,7 +446,10 @@ def _sol_keypair():
     try:
         from solders.keypair import Keypair
         import base58
-        return Keypair.from_bytes(base58.b58decode(SOL_PRIVATE_KEY))
+        try:
+            return Keypair.from_base58_string(SOL_PRIVATE_KEY)
+        except Exception:
+            return Keypair.from_bytes(base58.b58decode(SOL_PRIVATE_KEY))
     except ImportError:
         print("  executor: pip install solana solders base58")
         return None
@@ -428,7 +465,8 @@ def _is_pumpfun_graduated(mint_address) -> bool:
     """
     Check if a PumpFun token has graduated to Raydium.
     Ungraduated tokens can't be bought via Jupiter — they need PumpFun's own UI.
-    Returns True if safe to trade via Jupiter, False if still on bonding curve.
+    Returns True if safe to trade via Jupiter, False if still on bonding curve,
+    or None if the check is inconclusive.
     """
     try:
         # Check DexScreener — graduated tokens show Raydium as DEX
@@ -455,7 +493,7 @@ def _is_pumpfun_graduated(mint_address) -> bool:
             return True  # In Jupiter's list = tradeable
     except Exception:
         pass
-    return True  # Default to allowing — let Jupiter handle it
+    return None  # Unknown is not safe enough for live routing decisions.
 
 
 def _resolve_sol_mint(symbol) -> str:
@@ -555,8 +593,8 @@ def _pumpfun_buy(kp, contract, sol_amount) -> dict:
             'mint':              contract,
             'amount':            sol_amount,       # SOL amount to spend
             'denominatedInSol':  'true',
-            'slippage':          50,
-            'priorityFee':       0.001,
+        'slippage':          PUMPFUN_SLIPPAGE,
+        'priorityFee':       PUMPFUN_PRIORITY_FEE_SOL,
             'pool':              'pump',
         }, timeout=15)
 
@@ -620,8 +658,8 @@ def _pumpfun_sell(kp, contract, raw_amount) -> dict:
             'mint': contract,
             'amount': str(raw_amount),  # exact token amount to sell
             'denominatedInSol': 'false',  # we're selling tokens not SOL
-            'slippage': 50,  # 50% slippage tolerance for illiquid tokens
-            'priorityFee': 0.001,
+            'slippage': PUMPFUN_SLIPPAGE,
+            'priorityFee': PUMPFUN_PRIORITY_FEE_SOL,
             'pool': 'pump',
         }, timeout=15)
 
@@ -668,7 +706,7 @@ def _jito_submit(signed_b64):
         except Exception:
             continue
 
-    return _sol_rpc_send(signed_b64, skip_preflight=True)
+    return _sol_rpc_send(signed_b64, skip_preflight=False)
 
 def _can_sell_sol_token(contract: str) -> tuple:
     """Pre-check: can Jupiter route a sell? Prevents buying honeypots."""
@@ -680,18 +718,21 @@ def _can_sell_sol_token(contract: str) -> tuple:
         if r.status_code == 200 and r.json().get('outAmount'):
             return True, 'route_ok'
         return False, f'no_sell_route: {r.text[:60]}'
-    except Exception:
-        return True, 'check_failed_allowing'
+    except Exception as e:
+        return False, f'check_failed_blocking: {str(e)[:60]}'
 
 
 def execute_sol_buy(symbol, contract, usd) -> dict:
-    if DRY_RUN: return {'success': False, 'mode': 'dry'}
+    if _is_dry_run(): return {'success': False, 'mode': 'dry'}
     kp = _sol_keypair()
     if not kp: return {'success': False, 'error': 'No SOL keypair'}
     if contract and len(contract) > 30:
         # Check graduation status
         graduated = _is_pumpfun_graduated(contract)
-        if not graduated:
+        if graduated is None:
+            return {'success': False,
+                    'error': f'Graduation status unknown for {symbol}; refusing live buy'}
+        if graduated is False:
             # Token still on bonding curve — try PumpFun direct buy
             print(f"    PumpFun direct buy: {symbol} (bonding curve)")
             sol_price = _sol_price() or 150
@@ -741,7 +782,11 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
         return {'success': False, 'error': f'Jupiter quote failed — no route for {symbol}'}
     # Check if PumpFun token has graduated to Raydium
     # Ungraduated tokens fail with 0x1771 on Jupiter — skip buy entirely
-    if not _is_pumpfun_graduated(contract):
+    graduated = _is_pumpfun_graduated(contract)
+    if graduated is None:
+        return {'success': False,
+                'error': f'Graduation status unknown for {symbol}; refusing live buy'}
+    if graduated is False:
         return {'success': False,
                 'error': f'{symbol} still on PumpFun bonding curve — wait for Raydium graduation'}
 
@@ -858,7 +903,7 @@ def _get_spl_decimals(mint_address) -> int:
 
 
 def execute_sol_sell(symbol, contract, token_amount) -> dict:
-    if DRY_RUN: return {'success': False, 'mode': 'dry'}
+    if _is_dry_run(): return {'success': False, 'mode': 'dry'}
     kp = _sol_keypair()
     if not kp: return {'success': False, 'error': 'No SOL keypair'}
     if not contract or len(contract) < 30:
@@ -1116,7 +1161,7 @@ def _get_decimals(w3, token_address) -> int:
         return 18
 
 def _approve_token(w3, chain, token_address, amount_wei, acct, addr,
-                   router_override=None):
+                   router_override=None, trade_usd=0):
     """Approve router to spend token. Uses router_override or chain primary router."""
     try:
         primary_router = router_override or DEX_ROUTERS.get(chain, [{}])[0].get('router', UNISWAP_ROUTER)
@@ -1131,14 +1176,19 @@ def _approve_token(w3, chain, token_address, amount_wei, acct, addr,
         except Exception:
             pass
         MAX_UINT256 = 2**256 - 1
+        max_fee, priority_fee = _gas_params(w3)
+        ok, gas_err = _guard_evm_gas(trade_usd, 60000, max_fee, 'approve')
+        if not ok:
+            print(f"    approve skipped: {gas_err}")
+            return False
         tx = token.functions.approve(
             w3.to_checksum_address(primary_router), MAX_UINT256
         ).build_transaction({
             'from': addr,
             'nonce': w3.eth.get_transaction_count(addr, 'pending'),
             'gas': 60000,
-            'maxFeePerGas': w3.to_wei(10, 'gwei'),
-            'maxPriorityFeePerGas': w3.to_wei(2, 'gwei'),
+            'maxFeePerGas': max_fee,
+            'maxPriorityFeePerGas': priority_fee,
             'chainId': CHAIN_IDS[chain],
             'type': 2,
         })
@@ -1158,7 +1208,79 @@ def _gas_params(w3):
     return base_fee * 2 + priority_fee, priority_fee
 
 
-def _try_aerodrome_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -> dict:
+def _min_out(amount_out: int) -> int:
+    """Apply configured EVM slippage to a quoted output amount."""
+    if amount_out <= 0:
+        return 0
+    return int(amount_out * max(0, 10_000 - EVM_SLIPPAGE_BPS) / 10_000)
+
+
+def _quote_v2_min_out(router, amount_in: int, path: list) -> int:
+    try:
+        amounts = router.functions.getAmountsOut(amount_in, path).call()
+        return _min_out(int(amounts[-1])) if amounts else 0
+    except Exception:
+        return 0
+
+
+def _quote_aero_min_out(router, amount_in: int, routes: list) -> int:
+    try:
+        amounts = router.functions.getAmountsOut(amount_in, routes).call()
+        return _min_out(int(amounts[-1])) if amounts else 0
+    except Exception:
+        return 0
+
+
+QUOTER_ABI = [{
+    "inputs": [
+        {"name": "tokenIn", "type": "address"},
+        {"name": "tokenOut", "type": "address"},
+        {"name": "fee", "type": "uint24"},
+        {"name": "amountIn", "type": "uint256"},
+        {"name": "sqrtPriceLimitX96", "type": "uint160"},
+    ],
+    "name": "quoteExactInputSingle",
+    "outputs": [{"name": "amountOut", "type": "uint256"}],
+    "stateMutability": "nonpayable",
+    "type": "function",
+}]
+
+
+def _quote_v3_min_out(w3, chain: str, token_in: str, token_out: str,
+                      fee: int, amount_in: int) -> int:
+    try:
+        quoter_addr = UNISWAP_QUOTERS.get(chain, UNISWAP_QUOTER)
+        quoter = w3.eth.contract(address=w3.to_checksum_address(quoter_addr),
+                                 abi=QUOTER_ABI)
+        out = quoter.functions.quoteExactInputSingle(
+            token_in, token_out, fee, amount_in, 0).call()
+        return _min_out(int(out))
+    except Exception:
+        return 0
+
+
+def _gas_cost_usd(gas_units: int, max_fee_per_gas: int) -> float:
+    return (gas_units * max_fee_per_gas / 1e18) * _eth_price()
+
+
+def _guard_evm_gas(trade_usd: float, gas_units: int, max_fee_per_gas: int,
+                   label: str) -> tuple:
+    """
+    Refuse transactions where worst-case gas is too large for the trade.
+    This prevents tiny $1-$2 trades from paying irrational mainnet fees.
+    """
+    trade_usd = float(trade_usd or 0)
+    gas_usd = _gas_cost_usd(gas_units, max_fee_per_gas)
+    pct_limit_usd = (trade_usd * MAX_GAS_COST_PCT / 100) if trade_usd > 0 else 0
+    limit_usd = min(MAX_GAS_COST_USD, pct_limit_usd) if pct_limit_usd else MAX_GAS_COST_USD
+    if gas_usd > limit_usd:
+        return False, (f'{label}: gas ${gas_usd:.2f} exceeds limit '
+                       f'${limit_usd:.2f} ({MAX_GAS_COST_PCT:.0f}%/${MAX_GAS_COST_USD:.2f})')
+    return True, ''
+
+
+def _try_aerodrome_buy(w3, chain, acct, addr, router_addr, token_out,
+                       eth_amount_wei, trade_usd=0) -> dict:
     """Buy via Aerodrome router on Base — uses routes struct instead of path array."""
     weth = w3.to_checksum_address(WETH[chain])
     token = w3.to_checksum_address(token_out)
@@ -1169,8 +1291,14 @@ def _try_aerodrome_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount
     for stable in [False, True]:
         try:
             routes = [{'from': weth, 'to': token, 'stable': stable, 'factory': AERODROME_FACTORY}]
+            amount_out_min = _quote_aero_min_out(router, eth_amount_wei, routes)
+            if amount_out_min <= 0:
+                continue
+            ok, gas_err = _guard_evm_gas(trade_usd, 300000, max_fee, 'Aerodrome buy')
+            if not ok:
+                return {'success': False, 'error': gas_err}
             tx = router.functions.swapExactETHForTokens(
-                0, routes, addr, deadline
+                amount_out_min, routes, addr, deadline
             ).build_transaction({
                 'from': addr, 'value': eth_amount_wei, 'gas': 300000,
                 'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
@@ -1192,7 +1320,8 @@ def _try_aerodrome_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount
     return {'success': False, 'error': 'Aerodrome: both stable/volatile pools failed'}
 
 
-def _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> dict:
+def _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei,
+                 trade_usd=0) -> dict:
     """Sell via Uniswap v2-style router.
     Order: approve → dry-run → send.
     Approve must come BEFORE dry-run: eth_call simulates transferFrom which
@@ -1203,18 +1332,25 @@ def _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> di
     router = w3.eth.contract(address=w3.to_checksum_address(router_addr),
                              abi=UNISWAP_V2_ABI)
     approved = _approve_token(w3, chain, token_in, amount_wei, acct, addr,
-                              router_override=router_addr)
+                              router_override=router_addr, trade_usd=trade_usd)
     if not approved:
         return {'success': False, 'error': 'approve failed'}
     max_fee, priority_fee = _gas_params(w3)
     deadline = int(time.time()) + 300
     try:
+        path = [token, weth]
+        amount_out_min = _quote_v2_min_out(router, amount_wei, path)
+        if amount_out_min <= 0:
+            return {'success': False, 'error': 'v2 sell quote failed'}
+        ok, gas_err = _guard_evm_gas(trade_usd, 200000, max_fee, 'v2 sell')
+        if not ok:
+            return {'success': False, 'error': gas_err}
         try:
             swap_fn = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
-                amount_wei, 0, [token, weth], addr, deadline)
+                amount_wei, amount_out_min, path, addr, deadline)
         except Exception:
             swap_fn = router.functions.swapExactTokensForETH(
-                amount_wei, 0, [token, weth], addr, deadline)
+                amount_wei, amount_out_min, path, addr, deadline)
         tx = swap_fn.build_transaction({
             'from': addr, 'value': 0, 'gas': 200000,
             'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
@@ -1236,14 +1372,15 @@ def _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> di
         return {'success': False, 'error': str(e)[:80]}
 
 
-def _try_aerodrome_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei) -> dict:
+def _try_aerodrome_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei,
+                        trade_usd=0) -> dict:
     """Sell via Aerodrome router on Base.
     Order: approve → dry-run → send (same reason as _try_v2_sell)."""
     weth = w3.to_checksum_address(WETH[chain])
     token = w3.to_checksum_address(token_in)
     router = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=AERODROME_ABI)
     approved = _approve_token(w3, chain, token_in, amount_wei, acct, addr,
-                              router_override=router_addr)
+                              router_override=router_addr, trade_usd=trade_usd)
     if not approved:
         return {'success': False, 'error': 'Aerodrome approve failed'}
     max_fee, priority_fee = _gas_params(w3)
@@ -1251,8 +1388,14 @@ def _try_aerodrome_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei
     for stable in [False, True]:
         try:
             routes = [{'from': token, 'to': weth, 'stable': stable, 'factory': AERODROME_FACTORY}]
+            amount_out_min = _quote_aero_min_out(router, amount_wei, routes)
+            if amount_out_min <= 0:
+                continue
+            ok, gas_err = _guard_evm_gas(trade_usd, 300000, max_fee, 'Aerodrome sell')
+            if not ok:
+                return {'success': False, 'error': gas_err}
             tx = router.functions.swapExactTokensForETH(
-                amount_wei, 0, routes, addr, deadline
+                amount_wei, amount_out_min, routes, addr, deadline
             ).build_transaction({
                 'from': addr, 'value': 0, 'gas': 300000,
                 'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
@@ -1274,7 +1417,8 @@ def _try_aerodrome_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei
     return {'success': False, 'error': 'Aerodrome sell failed (both pools)'}
 
 
-def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -> dict:
+def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei,
+                trade_usd=0) -> dict:
     """Buy via Uniswap v2 style router (also works for SushiSwap, PancakeSwap, BaseSwap)."""
     weth = w3.to_checksum_address(WETH[chain])
     token = w3.to_checksum_address(token_out)
@@ -1282,13 +1426,20 @@ def _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei) -
     max_fee, priority_fee = _gas_params(w3)
     deadline = int(time.time()) + 300
     try:
+        path = [weth, token]
+        amount_out_min = _quote_v2_min_out(router, eth_amount_wei, path)
+        if amount_out_min <= 0:
+            return {'success': False, 'error': 'v2 buy quote failed'}
+        ok, gas_err = _guard_evm_gas(trade_usd, 200000, max_fee, 'v2 buy')
+        if not ok:
+            return {'success': False, 'error': gas_err}
         # Try fee-on-transfer version first (works for tax tokens), then standard
         try:
             swap_fn = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-                0, [weth, token], addr, deadline)
+                amount_out_min, path, addr, deadline)
         except Exception:
             swap_fn = router.functions.swapExactETHForTokens(
-                0, [weth, token], addr, deadline)
+                amount_out_min, path, addr, deadline)
         tx = swap_fn.build_transaction({
             'from': addr, 'value': eth_amount_wei, 'gas': 200000,
             'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
@@ -1355,6 +1506,7 @@ def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei,
     max_fee, priority_fee = _gas_params(w3)
     deadline = int(time.time()) + 300
     errors = []
+    trade_usd = (eth_amount_wei / 1e18) * _eth_price()
 
     def _try_v3_buy(router_addr, name, mf=None, pf=None):
         mf = mf or max_fee
@@ -1362,10 +1514,17 @@ def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei,
         r = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=UNISWAP_ABI)
         for fee in POOL_FEES:
             try:
+                amount_out_min = _quote_v3_min_out(w3, chain, weth, token, fee, eth_amount_wei)
+                if amount_out_min <= 0:
+                    errors.append(f"{name} fee={fee}: quote failed")
+                    continue
+                ok, gas_err = _guard_evm_gas(trade_usd, 250000, mf, f'{name} buy')
+                if not ok:
+                    return {'success': False, 'error': gas_err}
                 tx = r.functions.exactInputSingle({
                     'tokenIn': weth, 'tokenOut': token, 'fee': fee,
                     'recipient': addr, 'deadline': deadline,
-                    'amountIn': eth_amount_wei, 'amountOutMinimum': 0, 'sqrtPriceLimitX96': 0,
+                    'amountIn': eth_amount_wei, 'amountOutMinimum': amount_out_min, 'sqrtPriceLimitX96': 0,
                 }).build_transaction({
                     'from': addr, 'value': eth_amount_wei, 'gas': 250000,
                     'maxFeePerGas': mf, 'maxPriorityFeePerGas': pf,
@@ -1395,11 +1554,13 @@ def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei,
         router_addr = target_router['router']
         dex_name = target_router['name']
         if dex_type == 'aero':
-            result = _try_aerodrome_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei)
+            result = _try_aerodrome_buy(w3, chain, acct, addr, router_addr, token_out,
+                                        eth_amount_wei, trade_usd=trade_usd)
         elif dex_type == 'v3':
             result = _try_v3_buy(router_addr, dex_name)
         else:
-            result = _try_v2_buy(w3, chain, acct, addr, router_addr, token_out, eth_amount_wei)
+            result = _try_v2_buy(w3, chain, acct, addr, router_addr, token_out,
+                                 eth_amount_wei, trade_usd=trade_usd)
         if result.get('success'):
             result.setdefault('dex', dex_name)
             return result
@@ -1416,11 +1577,13 @@ def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei,
         dex_name = dex['name']
         try:
             if dex_type == 'aero':
-                result = _try_aerodrome_buy(w3, chain, acct, addr, dex['router'], token_out, eth_amount_wei)
+                result = _try_aerodrome_buy(w3, chain, acct, addr, dex['router'], token_out,
+                                            eth_amount_wei, trade_usd=trade_usd)
             elif dex_type == 'v3':
                 result = _try_v3_buy(dex['router'], dex_name)
             else:
-                result = _try_v2_buy(w3, chain, acct, addr, dex['router'], token_out, eth_amount_wei)
+                result = _try_v2_buy(w3, chain, acct, addr, dex['router'], token_out,
+                                     eth_amount_wei, trade_usd=trade_usd)
             if result.get('success'):
                 result.setdefault('dex', dex_name)
                 return result
@@ -1431,7 +1594,7 @@ def _uniswap_buy(w3, chain, acct, addr, token_out, eth_amount_wei,
     return {'success': False, 'error': ' | '.join(errors[-4:])}
 
 def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei,
-                  target_router=None) -> dict:
+                  target_router=None, trade_usd=0) -> dict:
     """Sell token for ETH/native.
     If target_router is set (from DexScreener), approves and tries ONLY that router.
     Falls back to full scan when unknown or failed.
@@ -1447,7 +1610,7 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei,
     def _approve_once(router_addr):
         if router_addr not in approved_routers:
             ok = _approve_token(w3, chain, token_in, amount_wei, acct, addr,
-                                router_override=router_addr)
+                                router_override=router_addr, trade_usd=trade_usd)
             if ok:
                 approved_routers.add(router_addr)
             return ok
@@ -1459,10 +1622,17 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei,
         r = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=UNISWAP_ABI)
         for pool_fee in POOL_FEES:
             try:
+                amount_out_min = _quote_v3_min_out(w3, chain, token, weth, pool_fee, amount_wei)
+                if amount_out_min <= 0:
+                    errors.append(f"{name} fee={pool_fee}: quote failed")
+                    continue
+                ok, gas_err = _guard_evm_gas(trade_usd, 250000, max_fee, f'{name} sell')
+                if not ok:
+                    return {'success': False, 'error': gas_err}
                 tx = r.functions.exactInputSingle({
                     'tokenIn': token, 'tokenOut': weth, 'fee': pool_fee,
                     'recipient': addr, 'deadline': deadline,
-                    'amountIn': amount_wei, 'amountOutMinimum': 0, 'sqrtPriceLimitX96': 0,
+                    'amountIn': amount_wei, 'amountOutMinimum': amount_out_min, 'sqrtPriceLimitX96': 0,
                 }).build_transaction({
                     'from': addr, 'value': 0, 'gas': 250000,
                     'maxFeePerGas': max_fee, 'maxPriorityFeePerGas': priority_fee,
@@ -1494,9 +1664,11 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei,
         if dex_type == 'v3':
             result = _try_v3(router_addr, dex_name)
         elif dex_type == 'aero':
-            result = _try_aerodrome_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei)
+            result = _try_aerodrome_sell(w3, chain, acct, addr, router_addr, token_in,
+                                         amount_wei, trade_usd=trade_usd)
         else:
-            result = _try_v2_sell(w3, chain, acct, addr, router_addr, token_in, amount_wei)
+            result = _try_v2_sell(w3, chain, acct, addr, router_addr, token_in,
+                                  amount_wei, trade_usd=trade_usd)
         if result.get('success'):
             return result
         # Target failed — fall through silently to full scan
@@ -1513,7 +1685,8 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei,
     for dex in DEX_ROUTERS.get(chain, []):
         if dex.get('type') != 'aero':
             continue
-        result = _try_aerodrome_sell(w3, chain, acct, addr, dex['router'], token_in, amount_wei)
+        result = _try_aerodrome_sell(w3, chain, acct, addr, dex['router'], token_in,
+                                     amount_wei, trade_usd=trade_usd)
         if result.get('success'):
             return result
         errors.append(f"aerodrome: {result.get('error','')[:50]}")
@@ -1522,7 +1695,8 @@ def _uniswap_sell(w3, chain, acct, addr, token_in, amount_wei,
     for dex in DEX_ROUTERS.get(chain, []):
         if dex.get('type') != 'v2':
             continue
-        result = _try_v2_sell(w3, chain, acct, addr, dex['router'], token_in, amount_wei)
+        result = _try_v2_sell(w3, chain, acct, addr, dex['router'], token_in,
+                              amount_wei, trade_usd=trade_usd)
         if result.get('success'):
             result['dex'] = dex['name']
             return result
@@ -1584,7 +1758,7 @@ def _check_uniswap_pool(w3, chain, token_address) -> str:
 
 
 def execute_evm_buy(symbol, chain, contract, usd) -> dict:
-    if DRY_RUN: return {'success': False, 'mode': 'dry'}
+    if _is_dry_run(): return {'success': False, 'mode': 'dry'}
     if chain not in CHAIN_IDS or chain not in WETH:
         return {'success': False, 'error': f'Chain {chain} not supported for EVM buy'}
     acct, addr = _evm_account()
@@ -1649,8 +1823,9 @@ def execute_evm_buy(symbol, chain, contract, usd) -> dict:
             f'🔗 <a href="{explorer}{tx}">{tx[:16]}...</a>')
     return result
 
-def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18) -> dict:
-    if DRY_RUN: return {'success': False, 'mode': 'dry'}
+def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18,
+                     reference_price_usd=0) -> dict:
+    if _is_dry_run(): return {'success': False, 'mode': 'dry'}
     if chain not in CHAIN_IDS or chain not in WETH:
         return {'success': False, 'error': f'Chain {chain} not supported'}
     acct, addr = _evm_account()
@@ -1669,8 +1844,10 @@ def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18) -> dict
     target_router_s = _resolve_dex_router(chain, dex_info_s.get('dex', '')) if dex_info_s else None
     if target_router_s:
         print(f"    {symbol} sell → {target_router_s['name']} only")
+    estimated_trade_usd = max(0, float(token_amount or 0) * float(reference_price_usd or 0))
     result = _uniswap_sell(w3, chain, acct, addr, contract, amount_wei,
-                           target_router=target_router_s)
+                           target_router=target_router_s,
+                           trade_usd=estimated_trade_usd)
     if result['success']:
         # Try to get ETH received from receipt logs (approximate)
         eth_out = 0
@@ -1685,8 +1862,11 @@ def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18) -> dict
         tx = result['tx']
         explorer = {'ethereum': 'https://etherscan.io/tx/',
                     'base': 'https://basescan.org/tx/'}.get(chain, 'https://basescan.org/tx/')
+        dex_label = result.get('dex') or (
+            f"fee:{result.get('fee_tier', 0)/10000:.2f}%"
+            if result.get('fee_tier') else 'DEX')
         _tg(f"✅ <b>SELL {symbol}</b> ({chain})\n"
-            f"📋 fee:{result['fee_tier']/10000:.2f}%\n"
+            f"📋 {dex_label}\n"
             f'🔗 <a href="{explorer}{tx}">{tx[:16]}...</a>')
     return result
 
@@ -1702,7 +1882,7 @@ BASE_LIVE_ENABLED = True   # BASE live — Aerodrome first, ghost pool check add
 def on_buy(symbol, chain, usd, price, source='', contract='', cash_left=None):
     """Called by simulation on every BUY."""
     real_usd = min(usd, MAX_TRADE_USD)
-    if DRY_RUN:
+    if _is_dry_run():
         alert_buy(symbol, chain, real_usd, price, source, dry=True, cash_left=cash_left)
         return {'success': True, 'mode': 'paper', 'price': price}
     if chain == 'solana':
@@ -1742,7 +1922,7 @@ def on_sell(symbol, chain, price, pnl_pct, reason,
             token_amount=0, contract='', decimals=18,
             pnl_usd=None, trading_total=None, trading_pct=None):
     """Called by simulation on every SELL."""
-    if DRY_RUN:
+    if _is_dry_run():
         alert_sell(symbol, chain, price, pnl_pct, reason, dry=True,
                    pnl_usd=pnl_usd, trading_total=trading_total, trading_pct=trading_pct)
         return {'success': True, 'mode': 'paper'}
@@ -1750,7 +1930,8 @@ def on_sell(symbol, chain, price, pnl_pct, reason,
     if chain == 'solana':
         result = execute_sol_sell(symbol, contract, token_amount)
     elif chain in ('base', 'ethereum'):
-        result = execute_evm_sell(symbol, chain, contract, token_amount, decimals)
+        result = execute_evm_sell(symbol, chain, contract, token_amount, decimals,
+                                  reference_price_usd=price)
     else:
         return {'success': True, 'mode': 'paper'}
     if result.get('success'):
@@ -1769,7 +1950,7 @@ def on_sell(symbol, chain, price, pnl_pct, reason,
 def test_connection():
     print("\n" + "="*55)
     print(f"  AlphaScope Executor v2.1 — Uniswap v3 + Jupiter")
-    print(f"  Mode: {'🔵 DRY RUN (Phase 1)' if DRY_RUN else '🚀 LIVE (Phase 2)'}")
+    print(f"  Mode: {'🔵 DRY RUN (Phase 1)' if _is_dry_run() else '🚀 LIVE (Phase 2)'}")
     print(f"  EVM router: Uniswap v3 (no API key needed)")
     print(f"  SOL router: Jupiter + Jito MEV protection")
     print("="*55)

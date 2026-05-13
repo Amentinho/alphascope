@@ -20,8 +20,22 @@ import json
 import re
 import time
 from datetime import datetime, timezone
+import os
 
-TWITTER_API_KEY = "new1_1597ef833361479ba82c88ff32b2fb8c"
+def _env(key, default=''):
+    val = os.environ.get(key, '')
+    if val:
+        return val
+    try:
+        with open('.env') as f:
+            for line in f:
+                if line.strip().startswith(f'{key}='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
+
+TWITTER_API_KEY = _env('TWITTER_API_KEY', '')
 
 # Free API endpoints
 HONEYPOT_ETH   = "https://api.honeypot.is/v2/IsHoneypot"
@@ -392,6 +406,8 @@ def check_twitter_basic(symbol, project_name):
     Returns: followers, account_age_days, engagement_rate, account_exists
     """
     result = {'followers': 0, 'age_days': 0, 'engagement': 0.0, 'exists': False}
+    if not TWITTER_API_KEY:
+        return result
     try:
         query = f'${symbol} OR "{project_name}"'
         res = requests.get(

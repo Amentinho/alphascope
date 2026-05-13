@@ -25,20 +25,37 @@ import threading
 from datetime import datetime, timezone
 
 import os
+import requests
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PUMPPORTAL_WS   = "wss://pumpportal.fun/api/data"
 PUMPPORTAL_BUY  = "https://pumpportal.fun/api/trade-local"
 MAIN_DB         = "alphascope.db"
 
+def _env(key, default=''):
+    val = os.environ.get(key, '')
+    if val:
+        return val
+    try:
+        with open('.env') as f:
+            for line in f:
+                if line.strip().startswith(f'{key}='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
+
 # Paper mode — set PUMPFUN_PAPER_MODE=false in .env to go live
 # Defaults to TRUE (paper) so you never accidentally spend real money
-PAPER_MODE = os.environ.get('PUMPFUN_PAPER_MODE', 'true').lower().strip() != 'false'
+PAPER_MODE = _env('PUMPFUN_PAPER_MODE', 'true').lower().strip() != 'false'
 
-BUY_SOL_AMOUNT  = 0.01          # 0.01 SOL = ~$1 at $100/SOL — hard cap
+BUY_SOL_AMOUNT  = min(float(_env('PUMPFUN_BUY_SOL_AMOUNT', '0.005')),
+                      float(_env('PUMPFUN_MAX_BUY_SOL', '0.01')))
 MAX_BUY_USD     = 1.0           # display cap for logs
 SCORE_THRESHOLD = 55            # minimum score 0-100 to buy
 MIN_TWITTER_MENTIONS = 3        # must have ≥ 3 recent tweets
+PUMPFUN_SLIPPAGE = int(_env('PUMPFUN_SLIPPAGE', '10'))
+PUMPFUN_PRIORITY_FEE_SOL = float(_env('PUMPFUN_PRIORITY_FEE_SOL', '0.0001'))
 BAN_WORDS = {
     'rug', 'scam', 'fake', 'ponzi', 'elon', 'trump', 'maga', 'safe', 'moon',
     'porn', 'nude', 'penis', 'rape', 'nazi', 'isis', 'squid', 'shib2',
@@ -245,17 +262,14 @@ def buy_pumpfun_token(mint: str, symbol: str, sol_amount: float = BUY_SOL_AMOUNT
 
     try:
         from solders.transaction import VersionedTransaction  # type: ignore
-        from solders.keypair import Keypair                  # type: ignore
         from solders.commitment_config import CommitmentLevel  # type: ignore
         from solders.rpc.requests import SendVersionedTransaction  # type: ignore
         from solders.rpc.config import RpcSendTransactionConfig  # type: ignore
-        import base58
-        from executor import SOL_PRIVATE_KEY, SOL_RPC_FALLBACKS
+        from executor import SOL_RPC_FALLBACKS, _sol_keypair
 
-        if not SOL_PRIVATE_KEY:
+        kp = _sol_keypair()
+        if not kp:
             return {'success': False, 'error': 'No SOL_PRIVATE_KEY in .env'}
-
-        kp = Keypair.from_base58_string(SOL_PRIVATE_KEY)
 
         # Step 1: Get unsigned transaction from PumpPortal
         r = requests.post(
@@ -266,8 +280,8 @@ def buy_pumpfun_token(mint: str, symbol: str, sol_amount: float = BUY_SOL_AMOUNT
                 'mint':             mint,
                 'amount':           sol_amount,     # SOL amount
                 'denominatedInSol': 'true',
-                'slippage':         30,             # 30% — bonding curve is volatile
-                'priorityFee':      0.0005,         # ~$0.05 priority — enough for speed
+                'slippage':         PUMPFUN_SLIPPAGE,
+                'priorityFee':      PUMPFUN_PRIORITY_FEE_SOL,
                 'pool':             'pump',         # explicit pool — avoids 100ms auto-detect delay
             },
             timeout=15,
