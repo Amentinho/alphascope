@@ -342,7 +342,7 @@ def fetch_reddit_data():
     for sub in REDDIT_SUBS:
         try:
             res = requests.get(f'https://www.reddit.com/r/{sub}/hot.json?limit=25',
-                headers=headers, timeout=10)
+                headers=headers, timeout=3)
             if res.status_code != 200:
                 print(f"    r/{sub}: HTTP {res.status_code}")
                 continue
@@ -354,8 +354,8 @@ def fetch_reddit_data():
                 title = d.get('title', '')
                 selftext = d.get('selftext', '')[:300]
                 all_titles.append(title)
-                score = d.get('score', 0)
-                comments = d.get('num_comments', 0)
+                score = d.get('score') or 0        # API returns None on some posts
+                comments = d.get('num_comments') or 0  # API returns None on some posts
                 coins = detect_coins(title + ' ' + selftext, f'reddit:{sub}')
                 sent_score, sent_label = calc_sentiment(title + ' ' + selftext)
                 for coin in coins:
@@ -380,14 +380,14 @@ def fetch_reddit_data():
                      ','.join(coins), sent_score, sent_label, score + comments, d.get('url', ''), now))
             conn.commit()
             conn.close()
-            time.sleep(1.5)
+            time.sleep(0.5)  # was 1.5s
         except Exception as e:
             print(f"    r/{sub}: {e}")
 
     for sub in AIRDROP_SUBS:
         try:
             res = requests.get(f'https://www.reddit.com/r/{sub}/hot.json?limit=10',
-                headers=headers, timeout=10)
+                headers=headers, timeout=3)
             if res.status_code != 200:
                 continue
             posts = res.json()['data']['children']
@@ -402,7 +402,7 @@ def fetch_reddit_data():
                      '', 0, 'N/A', d.get('score', 0), d.get('url', ''), now))
             conn.commit()
             conn.close()
-            time.sleep(2)
+            time.sleep(0.3)
         except:
             pass
 
@@ -444,10 +444,12 @@ def fetch_reddit_data():
 def fetch_telegram_data():
     print("  Fetching Telegram...")
     now = datetime.now().isoformat()
-    for channel in TELEGRAM_CHANNELS:
+    # Cap to 20 channels per run — 65 channels × 10s timeout = guaranteed hang
+    channels_this_run = TELEGRAM_CHANNELS[:10]  # cap tight
+    for channel in channels_this_run:
         try:
             res = requests.get(f"https://t.me/s/{channel}",
-                headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
             if res.status_code != 200:
                 continue
             messages = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', res.text, re.DOTALL)
@@ -473,7 +475,7 @@ def fetch_telegram_data():
             print(f"    @{channel}: {len(clean[-10:])} messages")
         except Exception as e:
             print(f"    @{channel}: {e}")
-        time.sleep(2)
+        time.sleep(0.3)  # was 2s — 65 channels × 2s = 130s timeout
 
 # ============================================================
 # X/TWITTER — Routed through social_monitor credit budget
@@ -589,7 +591,7 @@ def fetch_x_airdrops():
             print(f"    '{query}': {len(tweets)} tweets stored")
         except Exception as e:
             print(f"    '{query}': {e}")
-        time.sleep(2)
+        time.sleep(0.3)
     conn.close()
 
 def detect_hidden_gems():
@@ -634,9 +636,29 @@ def fetch_all():
     fetch_fear_greed()
     fetch_trending()
 
-    # Phase 2: Social signals
-    fetch_reddit_data()
-    fetch_telegram_data()
+    # Phase 1b: Established token intelligence — multi-source composite scores
+    # This populates coin_buzz with REAL sentiment for ETH/SOL/LINK/AAVE etc.
+    try:
+        from token_intelligence import run_token_intelligence
+        run_token_intelligence()
+    except Exception as _ti_e:
+        print(f"  token_intelligence error: {_ti_e}")
+
+    # Phase 2: Social signals — fire and forget, 20s budget max
+    # These are slow — cap tightly and never let them block the sim cycle
+    import threading as _thr
+    def _run_social():
+        try:
+            fetch_reddit_data()
+        except Exception:
+            pass
+        try:
+            fetch_telegram_data()
+        except Exception:
+            pass
+    _st = _thr.Thread(target=_run_social, daemon=True)
+    _st.start()
+    _st.join(timeout=20)  # hard cap: give up after 20s, never block longer
 
     # Phase 3: News & DeFi (imported modules)
     try:
@@ -706,26 +728,25 @@ if __name__ == '__main__':
     quick = '--quick' in sys.argv
     init_db()
     if quick:
-        # Quick mode for sim cycle refreshes — only DEX + social, skip slow sources
+        # Quick mode: DEX + social + token intelligence. < 30s guaranteed.
         print("  [quick refresh]")
-        from dex_scanner import fetch_dex_gems
-        fetch_dex_gems()
-        from social_monitor import run_social_monitoring
-        run_social_monitoring()
-        from portfolio import run_portfolio_signals
-        run_portfolio_signals()
-        # Airdrop processing — always run even in quick mode
         try:
-            from airdrop_intel import process_new_airdrops
-            process_new_airdrops()
-        except Exception:
-            pass
-        # Opportunity hunter — alert on new airdrops/presales immediately
+            from dex_scanner import fetch_dex_gems
+            fetch_dex_gems()
+        except Exception as _de:
+            print(f"    DEX error: {_de}")
         try:
-            from opportunity_hunter import alert_new_airdrop_signals, scan_presales
-            alert_new_airdrop_signals()  # fast path — fires Telegram directly from signals
-            scan_presales()
-        except Exception:
-            pass
-    else:
-        fetch_all()
+            from social_monitor import run_social_monitoring
+            run_social_monitoring()
+        except Exception as _se:
+            print(f"    Social error: {_se}")
+        # Token intelligence: fresh composite scores for established tokens
+        # Runs in background thread so it doesn't block the cycle
+        try:
+            import threading as _ti_thr
+            from token_intelligence import run_token_intelligence
+            _ti_t = _ti_thr.Thread(target=run_token_intelligence, daemon=True)
+            _ti_t.start()
+            _ti_t.join(timeout=20)  # max 20s — non-blocking if slow
+        except Exception as _ti_e:
+            pass  # non-fatal

@@ -21,13 +21,13 @@ except Exception:
     pass
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-STARTING_BALANCE_USD = 200.0
-STOP_LOSS_PCT        = -30.0
-TAKE_PROFIT_PCT      = 150.0
+STARTING_BALANCE_USD = 50.0
+STOP_LOSS_PCT        = -20.0
+TAKE_PROFIT_PCT      = 25.0
 MIN_SIGNAL_CONF      = 65
 
 CHAINS = ['solana', 'base', 'ethereum']  # BSC/ARB removed — no wallet configured
-ETH_BUDGET_USD = 800.0   # ETH mainnet gets more — real gems live here
+ETH_BUDGET_USD = 100.0   # ETH paper budget
 NATIVE_TOKENS = {
     'solana':   ('SOL', 'solana'),
     'bsc':      ('BNB', 'binancecoin'),
@@ -37,17 +37,14 @@ NATIVE_TOKENS = {
 
 REAL_PORTFOLIO = {
     'ethereum': [
-        {'symbol': 'LINK', 'coin_id': 'chainlink',   'amount': 90.9252, 'entry_price': 9.33},
-        {'symbol': 'ETH',  'coin_id': 'ethereum',    'amount': 0.0338,  'entry_price': 2333.18},
+        {'symbol': 'LINK', 'coin_id': 'chainlink', 'amount': 60.9266, 'entry_price': 10.58},
+        {'symbol': 'ETH',  'coin_id': 'ethereum',  'amount': 0.1281,  'entry_price': 2329.01},
     ],
-    'bitcoin': [
-        {'symbol': 'BTC',  'coin_id': 'bitcoin',     'amount': 0.1,     'entry_price': 75000.00},
+    'base': [
+        {'symbol': 'ETH',  'coin_id': 'ethereum',  'amount': 0.0594,  'entry_price': 2329.01},
     ],
     'solana': [
-        {'symbol': 'SOL',  'coin_id': 'solana',      'amount': 20,      'entry_price': 85.00},
-    ],
-    'arbitrum': [
-        {'symbol': 'HYPE', 'coin_id': 'hyperliquid', 'amount': 10,      'entry_price': 38.00},
+        {'symbol': 'SOL',  'coin_id': 'solana',    'amount': 0.46,    'entry_price': 93.70},
     ],
 }
 # Note: entry_price = your actual purchase price (cost basis), never changes
@@ -103,11 +100,13 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
         if time.time() - cached_time < 30 and cached_price > 0:
             return cached_price
 
-    # 0. DB first — fetcher writes fresh prices here every cycle
-    price = _db_price(sym)
-    if price > 0:
-        _price_cache[cache_key] = (price, time.time())
-        return price
+    # 0. DB first — only for known majors (Binance symbols)
+    # Micro-cap tokens use contract address via DexScreener to avoid stale prices
+    if sym in BINANCE_SYMBOLS:
+        price = _db_price(sym)
+        if price > 0:
+            _price_cache[cache_key] = (price, time.time())
+            return price
 
     price = 0.0
 
@@ -151,19 +150,19 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
             except Exception:
                 pass
 
-    # 2. DexScreener by symbol
-    if not price:
+    # 2. DexScreener by symbol — only if no contract available
+    # Symbol search is unreliable (YUNOGUY matches wrong token)
+    # Only use when coin_id is not a contract address
+    if not price and (not coin_id or len(coin_id) < 20):
         try:
             r = requests.get(
                 f'https://api.dexscreener.com/latest/dex/search?q={symbol}',
                 timeout=8)
             if r.status_code == 200:
                 pairs = r.json().get('pairs', [])
-                # Filter to chain
                 if chain and chain not in ('ethereum', 'bitcoin'):
                     cp = [p for p in pairs if p.get('chainId','') == chain]
                     pairs = cp or pairs
-                # Exact symbol match with min $100 liquidity
                 exact = [p for p in pairs
                          if p.get('baseToken',{}).get('symbol','').upper() == sym
                          and float(p.get('liquidity',{}).get('usd',0) or 0) >= 100]
@@ -292,6 +291,15 @@ def init_sim_tables():
         if _db_conn is not None:
             break
         time.sleep(0.1)
+    # Ensure coin_buzz has source column for token_intelligence
+    try:
+        import sqlite3 as _sq
+        _c = _sq.connect(MAIN_DB, timeout=5)
+        _c.execute("ALTER TABLE coin_buzz ADD COLUMN source TEXT DEFAULT 'manual'")
+        _c.commit()
+        _c.close()
+    except Exception:
+        pass  # already exists
     _db_exec('''CREATE TABLE IF NOT EXISTS sim_portfolio (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sim_id TEXT, symbol TEXT, chain TEXT,
@@ -312,6 +320,55 @@ def init_sim_tables():
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────
 class SimPortfolio:
+    @classmethod
+    def restore(cls, sim_id):
+        """
+        Restore portfolio state from sim.db after a crash.
+        Re-seeds real holdings and rebuilds open sim positions from DB.
+        """
+        port = cls.__new__(cls)
+        port.sim_id = sim_id
+        port.cash = {ch: STARTING_BALANCE_USD for ch in CHAINS}
+        port.cash['ethereum'] = ETH_BUDGET_USD
+        port.holdings = {}
+        port.trades = []
+        port._saved_count = 0
+        port._seed_real()
+        port.t0_prices = {}
+        port.starting_real = port._real_cost_basis()
+        port.starting_trading = (STARTING_BALANCE_USD * 2) + ETH_BUDGET_USD
+        port.starting_total = port.starting_trading + port.starting_real
+        port.wallet_balances = {}
+        port.wallet_balances_t0 = {}
+
+        # Restore open sim positions from DB
+        try:
+            conn = sqlite3.connect(SIM_DB, timeout=10)
+            rows = conn.execute("""
+                SELECT symbol, chain, amount_tokens, buy_price_usd, buy_time, signal_source
+                FROM sim_portfolio
+                WHERE sim_id=? AND status='HOLDING' AND buy_price_usd > 0
+            """, (sim_id,)).fetchall()
+            conn.close()
+            for sym, chain, tokens, buy_price, buy_time, src in rows:
+                if chain not in CHAINS:
+                    continue
+                key = f"{sym}_{chain}"
+                port.holdings[key] = {
+                    'symbol': sym, 'chain': chain, 'amount': tokens,
+                    'buy_price': buy_price, 'buy_time': buy_time or '',
+                    'usd_spent': tokens * buy_price, 'source': src or 'restored',
+                    'coin_id': '', 'is_real': False, '_zero_count': 0,
+                }
+                # Deduct the position cost from cash
+                port.cash[chain] = max(0, port.cash.get(chain, 0) - (tokens * buy_price))
+            if rows:
+                print(f"  ♻️  Restored {len(rows)} open positions from DB (sim_id={sim_id})")
+        except Exception as e:
+            print(f"  ⚠️  Restore failed: {e} — starting fresh")
+
+        return port
+
     def __init__(self, sim_id):
         self.sim_id = sim_id
         self.cash = {ch: STARTING_BALANCE_USD for ch in CHAINS}
@@ -329,6 +386,10 @@ class SimPortfolio:
         # Snapshot real wallet balances at T=0
         self.wallet_balances = self._snapshot_wallet_balances()
         self.wallet_balances_t0 = dict(self.wallet_balances)
+        if self.wallet_balances:
+            live = sum(b['usd'] for b in self.wallet_balances.values())
+            if live > 10:
+                self.starting_real = live
 
     def _snapshot_wallet_balances(self) -> dict:
         """Get real on-chain wallet balances. Called at start and after each tx."""
@@ -432,7 +493,9 @@ class SimPortfolio:
         return total
 
     def _real_value(self):
-        """Current live value — Binance direct, bypasses all caches."""
+        """Current live value."""
+        if self.wallet_balances:
+            return sum(b['usd'] for b in self.wallet_balances.values())
         BINANCE_IDS = {
             'LINK':'LINKUSDT','ETH':'ETHUSDT','BTC':'BTCUSDT',
             'SOL':'SOLUSDT','HYPE':'HYPEUSDT','BNB':'BNBUSDT',
@@ -521,6 +584,8 @@ class SimPortfolio:
                 if self.trades and self.trades[-1].get('symbol') == symbol:
                     self.trades.pop()
                 print(f"    ↩️  Reversed sim buy {symbol} — real tx failed")
+                # Persist ban so this token is never retried
+                _write_persistent_ban(symbol, chain, result.get('error', 'tx failed'))
         except Exception:
             pass
         return True, f"bought {tokens:.4f} {symbol} @ ${price:.8f}"
@@ -617,12 +682,10 @@ class SimPortfolio:
     def print_status(self):
         tv = self._trading_value()
         rv = self._real_value()
-        t0_rv = sum(self.t0_prices.get(pos['symbol'], 0) * pos['amount']
-                    for positions in REAL_PORTFOLIO.values() for pos in positions
-                    if self.t0_prices.get(pos['symbol'], 0) > 0)
-        rv_delta = rv - t0_rv if t0_rv > 0 else 0  # change vs T=0
-        tp = tv - self.starting_trading
+        rv_delta = rv - self.starting_real if self.starting_real > 0 else 0
+        # Session P&L = sum of all realized trade P&L this session
         sells = [t for t in self.trades if t['action'] == 'SELL']
+        session_pnl = sum(t.get('pnl', 0) for t in sells)
         wins   = sum(1 for t in sells if t.get('pnl', 0) > 0)
         losses = sum(1 for t in sells if t.get('pnl', 0) <= 0)
         best  = max(sells, key=lambda t: t.get('pnl_pct', 0), default=None)
@@ -632,7 +695,8 @@ class SimPortfolio:
         print(f"\n  {'='*52}")
         print(f"  {self.sim_id} | {datetime.now().strftime('%H:%M:%S')}")
         print(f"  Real portfolio:   ${rv:>10,.2f}  ({rv_delta:+.2f} this session)")
-        print(f"  Trading capital:  ${tv:>10,.2f}  ({tp:+.2f} | {tp/max(self.starting_trading,1)*100:+.1f}%)")
+        pnl_str = f"{session_pnl:+.2f}" if sells else "no closed trades"
+        print(f"  Session P&L:      ${session_pnl:>10.2f}  (realized: {len(sells)} trades)")
         print(f"  Trades: {len(self.trades)} | W:{wins} L:{losses} | Best: {best_str} | Worst: {worst_str}")
         cash_str = ' | '.join(f"{c}:${v:.0f}" for c, v in self.cash.items() if v > 0)
         print(f"  Cash: {cash_str}")
@@ -697,7 +761,7 @@ class SimPortfolio:
 
 # ── Price monitor (background thread) ────────────────────────────────────────
 def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT,
-                      duration_minutes=370, interval_seconds=15):
+                      duration_minutes=370, interval_seconds=10):
     """Checks open positions every 60s -- catches rugs before next cycle."""
     def _loop():
         end = time.time() + duration_minutes * 60
@@ -716,8 +780,9 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                     if not buy_price:
                         continue
                     try:
-                        # Use 30s cache in monitor to avoid API rate limits
-                        price = resolve_price(sym, chain=chain, use_cache=True)
+                        # Pass contract so resolve_price uses exact address not symbol search
+                        contract = pos.get('contract', pos.get('coin_id', ''))
+                        price = resolve_price(sym, coin_id=contract, chain=chain, use_cache=True)
                     except Exception:
                         price = 0
                     if not price or price <= 0:
@@ -778,7 +843,7 @@ def _load_dex_proposals(portfolio):
         try:
             rows = conn.execute("""
                 SELECT symbol, chain, contract_address, dex_url, price_usd,
-                       liquidity_usd, age_hours, cross_score
+                       liquidity_usd, age_hours, cross_score, price_change_24h
                 FROM dex_gems
                 WHERE fetched_at >= datetime('now', '-24 hours')
                 AND cross_score >= 5
@@ -796,12 +861,21 @@ def _load_dex_proposals(portfolio):
             import json as _j
             with open('sim_ban_list.json') as _f:
                 for entry in _j.load(_f):
-                    stop_lossed_syms.add(entry.split('_')[0])
+                    key = entry.split('|')[0]   # strip |date suffix if present
+                    stop_lossed_syms.add(key.split('_')[0])
+        except Exception:
+            pass
+        # Also load from DB auto_ban table
+        try:
+            _bc = sqlite3.connect(MAIN_DB, timeout=3)
+            for (bsym,) in _bc.execute("SELECT symbol FROM auto_ban").fetchall():
+                stop_lossed_syms.add(bsym.upper())
+            _bc.close()
         except Exception:
             pass
 
         seen = set()
-        for sym, chain, contract, dex_url, price_db, liq, age, score in rows:
+        for sym, chain, contract, dex_url, price_db, liq, age, score, *_extra in rows:
             sym = sym.upper()
             chain = (chain or 'solana').lower()
             if sym in seen:
@@ -815,6 +889,9 @@ def _load_dex_proposals(portfolio):
             # Skip majors
             if sym in ('BTC','ETH','SOL','BNB','USDT','USDC','WETH','WSOL','WBTC'):
                 continue
+            # BSC excluded — no wallet configured
+            if chain == 'bsc':
+                continue
             liq = liq or 0
             age = age or 99
             # Liquidity minimums per chain
@@ -824,9 +901,10 @@ def _load_dex_proposals(portfolio):
             # Size by chain
             # Phase 2 trade sizes — based on available wallet balance per chain
             if chain == 'solana':
-                trade_usd = 10   # ~$60 SOL left — conservative
+                trade_usd = 1    # SOL gems: $1
             else:
-                trade_usd = 20   # BASE + ETH
+                trade_usd = 2    # BASE/ETH gems: $2
+            price_chg_24h = float(_extra[0]) if _extra and _extra[0] is not None else 0.0
             proposals.append({
                 'action': 'BUY',
                 'symbol': sym,
@@ -837,6 +915,8 @@ def _load_dex_proposals(portfolio):
                 'reasons': f'DEX liq:${liq/1000:.0f}k age:{age:.0f}h score:{score}',
                 'sources': 'dex_direct',
                 'category': 'DEX_GEM',
+                'price_change_24h': price_chg_24h,
+                'age_hours': age,
             })
     except Exception as e:
         print(f"    dex_proposals error: {e}")
@@ -866,7 +946,7 @@ def _fallback_signals():
                     'symbol': sym,
                     'coin_id': coin_id,
                     'chain': 'solana',  # default to SOL for low gas
-                    'trade_usd': 40,
+                    'trade_usd': 2,
                     'alpha_score': 70,
                     'reasons': 'CoinGecko trending (fallback)',
                     'sources': 'fallback',
@@ -894,7 +974,7 @@ def _fallback_signals():
                     'symbol': sym,
                     'coin_id': p.get('baseToken', {}).get('address', ''),
                     'chain': 'solana',
-                    'trade_usd': 35,
+                    'trade_usd': 2,
                     'alpha_score': 68,
                     'reasons': f'DexScreener SOL hot liq:${liq/1000:.0f}k vol:${vol/1000:.0f}k',
                     'sources': 'fallback_dex',
@@ -907,60 +987,215 @@ def _fallback_signals():
 
 
 
-def _load_established_proposals(portfolio):
-    """Sentiment-driven proposals for established native coins."""
+# ── Contract registry: native tokens on SOL / BASE / ETH only ───────────────
+# Only tokens that can actually be swapped on-chain — verified contract addresses.
+# BTC → not native to SOL/BASE/ETH, tracked as macro signal only, no execution.
+# HYPE → Hyperliquid L1 native, no DEX on supported chains, macro signal only.
+# The DECISION to trade any token comes entirely from token_intelligence scores.
+_CONTRACT_REGISTRY = {
+    # ── SOL ecosystem — Jupiter verified mint addresses ──────────────────────
+    'SOL':  {'chain': 'solana',   'coin_id': 'So11111111111111111111111111111111111111112',
+             'binance': 'SOLUSDT',  'sl': -6.0, 'tp': 12.0, 'max_usd': 2},
+    'JUP':  {'chain': 'solana',   'coin_id': 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
+             'binance': 'JUPUSDT',  'sl': -6.0, 'tp': 12.0, 'max_usd': 2},
+    'RAY':  {'chain': 'solana',   'coin_id': '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',
+             'binance': 'RAYUSDT',  'sl': -6.0, 'tp': 12.0, 'max_usd': 2},
+    'BONK': {'chain': 'solana',   'coin_id': 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+             'binance': 'BONKUSDT', 'sl': -8.0, 'tp': 15.0, 'max_usd': 2},
+    'WIF':  {'chain': 'solana',   'coin_id': 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
+             'binance': 'WIFUSDT',  'sl': -8.0, 'tp': 15.0, 'max_usd': 2},
+    'PYTH': {'chain': 'solana',   'coin_id': 'HZ1JovNiVvGrVMdPyDmkuMhkVDmZnMHT1N88pQqCpump',
+             'binance': 'PYTHUSDT', 'sl': -6.0, 'tp': 12.0, 'max_usd': 2},
+    # ── ETH mainnet — ERC-20 verified contract addresses ─────────────────────
+    'ETH':  {'chain': 'ethereum', 'coin_id': '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+             'binance': 'ETHUSDT',  'sl': -5.0, 'tp': 10.0, 'max_usd': 2},
+    'LINK': {'chain': 'ethereum', 'coin_id': '0x514910771AF9Ca656af840dff83E8264EcF986CA',
+             'binance': 'LINKUSDT', 'sl': -5.0, 'tp': 10.0, 'max_usd': 2},
+    'AAVE': {'chain': 'ethereum', 'coin_id': '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9',
+             'binance': 'AAVEUSDT', 'sl': -5.0, 'tp': 10.0, 'max_usd': 2},
+    'UNI':  {'chain': 'ethereum', 'coin_id': '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984',
+             'binance': 'UNIUSDT',  'sl': -5.0, 'tp': 10.0, 'max_usd': 2},
+    # ── BASE — native BASE ecosystem tokens ──────────────────────────────────
+    'AERO': {'chain': 'base',     'coin_id': '0x940181a94A35A4569E4529A3CDfB74e38FD98631',
+             'binance': 'AEROUSDT', 'sl': -6.0, 'tp': 12.0, 'max_usd': 2},
+    # BTC + HYPE → macro sentiment signals only, no on-chain execution
+    # (BTC lives on its own chain; HYPE is Hyperliquid L1 native)
+    # They stay in token_intelligence TRACKED_TOKENS for regime filtering.
+    '_MACRO_SIGNAL_ONLY': {'BTC', 'HYPE'},
+}
+
+
+def _load_listing_proposals(portfolio):
+    """
+    Load exchange listing signals from signals table (populated by exchange_feeds.py).
+    Tier 2 exchanges (KuCoin/Gate/MEXC/OKX) = highest alpha, handled with priority.
+    Only proposes if coin has a resolvable SOL mint (safest chain for low-gas listing plays).
+    """
     import sqlite3 as _sq
-    ESTABLISHED = [
-        {'symbol':'JUP',  'chain':'solana',   'sl':-6.0, 'tp':12.0, 'max_usd':10, 'coin_id':'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN'},
-        {'symbol':'RAY',  'chain':'solana',   'sl':-6.0, 'tp':12.0, 'max_usd':10, 'coin_id':'4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R'},
-        {'symbol':'BONK', 'chain':'solana',   'sl':-8.0, 'tp':15.0, 'max_usd':10, 'coin_id':'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'},
-        {'symbol':'LINK', 'chain':'ethereum', 'sl':-5.0, 'tp':10.0, 'max_usd':20, 'coin_id':'0x514910771AF9Ca656af840dff83E8264EcF986CA'},
-        {'symbol':'AAVE', 'chain':'ethereum', 'sl':-5.0, 'tp':10.0, 'max_usd':20, 'coin_id':'0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9'},
-        {'symbol':'UNI',  'chain':'ethereum', 'sl':-5.0, 'tp':10.0, 'max_usd':20, 'coin_id':'0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984'},
-        {'symbol':'AERO', 'chain':'base',     'sl':-6.0, 'tp':12.0, 'max_usd':20, 'coin_id':'0x940181a94A35A4569E4529A3CDfB74e38FD98631'},
-    ]
-    real_syms = {pos['symbol'] for positions in REAL_PORTFOLIO.values() for pos in positions}
-    BINANCE = {'JUP':'JUPUSDT','RAY':'RAYUSDT','BONK':'BONKUSDT',
-               'LINK':'LINKUSDT','AAVE':'AAVEUSDT','UNI':'UNIUSDT','AERO':'AEROUSDT'}
     proposals = []
     try:
         conn = _sq.connect(MAIN_DB, timeout=10)
-        for coin in ESTABLISHED:
-            sym, chain = coin['symbol'], coin['chain']
-            if sym in real_syms: continue
-            if f"{sym}_{chain}" in portfolio.holdings: continue
-            if chain not in CHAINS: continue
+        rows = conn.execute("""
+            SELECT coin, title, engagement, source_detail
+            FROM signals
+            WHERE source='exchange' AND signal_type='LISTING'
+            AND fetched_at >= datetime('now', '-4 hours')
+            AND engagement >= 100
+            ORDER BY engagement DESC LIMIT 8
+        """).fetchall()
+        conn.close()
+        stop_lossed_syms = {t['symbol'] for t in portfolio.trades
+                            if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
+        try:
+            with open('sim_ban_list.json') as _f:
+                for entry in json.load(_f):
+                    stop_lossed_syms.add(entry.split('_')[0])
+        except Exception:
+            pass
+        for coin, title, priority, exchange_detail in rows:
+            if not coin:
+                continue
+            for sym in coin.split(','):
+                sym = sym.strip().upper()
+                if not sym or sym in ('USDT', 'USDC', 'USD', 'BTC', 'ETH', 'SOL', 'BNB'):
+                    continue
+                if sym in stop_lossed_syms:
+                    continue
+                if f"{sym}_solana" in portfolio.holdings:
+                    continue
+                # Default to SOL for listing plays (lowest gas, fastest execution)
+                proposals.append({
+                    'action': 'BUY',
+                    'symbol': sym,
+                    'coin_id': '',  # will be resolved by resolve_price via DexScreener
+                    'chain': 'solana',
+                    'trade_usd': 1,
+                    'alpha_score': min(90, 50 + priority // 4),
+                    'reasons': f'Listing: {exchange_detail} — {title[:50]}',
+                    'sources': 'exchange_listing',
+                    'category': 'LISTING',
+                })
+    except Exception as e:
+        print(f"    listing proposals error: {e}")
+    return proposals
+
+
+
+def _load_established_proposals(portfolio):
+    """
+    Dynamic established token proposals driven entirely by token_intelligence scores.
+
+    Flow:
+      1. Read ALL tokens scored in token_intelligence table (last 2 hours)
+      2. BTC/HYPE → macro regime signals only (no execution)
+         If BTC composite < -0.3 → suppress all buys (bear regime)
+      3. Filter: only BUY/STRONG_BUY signals, score >= +0.1
+      4. Look up contract in _CONTRACT_REGISTRY — skip if unknown or macro-only
+      5. Verify price momentum from Binance (not crashing)
+      6. Propose with $2 cap and tight SL/TP from registry
+
+    New tokens get added automatically by updating token_intelligence.py TRACKED_TOKENS.
+    No changes to simulation.py needed.
+    """
+    import sqlite3 as _sq
+    proposals = []
+    macro_only = _CONTRACT_REGISTRY.get('_MACRO_SIGNAL_ONLY', set())
+    real_syms = {pos['symbol'] for positions in REAL_PORTFOLIO.values() for pos in positions}
+
+    try:
+        conn = _sq.connect(MAIN_DB, timeout=10)
+
+        # Step 1: read all fresh token_intelligence scores
+        rows = conn.execute("""
+            SELECT symbol, composite_score, signal, confidence, notes
+            FROM token_intelligence
+            WHERE id IN (
+                SELECT MAX(id) FROM token_intelligence
+                WHERE fetched_at >= datetime('now', '-2 hours')
+                GROUP BY symbol
+            )
+            ORDER BY composite_score DESC
+        """).fetchall()
+        conn.close()
+
+        if not rows:
+            print("    📊 Established: no fresh token intelligence data")
+            return []
+
+        # Step 2: BTC macro regime gate — if BTC is very bearish, hold off all buys
+        btc_score = next((r[1] for r in rows if r[0].upper() == 'BTC'), None)
+        if btc_score is not None and btc_score < -0.3:
+            print(f"    📊 Established: BTC macro score {btc_score:.2f} → bear regime, skipping established buys")
+            return []
+
+        for sym, score, signal, conf, notes in rows:
+            sym = sym.upper()
+
+            # Skip macro-signal-only tokens — no on-chain execution possible
+            if sym in macro_only:
+                continue
+
+            # Step 3: only act on positive signals
+            if signal not in ('BUY', 'STRONG_BUY'):
+                continue
+            if score < 0.1:
+                continue
+
+            # Step 4: must have a known tradeable contract — no guessing
+            registry = _CONTRACT_REGISTRY.get(sym)
+            if not registry or not isinstance(registry, dict):
+                continue  # not in registry or is a set (macro-only marker)
+
+            chain = registry['chain']
+            if chain not in CHAINS:
+                continue
+            if sym in real_syms:
+                continue  # already holding in real wallet
+            if f"{sym}_{chain}" in portfolio.holdings:
+                continue  # already in sim position
+
+            # Step 5: live price check — not crashing, not overbought
             try:
-                row = conn.execute(
-                    'SELECT avg_sentiment, mention_count FROM coin_buzz '
-                    'WHERE coin=? ORDER BY fetched_at DESC LIMIT 1', (sym,)).fetchone()
-                if not row: continue
-                sentiment, mentions = float(row[0] or 0), int(row[1] or 0)
-                if sentiment < 0.35 or mentions < 5: continue
-                if sym not in BINANCE: continue
                 r = requests.get(
-                    f'https://api.binance.com/api/v3/ticker/24hr?symbol={BINANCE[sym]}',
+                    f"https://api.binance.com/api/v3/ticker/24hr?symbol={registry['binance']}",
                     timeout=5)
-                if r.status_code != 200: continue
+                if r.status_code != 200:
+                    continue
                 data = r.json()
                 price = float(data.get('lastPrice', 0))
                 chg = float(data.get('priceChangePercent', 0))
-                if price <= 0 or chg > 8 or chg < -10: continue
-                proposals.append({
-                    'symbol': sym, 'chain': chain, 'coin_id': coin['coin_id'],
-                    'price': price, 'trade_usd': coin['max_usd'],
-                    'stop_loss_override': coin['sl'], 'take_profit_override': coin['tp'],
-                    'alpha_score': 75, 'cross_score': 8,
-                    'sources': f'buzz:sent={sentiment:.2f},n={mentions}',
-                    'reasons': [f'established_{sym}'], 'category': 'ESTABLISHED',
-                    'liquidity_usd': 999_000_000, 'age_hours': 0,
-                })
-            except Exception: continue
-        conn.close()
+                if price <= 0 or chg > 10 or chg < -12:
+                    continue  # skip if pumped >10% or dumping >12%
+            except Exception:
+                continue
+
+            # Step 6: propose
+            proposals.append({
+                'action': 'BUY',
+                'symbol': sym,
+                'chain': chain,
+                'coin_id': registry['coin_id'],
+                'price': price,
+                'trade_usd': registry['max_usd'],  # $2 hard cap from registry
+                'stop_loss_override': registry['sl'],
+                'take_profit_override': registry['tp'],
+                'alpha_score': min(95, 60 + int(score * 100)),
+                'cross_score': 8,
+                'sources': f'intel:score={score:.2f},sig={signal}',
+                'reasons': [f'intel_{sym}:{signal}:{notes[:40]}'],
+                'category': 'ESTABLISHED',
+                'liquidity_usd': 999_000_000,
+                'age_hours': 0,
+            })
+
     except Exception as e:
         print(f'  established error: {e}')
+
     if proposals:
-        print(f"    📊 Established: {', '.join(p['symbol'] for p in proposals)}")
+        syms = ', '.join(f"{p['symbol']}({p['sources'].split('=')[1][:5]})" for p in proposals)
+        print(f"    📊 Established signals: {syms}")
+    else:
+        print("    📊 Established: no BUY signals from intelligence")
     return proposals
 
 # Dry run flag — checked in agent cycle and proposal loading
@@ -970,8 +1205,17 @@ except Exception:
     DRY_RUN_FLAG = True
 
 
+DAILY_LOSS_LIMIT_USD = 200.0   # Stop new buys if trading P&L drops below -$200
+
 def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
     actions = 0
+
+    # Circuit breaker — stop new buys if daily loss limit hit
+    trading_pnl = portfolio._trading_value() - portfolio.starting_trading
+    if trading_pnl < -DAILY_LOSS_LIMIT_USD:
+        print(f"    🛑 Daily loss limit hit (${trading_pnl:.0f}) — checking exits only, no new buys")
+        portfolio.check_exits(stop_loss, take_profit)
+        return 0
 
     # 1. Check exits
     actions += portfolio.check_exits(stop_loss, take_profit)
@@ -1011,37 +1255,55 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         proposals = proposals + established
     except Exception as _ep:
         print(f"  established proposals error: {_ep}")
+    # Add exchange listing proposals (KuCoin/Gate/MEXC tier-2 alpha)
+    try:
+        listing_props = _load_listing_proposals(portfolio)
+        if listing_props:
+            print(f"    📢 Listing signals: {len(listing_props)}")
+        proposals = proposals + listing_props
+    except Exception as _lp:
+        print(f"  listing proposals error: {_lp}")
 
-    # 3b. Supplement with wallet_agent for non-DEX signals (listings, pre-launch etc)
+    # 3b. Supplement with wallet_agent for non-DEX signals (listings, exchange alerts etc)
     try:
         from wallet_agent import evaluate_signals
         wa_proposals = evaluate_signals() or []
-        # Only take non-DEX_GEM proposals from wallet_agent to avoid chain mismatch
+        dex_syms = {p.get('symbol') for p in proposals}
         for p in wa_proposals:
-            if p.get('action') in ('SKIP', None): continue
-            if p.get('category') == 'DEX_GEM': continue  # handled by _load_dex_proposals
-            sym = p.get('symbol','')
-            chain = p.get('chain','')
-            if not any(x.get('symbol') == sym for x in proposals):
+            if p.get('action') in ('SKIP', None):
+                continue
+            sym = p.get('symbol', '')
+            if not sym:
+                continue
+            # DEX_GEM: only skip if _load_dex_proposals already has this symbol
+            # (avoids dropping valid social/buzz signals that happen to be DEX gems)
+            if p.get('category') == 'DEX_GEM' and sym in dex_syms:
+                continue
+            # Ensure coin_id is resolved — wallet_agent signals without contract
+            # are still useful if we can resolve them; drop only if truly empty
+            if not p.get('coin_id') and p.get('chain') in ('ethereum', 'base'):
+                continue  # EVM without contract → can't execute, skip
+            if sym not in dex_syms:
                 proposals.append(p)
     except Exception as e:
         print(f"    wallet_agent error: {e}")
 
     actionable = [p for p in proposals if p.get('action') not in ('SKIP', None)]
     if not actionable:
-        print(f"    No proposals — using live fallback signals")
-        proposals = _fallback_signals()
+        print(f"    No proposals this cycle — waiting for DEX gems")
+        proposals = []  # disabled: fallback bought CoinGecko trending w/ no Jupiter route
     else:
         print(f"    Proposals: " + " | ".join(
             f"{p['action']} {p['symbol']}({p.get('chain','?')[:3]})" for p in actionable[:10]))
 
-    # Ban by symbol across all chains
+    # Ban by symbol across all chains — strip |date suffix from dated entries
     stop_lossed_syms = {t['symbol'] for t in portfolio.trades
                         if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
     try:
         with open('sim_ban_list.json') as _f:
             for entry in json.load(_f):
-                stop_lossed_syms.add(entry.split('_')[0])
+                key = entry.split('|')[0]   # strip |date suffix if present
+                stop_lossed_syms.add(key.split('_')[0])
     except Exception:
         pass
 
@@ -1060,7 +1322,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         action   = p.get('action', '')
         cat      = p.get('category', '')
         # Per-chain hard caps
-        chain_caps = {'solana': 10, 'base': 20, 'ethereum': 20}
+        chain_caps = {'solana': 1, 'base': 2, 'ethereum': 2}
         trade_usd = min(p.get('trade_usd', 20), chain_caps.get(chain, 20))
 
         if not sym or action not in ('BUY', 'ACCUMULATE'):
@@ -1085,18 +1347,21 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if any(p in sym.lower() for p in _SCAM_PATTERNS):
             continue
 
-        # SOL: warn on PumpFun tokens (executor will handle rejection)
+        # SOL: PumpFun tokens — executor now handles bonding curve directly
+        # Ungraduated tokens go through _pumpfun_buy, graduated through Jupiter
+        # No pre-filtering needed here — executor decides the route
         if chain == 'solana' and not DRY_RUN_FLAG:
             coin_id = p.get('coin_id', '')
             if coin_id and len(coin_id) > 30:
                 try:
                     from executor import _is_pumpfun_graduated as _grad
                     if not _grad(coin_id):
-                        print(f"    NOTE {sym} — PumpFun token (executor will check graduation)")
+                        print(f"    NOTE {sym} — PumpFun token (bonding curve, will buy direct)")
                 except Exception:
                     pass
 
 
+        key = f"{sym}_{chain}"
         if key in portfolio.holdings:
             continue
         if sym in stop_lossed_syms:
@@ -1112,8 +1377,22 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if not price or price <= 0:
             print(f"    SKIP {sym} -- price unavailable on {chain}")
             continue
-        if price < 1e-6:
+        if price < 1e-9:
             print(f'    SKIP {sym} -- price dust (${price:.2e})')
+            continue
+
+        # ATH/rug check — if token already crashed >80% in 24h, skip
+        # This catches post-rug tokens and pump-and-dumps
+        price_change_24h = float(p.get('price_change_24h', 0) or 0)
+        if price_change_24h < -80:
+            print(f'    SKIP {sym} -- crashed {price_change_24h:.0f}% in 24h (likely rug)')
+            _write_persistent_ban(sym, chain, f'crashed {price_change_24h:.0f}% in 24h')
+            continue
+        # Additional check: if age < 6h and already down >50%, fast dump
+        age_hours = float(p.get('age_hours', 999) or 999)
+        if age_hours < 6 and price_change_24h < -50:
+            print(f'    SKIP {sym} -- fast dump {price_change_24h:.0f}% in {age_hours:.1f}h')
+            _write_persistent_ban(sym, chain, f'fast dump {price_change_24h:.0f}%')
             continue
 
         ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'),
@@ -1133,12 +1412,155 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
 
 
 # ── Main simulation ───────────────────────────────────────────────────────────
+def _clean_expired_bans(max_age_days=7):
+    """
+    Remove ban list entries older than max_age_days.
+    Called at the start of each simulation so the list doesn't grow forever.
+    A token that rugged 2 weeks ago might have a completely new liquidity pool
+    with the same ticker — the old ban shouldn't block it indefinitely.
+    """
+    removed = 0
+    # Clean DB auto_ban table
+    try:
+        conn = sqlite3.connect(MAIN_DB, timeout=5)
+        conn.execute("""CREATE TABLE IF NOT EXISTS auto_ban (
+            key TEXT PRIMARY KEY, symbol TEXT, chain TEXT,
+            reason TEXT, banned_at TEXT DEFAULT (datetime('now')))""")
+        result = conn.execute(
+            "DELETE FROM auto_ban WHERE banned_at < datetime('now', ?)",
+            (f'-{max_age_days} days',))
+        removed += result.rowcount
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    # Clean sim_ban_list.json — keep only entries without a timestamp
+    # (legacy entries have no date so we can't age them — keep them as permanent)
+    # New entries written below include a date suffix for future expiry
+    try:
+        import json as _j
+        from datetime import datetime as _dt, timedelta as _td
+        bl_file = 'sim_ban_list.json'
+        try:
+            raw = _j.load(open(bl_file))
+        except Exception:
+            raw = []
+        cutoff = _dt.now() - _td(days=max_age_days)
+        kept = []
+        for entry in raw:
+            # Format: "SYM_chain" (legacy, keep) or "SYM_chain|2025-01-01" (dated)
+            if '|' in entry:
+                try:
+                    date_str = entry.split('|')[1]
+                    if _dt.fromisoformat(date_str) < cutoff:
+                        removed += 1
+                        continue
+                except Exception:
+                    pass
+            kept.append(entry)
+        _j.dump(kept, open(bl_file, 'w'))
+    except Exception:
+        pass
+    if removed:
+        print(f"  🧹 Expired {removed} old bans (>{max_age_days}d)")
+
+
+def _write_persistent_ban(symbol, chain, reason=''):
+    """Write ban to DB + json. Bans auto-expire after 7 days (via _clean_expired_bans)."""
+    key = f"{symbol}_{chain}"
+    today = datetime.now().strftime('%Y-%m-%d')
+    # Write to DB
+    try:
+        conn = sqlite3.connect(MAIN_DB, timeout=5)
+        conn.execute("""CREATE TABLE IF NOT EXISTS auto_ban (
+            key TEXT PRIMARY KEY, symbol TEXT, chain TEXT,
+            reason TEXT, banned_at TEXT DEFAULT (datetime('now')))""")
+        conn.execute("INSERT OR IGNORE INTO auto_ban (key,symbol,chain,reason) VALUES (?,?,?,?)",
+                     (key, symbol, chain, reason[:120]))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    # Write to json with date suffix so _clean_expired_bans can expire it
+    try:
+        import json as _j
+        bl_file = 'sim_ban_list.json'
+        try:
+            bl = _j.load(open(bl_file))
+        except Exception:
+            bl = []
+        dated_key = f"{key}|{today}"
+        # Remove any existing undated version of this key
+        bl = [e for e in bl if not e.startswith(key)]
+        if dated_key not in bl:
+            bl.append(dated_key)
+            _j.dump(bl, open(bl_file, 'w'))
+    except Exception:
+        pass
+    print(f"    🚫 Auto-banned {key} — expires in 7 days")
+
+
 def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
     init_sim_tables()
-    sim_id = f"SIM_{datetime.now().strftime('%Y%m%d_%H%M')}"
-    portfolio = SimPortfolio(sim_id)
+
+    # Gap 1: Crash recovery — check if there's an active sim to resume
+    portfolio = None
+    try:
+        conn = sqlite3.connect(SIM_DB, timeout=5)
+        row = conn.execute("""
+            SELECT sim_id FROM sim_runs
+            WHERE end_time > datetime('now', '-30 minutes')
+            AND start_time > datetime('now', '-7 hours')
+            ORDER BY start_time DESC LIMIT 1
+        """).fetchone()
+        conn.close()
+        if row:
+            candidate_id = row[0]
+            # Check it has open positions worth restoring
+            conn2 = sqlite3.connect(SIM_DB, timeout=5)
+            open_count = conn2.execute(
+                "SELECT COUNT(*) FROM sim_portfolio WHERE sim_id=? AND status='HOLDING'",
+                (candidate_id,)).fetchone()[0]
+            conn2.close()
+            if open_count > 0:
+                print(f"  ♻️  Found active sim {candidate_id} with {open_count} open positions — restoring")
+                portfolio = SimPortfolio.restore(candidate_id)
+    except Exception as _re:
+        print(f"  ⚠️  Crash recovery check failed: {_re}")
+
+    if portfolio is None:
+        sim_id = f"SIM_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        portfolio = SimPortfolio(sim_id)
+
+    # Gap 3: Dynamic cash sizing from live wallet balance (live mode only)
+    try:
+        from executor import DRY_RUN as _DR_CHECK
+        if not _DR_CHECK and portfolio.wallet_balances:
+            for chain, bal in portfolio.wallet_balances.items():
+                if chain in CHAINS and bal.get('usd', 0) > 5:
+                    # Use 15% of wallet per chain for trading, capped at STARTING_BALANCE_USD
+                    dynamic_cash = min(bal['usd'] * 0.15, STARTING_BALANCE_USD)
+                    if dynamic_cash > 1:
+                        portfolio.cash[chain] = dynamic_cash
+                        print(f"  💼 {chain}: trading cash set to ${dynamic_cash:.1f} (15% of ${bal['usd']:.0f} wallet)")
+    except Exception:
+        pass  # dry run or wallet not available — use hardcoded defaults
+
     end_time = datetime.now(timezone.utc) + timedelta(hours=hours)
+    print("  📡 Initializing token intelligence...")
+    try:
+        from token_intelligence import run_token_intelligence
+        run_token_intelligence()
+    except ImportError:
+        print("  ⚠️  token_intelligence.py not found")
+    except Exception as _ti_e:
+        print(f"  token_intelligence error: {_ti_e}")
     total_cycles = int(hours * 60 / cycle_min)
+    sim_id = portfolio.sim_id
+
+    # Clean expired bans before starting — tokens that rugged >7 days ago
+    # may have new pools; don't block them indefinitely
+    _clean_expired_bans(max_age_days=7)
 
     # Start single-writer DB thread (must be first — everything else queues through it)
     _start_db_writer()
@@ -1155,6 +1577,24 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
         print("  🔍 Opportunity hunter: active (airdrops + presales + launchpads)")
     except Exception as _oh_err:
         print(f"  ⚠️  Opportunity hunter: {_oh_err}")
+
+    # Start PumpFun real-time stream (new token launches + graduations)
+    try:
+        from pumpfun_stream import start_pumpfun_stream
+        start_pumpfun_stream()
+    except ImportError:
+        print("  ⚠️  pumpfun_stream.py not found — copy it to this folder")
+    except Exception as _pf_err:
+        print(f"  ⚠️  PumpFun stream: {_pf_err}")
+
+    # Start KOL copy trader (dynamic wallet list — auto-refreshes from Kolscan/GMGN every 24h)
+    try:
+        from kol_tracker import start_kol_tracker
+        start_kol_tracker()
+    except ImportError:
+        print("  ⚠️  kol_tracker.py not found — copy it to this folder")
+    except Exception as _kol_err:
+        print(f"  ⚠️  KOL tracker: {_kol_err}")
 
     # Start source discovery (finds new Telegram/Reddit/Twitter sources weekly)
     try:
@@ -1173,8 +1613,6 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     print(f"\n{'='*60}")
     print(f"  AlphaScope Trade Simulation v2.3")
     print(f"  Sim ID: {sim_id}")
-    print(f"  Trading capital: ${portfolio.starting_trading:.0f} "
-          f"(SOL: ${STARTING_BALANCE_USD:.0f} | BASE: ${STARTING_BALANCE_USD:.0f} | ETH: ${ETH_BUDGET_USD:.0f})")
     try:
         from executor import DRY_RUN as _DR
         if not _DR:
@@ -1188,13 +1626,27 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     print(f"  Real portfolio T=0 value:  ${portfolio._real_value():,.2f}")
     print(f"  Duration: {hours}h | Cycle: {cycle_min}min | "
           f"Stop: {stop_loss}% | TP: +{take_profit}%")
-    print(f"  Price monitor: every 60s (catches rugs fast)")
+    print(f"  Price monitor: every 10s (fast rug detection)")
     print(f"  End: {end_time.strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*60}\n")
 
-    # Print real wallet balances at T=0
+    # Always show real portfolio holdings from config (wallet_balances may not load)
+    print("  Real portfolio holdings:")
+    for chain, positions in REAL_PORTFOLIO.items():
+        for pos in positions:
+            p_now = resolve_price(pos['symbol'], pos['coin_id'], chain, use_cache=False)
+            p_show = p_now if p_now else pos['entry_price']
+            val = pos['amount'] * p_show
+            pnl = (p_show - pos['entry_price']) * pos['amount']
+            arrow = '📈' if pnl >= 0 else '📉'
+            print(f"    {arrow} {pos['symbol']:<6} ({chain}) "
+                  f"{pos['amount']} @ cost ${pos['entry_price']:.2f} → now ${p_show:.2f} "
+                  f"= ${val:,.2f} ({pnl:+.2f})")
+    print()
+
+    # Print live on-chain wallet balances if available
     if portfolio.wallet_balances:
-        print("  Real wallet balances (T=0):")
+        print("  On-chain wallet balances (T=0):")
         for chain, b in portfolio.wallet_balances.items():
             print(f"    {chain}: {b['amount']:.4f} {b['symbol']} = ${b['usd']:.2f}")
         total_wallet = sum(b['usd'] for b in portfolio.wallet_balances.values())
@@ -1207,28 +1659,56 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
         elapsed = cycle * cycle_min / 60
         print(f"\n  --- Cycle {cycle}/{total_cycles} | +{elapsed:.1f}h ---")
 
+        # Gap 2: Monitor watchdog — restart if thread died
+        if not monitor.is_alive():
+            print("  ⚠️  Price monitor died — restarting")
+            try:
+                from executor import alert_error
+                alert_error("Price monitor thread died — restarted automatically")
+            except Exception:
+                pass
+            monitor = run_price_monitor(portfolio, stop_loss, take_profit,
+                                        duration_minutes=int(hours * 60) + 5,
+                                        interval_seconds=10)
+
+        # Gap 4: Refresh token intelligence every 3 cycles (scores go stale in ~1h)
+        if cycle % 3 == 0:
+            try:
+                from token_intelligence import run_token_intelligence
+                run_token_intelligence()
+                print("  📊 Token intelligence refreshed")
+            except Exception as _tie:
+                print(f"  token_intelligence refresh: {_tie}")
+
         # Clear price cache each cycle — forces fresh API fetch for all prices
         _price_cache.clear()
 
+        # Issue F: Try direct module call first (faster, no subprocess overhead)
         try:
-            import subprocess
-            print("  Refreshing data...")
-            r = subprocess.run(
-                ['python3', 'fetcher.py', '--quick'],
-                capture_output=True, text=True, timeout=180,
-                close_fds=True,
-                cwd=os.path.dirname(os.path.abspath(__file__)) or '.')
-            if r.stdout:
-                for line in r.stdout.strip().split('\n'):
-                    if line.strip():
-                        print(f"  {line}")
-            if r.returncode != 0 and r.stderr:
-                print(f"  Refresh warning: {r.stderr[:200]}")
-                for line in r.stdout.split('\n'):
-                    if any(x in line for x in ['gems','Social','Portfolio','Agent','Security']):
-                        print(f"  {line.strip()}")
-        except Exception as e:
-            print(f"  Refresh error: {e}")
+            import fetcher as _fetcher
+            if hasattr(_fetcher, 'run_quick_fetch'):
+                print("  Refreshing data (direct)...")
+                _fetcher.run_quick_fetch()
+            else:
+                raise AttributeError("run_quick_fetch not found")
+        except Exception:
+            # Fallback to subprocess (original behaviour)
+            try:
+                import subprocess
+                print("  Refreshing data...")
+                r = subprocess.run(
+                    ['python3', 'fetcher.py', '--quick'],
+                    capture_output=True, text=True, timeout=180,
+                    close_fds=True,
+                    cwd=os.path.dirname(os.path.abspath(__file__)) or '.')
+                if r.stdout:
+                    for line in r.stdout.strip().split('\n'):
+                        if line.strip():
+                            print(f"  {line}")
+                if r.returncode != 0 and r.stderr:
+                    print(f"  Refresh warning: {r.stderr[:200]}")
+            except Exception as e:
+                print(f"  Refresh error: {e}")
 
         actions = run_agent_cycle(portfolio, stop_loss, take_profit)
         print(f"  Actions: {actions}")
@@ -1243,14 +1723,46 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
             try:
                 time.sleep(cycle_min * 60)
             except KeyboardInterrupt:
-                print("\n  Stopped by user")
-                break
+                print("\n  Stopped by user — selling all open positions...")
+                _sell_all_gems(portfolio)
+                print(f"\n{'='*60}")
+                print(f"  COMPLETE -- {sim_id}")
+                portfolio.print_status()
+                display_results(sim_id, portfolio)
+                portfolio.save()
+                return
 
+    # ── Natural end of session ───────────────────────────────────────
+    _sell_all_gems(portfolio)
     print(f"\n{'='*60}")
     print(f"  COMPLETE -- {sim_id}")
     portfolio.print_status()
     display_results(sim_id, portfolio)
     portfolio.save()
+
+
+def _sell_all_gems(portfolio):
+    """Sell all open positions at end of session or Ctrl+C.
+    portfolio.sell() calls executor.on_sell() internally — no double execution."""
+    open_pos = [(k, v) for k, v in portfolio.holdings.items()
+                if not v.get('is_real')]
+    if not open_pos:
+        print("  No open positions to close.")
+        return
+    print(f"\n  🔚 Closing {len(open_pos)} open position(s)...")
+    for key, pos in open_pos:
+        sym      = pos['symbol']
+        chain    = pos['chain']
+        contract = pos.get('coin_id', '') or pos.get('contract', '')
+        price    = resolve_price(sym, coin_id=contract, chain=chain)
+        if price <= 0:
+            price = pos.get('_last_price', pos.get('buy_price', 0))
+        pnl_pct  = ((price - pos['buy_price']) / pos['buy_price'] * 100
+                    if pos.get('buy_price') else 0)
+        # portfolio.sell() calls executor.on_sell() internally — one execution only
+        ok, msg  = portfolio.sell(sym, chain, price, reason='end_of_session')
+        arrow    = '📈' if pnl_pct >= 0 else '📉'
+        print(f"    {arrow} {'OK' if ok else 'FAIL'} {sym} ({chain}) {pnl_pct:+.1f}% | {msg}")
 
 
 # ── Results display ───────────────────────────────────────────────────────────
@@ -1402,21 +1914,35 @@ def display_results(sim_id=None, portfolio=None):
     print(f"  {d} Trading: ${total_in:.2f} -> ${total_now:.2f} = ${total_pnl:+.2f} ({pct:+.1f}%)")
     print(f"  Win rate: {wins}W / {losses}L = {wins/max(wins+losses,1)*100:.0f}%")
 
-    print(f"\n  Real Portfolio (vs T=0 session start):")
+    print(f"\n  Real Portfolio (vs session start):")
     real_total = real_pnl = 0
-    # Use portfolio T=0 snapshot if available, else entry_price
+    BINANCE_IDS = {'LINK':'LINKUSDT','ETH':'ETHUSDT','SOL':'SOLUSDT',
+                   'BTC':'BTCUSDT','AAVE':'AAVEUSDT','UNI':'UNIUSDT'}
     t0 = getattr(portfolio, 't0_prices', {}) if portfolio else {}
     for chain, plist in REAL_PORTFOLIO.items():
         for pos in plist:
-            p_now = resolve_price(pos['symbol'], pos['coin_id'], chain)
+            sym = pos['symbol']
+            # Force fresh price — bypass cache
+            p_now = 0
+            try:
+                if sym in BINANCE_IDS:
+                    r = requests.get(
+                        f'https://api.binance.com/api/v3/ticker/price?symbol={BINANCE_IDS[sym]}',
+                        timeout=5)
+                    if r.status_code == 200:
+                        p_now = float(r.json().get('price', 0) or 0)
+            except Exception:
+                pass
+            if not p_now:
+                p_now = resolve_price(sym, pos['coin_id'], chain, use_cache=False)
             p_now = p_now or pos['entry_price']
-            p_ref = t0.get(pos['symbol'], pos['entry_price'])  # T=0 or entry
+            p_ref = t0.get(sym, pos['entry_price'])
             val = pos['amount'] * p_now
             pnl_r = (p_now - p_ref) * pos['amount']
             real_total += val
             real_pnl += pnl_r
             d = 'UP' if pnl_r >= 0 else 'DN'
-            print(f"    {d} {pos['symbol']:<6} ${p_ref:.2f}->${p_now:.2f} "
+            print(f"    {d} {sym:<6} ${p_ref:.2f}->${p_now:.2f} "
                   f"x{pos['amount']} = ${val:,.2f} ({pnl_r:+.2f})")
     print(f"  Real portfolio total: ${real_total:,.2f} (session pnl: ${real_pnl:+.2f})")
     print(f"{'='*65}\n")
@@ -1430,8 +1956,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AlphaScope Simulator v2.1')
     parser.add_argument('--hours',       type=float, default=6)
     parser.add_argument('--cycle',       type=int,   default=5)
-    parser.add_argument('--stop-loss',   type=float, default=-30)
-    parser.add_argument('--take-profit', type=float, default=150)
+    parser.add_argument('--stop-loss',   type=float, default=STOP_LOSS_PCT)
+    parser.add_argument('--take-profit', type=float, default=TAKE_PROFIT_PCT)
     parser.add_argument('--test',        action='store_true')
     parser.add_argument('--results',     action='store_true')
     args = parser.parse_args()

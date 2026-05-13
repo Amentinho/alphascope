@@ -215,7 +215,10 @@ def _load_all_candidates():
     Pull investment candidates from ALL AlphaScope intelligence sources.
     Returns list of dicts with unified fields.
     """
-    import pandas as pd
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = None
     candidates = {}  # keyed by symbol to dedup
 
     conn = get_db()
@@ -488,322 +491,251 @@ def _load_all_candidates():
 
 def evaluate_signals():
     """
-    Unified signal evaluation across ALL intelligence sources.
-    Returns prioritised list of proposed trades.
+    Unified signal evaluation — reads dex_gems + signals tables directly.
+    Returns a prioritised list of proposed trades with correct per-chain sizing.
     """
-    init_agent_tables()
-    mode = get_config('mode', 'PAPER')
-    enabled = get_config('enabled', 'false') == 'true'
-    min_conf = int(get_config('min_signal_confidence', str(MIN_SIGNAL_CONFIDENCE)))
-    daily_pnl = get_daily_pnl()
+    import sqlite3 as _sq
+    MAIN_DB = 'alphascope.db'
 
-    if daily_pnl <= -float(get_config('daily_loss_limit_usd', str(DAILY_LOSS_LIMIT_USD))):
-        print(f"  Agent: daily loss limit hit (${daily_pnl:.0f}) — pausing all trades")
-        return []
-
-    candidates = _load_all_candidates()
-    if not candidates:
-        return []
-
-    # Security check — filter out hacked tokens
-    try:
-        from security_monitor import get_security_flags
-        for sym in list(candidates.keys()):
-            c = candidates[sym]
-            sec = get_security_flags(coin_id=c['coin_id'], protocol_name=sym)
-            if sec.get('hacked') and not sec.get('resolved') and sec.get('amount_usd', 0) >= 100_000:
-                c['signal'] = 'SELL' if c['is_holding'] else 'AVOID'
-                c['confidence'] = 95
-                days = sec.get('days_ago', 0)
-                amt = sec.get('amount_usd', 0)
-                c['reasons'] = [f'HACKED {days}d ago (${amt/1e6:.1f}M) — unresolved']
-                c['alpha_score'] = 0
-    except ImportError:
-        pass
-
-    # Sort by alpha_score descending
-    sorted_candidates = sorted(candidates.values(), key=lambda x: -x['alpha_score'])
-
-    # Debug: log SOL/BSC candidates before filtering
-    sol_cands = [c for c in sorted_candidates if c.get('chain') in ('solana','bsc')]
-    if sol_cands:
-        print("    [agent] SOL/BSC: " + ", ".join(
-            f"{c['symbol']}(a:{c['alpha_score']},s:{c['signal']},c:{c['confidence']})"
-            for c in sol_cands[:6]))
+    # Supported chains for DEX gems — ETH mainnet excluded (gas too high for $2 trades)
+    # ETH mainnet only used for established tokens (LINK/AAVE/UNI) via token_intelligence
+    SUPPORTED_CHAINS = {'solana', 'base'}
+    CHAIN_CAPS = {'solana': 1, 'base': 2}
+    LIQ_MIN    = {'solana': 20_000, 'base': 30_000}
+    MAJORS = {'BTC','ETH','SOL','BNB','XRP','ADA','DOGE','SHIB','AVAX',
+              'USDT','USDC','DAI','WBTC','WETH','WSOL'}
+    # Block obvious scam/meme names that consistently rug
+    SCAM_NAMES = {'ELON','TRUMP','MAGA','PEPE2','SAFEMOON','SQUID','RUG',
+                  'SCAM','FAKE','PONZI','NUDE','PORN','PENIS','RAPE',
+                  'NAZI','HITLER','ISIS','NIGGA','NIGGER'}
 
     proposals = []
-    seen_symbols = set()
+    seen = set()
 
-    for c in sorted_candidates:
-        sym = c['symbol']
-        if sym in seen_symbols:
-            continue
-        seen_symbols.add(sym)
+    # Load ban list once
+    banned_syms = set()
+    try:
+        import json as _j
+        for entry in _j.load(open('sim_ban_list.json')):
+            key = entry.split('|')[0]
+            banned_syms.add(key.split('_')[0])
+    except Exception:
+        pass
 
-        signal = c['signal']
-        confidence = c['confidence']
-        alpha_score = c['alpha_score']
-        chain = c.get('chain', 'ethereum')
-        is_holding = c.get('is_holding', False)
-        price = c.get('price_usd', 0)
-        amount = c.get('current_amount', 0)
-        position_value = price * amount
+    try:
+        conn = _sq.connect(MAIN_DB, timeout=10)
 
-        # Skip low confidence
-        if confidence < min_conf and signal not in ('SELL',):
-            if chain in ('solana', 'bsc'):
-                print(f"    [agent] SKIP {sym}({chain}): conf {confidence} < {min_conf}")
-            continue
+        # ── 1. DEX gems — primary source ─────────────────────────────────────
+        try:
+            rows = conn.execute("""
+                SELECT symbol, chain, contract_address, dex_url, price_usd,
+                       liquidity_usd, age_hours, cross_score, price_change_24h
+                FROM dex_gems
+                WHERE fetched_at >= datetime('now', '-24 hours')
+                AND cross_score >= 4
+                ORDER BY cross_score DESC, liquidity_usd DESC
+                LIMIT 40
+            """).fetchall()
+            for sym, chain, contract, dex_url, price_db, liq, age, score, chg_24h in rows:
+                sym = sym.upper()
+                chain = (chain or 'solana').lower()
+                # Drop unsupported chains, majors, scams, already-seen, banned
+                if chain not in SUPPORTED_CHAINS:
+                    continue
+                if sym in MAJORS or sym in SCAM_NAMES or sym in banned_syms or sym in seen:
+                    continue
+                # Drop obvious scam patterns in the name
+                if any(s in sym for s in ('ELON','TRUMP','MAGA','SAFE','SQUID')):
+                    continue
+                liq = liq or 0
+                if liq < LIQ_MIN.get(chain, 30_000):
+                    continue
+                chg_24h = float(chg_24h or 0)
+                if chg_24h < -80:
+                    continue  # already rugged
+                seen.add(sym)
+                trade_usd = CHAIN_CAPS.get(chain, 2)
+                alpha = min(100, int(score or 0) * 12 + 20)
+                proposals.append({
+                    'action': 'BUY',
+                    'symbol': sym,
+                    'coin_id': contract or dex_url or sym.lower(),
+                    'chain': chain,
+                    'trade_usd': trade_usd,
+                    'alpha_score': alpha,
+                    'confidence': 70,
+                    'reasons': f"DEX liq:${liq/1000:.0f}k age:{age:.0f}h score:{score}",
+                    'sources': 'dex_gems',
+                    'category': 'DEX_GEM',
+                    'price_change_24h': chg_24h,
+                    'age_hours': float(age or 99),
+                    'liquidity_usd': liq,
+                })
+        except Exception as e:
+            print(f"    [agent] dex_gems error: {e}")
 
-        # Skip AVOID signals (hacked non-holdings)
-        if signal == 'AVOID':
-            continue
-
-        # Symbol sanity check — skip non-ASCII, too long, or scam patterns
-        if not sym.isascii() or len(sym) > 10:
-            continue
-        SCAM_PATTERNS = ['SAFEMOON', 'SQUID', 'ELON', 'SCAM', 'RUG']
-        if any(s in sym for s in SCAM_PATTERNS):
-            continue
-
-        # Determine action and trade size
-        if signal == 'SELL' and is_holding:
-            action = 'SELL'
-            trade_usd = position_value
-        elif signal == 'REDUCE' and is_holding:
-            action = 'REDUCE'
-            trade_usd = position_value * 0.5
-        elif signal in ('BUY', 'ACCUMULATE') and is_holding:
-            action = 'ACCUMULATE'
-            trade_usd = min(MAX_POSITION_USD, max(50, position_value * 0.25))
-        elif signal in ('BUY', 'ACCUMULATE') and not is_holding and alpha_score >= 68:
-            action = 'BUY'
-            # Size based on alpha score + chain gas awareness
-            base_size = min(MAX_POSITION_USD, max(25, alpha_score * 3))
-            # ETH mainnet: size based on live gas cost
-            if chain == 'ethereum':
-                try:
-                    from portfolio import get_eth_gas_usd
-                    live_gas = get_eth_gas_usd()
-                    # Min position so gas is < 5%
-                    min_eth = max(200, live_gas / 0.05)
-                except Exception:
-                    min_eth = 200
-                trade_usd = max(min_eth, base_size)
-            else:
-                trade_usd = base_size
-        elif not is_holding and alpha_score >= 75:
-            action = 'BUY'
-            trade_usd = min(MAX_POSITION_USD, max(25, alpha_score * 2))
-        else:
-            continue
-
-        if trade_usd < 10:
-            continue
-
-        # Liquidity check for DEX gems — don't buy illiquid tokens
-        liq = c.get('liquidity_usd', 0)
-        if c.get('category') == 'DEX_GEM' and action == 'BUY':
-            # Chain-specific liquidity thresholds
-            # SOL/BSC: low gas so lower liq OK
-            # ETH/BASE: high gas needs real liquidity
-            liq_min = {
-                'solana':   20_000,
-                'bsc':      25_000,
-                'base':     30_000,
-                'arbitrum': 30_000,
-                'ethereum': 40_000,  # lowered — avg ETH gem is $46k
-            }.get(chain, 30_000)
-            liq_watch = liq_min * 1.5
-            if liq < liq_min:
-                continue  # skip — too illiquid for this chain
-            elif liq < liq_watch:
-                trade_usd = min(trade_usd, 25)  # small position for marginal liq
-
-        # Token validation — block BUY for unvalidated or failed gems
-        if action == 'BUY' and not is_holding:
-            try:
-                import sqlite3 as _sq
-                _vc = _sq.connect('alphascope.db', timeout=10)
-                _vcur = _vc.cursor()
-                # Check by contract_address OR symbol
-                _contract = c.get('contract_address', '')
-                if _contract:
-                    _vcur.execute("SELECT verdict, total_score FROM token_validation "
-                                  "WHERE contract_address=? AND chain=? "
-                                  "AND cached_at >= datetime('now','-2 hours')",
-                                  (_contract, chain))
-                else:
-                    _vcur.execute("SELECT verdict, total_score FROM token_validation "
-                                  "WHERE UPPER(symbol)=UPPER(?) AND chain=? "
-                                  "AND cached_at >= datetime('now','-2 hours')",
-                                  (sym, chain))
-                _vrow = _vcur.fetchone()
-                _vc.close()
-                if _vrow:
-                    verdict, val_score = _vrow
-                    if verdict == 'AVOID':
-                        proposals.append({'action':'SKIP','symbol':sym,
-                                          'category':c.get('category',''),
-                                          'reason':f'VALIDATION FAILED — AVOID (score:{val_score}/20)',
-                                          'trade_usd':trade_usd,'alpha_score':0})
+        # ── 2. Exchange listing signals (Tier 2: KuCoin/Gate/MEXC/OKX) ───────
+        try:
+            rows2 = conn.execute("""
+                SELECT coin, source_detail, engagement
+                FROM signals
+                WHERE source='exchange' AND signal_type='LISTING'
+                AND fetched_at >= datetime('now', '-4 hours')
+                AND engagement >= 100
+                ORDER BY engagement DESC LIMIT 8
+            """).fetchall()
+            for coin, exchange_detail, priority in rows2:
+                if not coin:
+                    continue
+                for sym in coin.split(','):
+                    sym = sym.strip().upper()
+                    if not sym or sym in MAJORS or sym in SCAM_NAMES or sym in banned_syms or sym in seen:
                         continue
-                    elif verdict == 'WATCH':
-                        trade_usd = min(trade_usd, 25)
-                        c['reasons'].append(f'WATCH val:{val_score}/20')
-                    elif verdict == 'CAUTION':
-                        # For SOL memes: require LP burned for CAUTION
-                        if chain == 'solana':
-                            try:
-                                _lp = _vc.execute(
-                                    'SELECT lp_burned FROM token_validation '
-                                    'WHERE contract_address=? AND chain=?',
-                                    (_contract, chain)).fetchone()
-                                if _lp and not _lp[0]:
-                                    trade_usd = min(trade_usd, 25)  # LP not burned -- tiny position
-                                    c['reasons'].append('CAUTION: LP not burned')
-                                else:
-                                    trade_usd = min(trade_usd, 75)
-                            except Exception:
-                                trade_usd = min(trade_usd, 50)
-                        else:
-                            trade_usd = min(trade_usd, 75)
-                        c['reasons'].append(f'CAUTION val:{val_score}/20')
-                    # BUY_OK: full size, no cap
-                else:
-                    # Not validated — run quick check now
-                    _contract = c.get('contract_address', '')
-                    if _contract and get_config('mode', 'PAPER') == 'PAPER':
-                        try:
-                            from token_validator import validate_token, init_validation_table
-                            init_validation_table()
-                            _vr = validate_token(
-                                symbol=sym,
-                                contract_address=_contract,
-                                chain=chain,
-                                use_ai=False,  # fast check only
-                            )
-                            if _vr.get('verdict') == 'AVOID':
-                                proposals.append({'action':'SKIP','symbol':sym,
-                                                  'category':c.get('category',''),
-                                                  'reason':'AVOID — honeypot/scam detected',
-                                                  'trade_usd':trade_usd,'alpha_score':0})
-                                continue
-                            elif _vr.get('verdict') in ('WATCH','CAUTION'):
-                                trade_usd = min(trade_usd, 50)
-                                c['reasons'].append(f"{_vr['verdict']} val:{_vr['total_score']}/20")
-                        except Exception:
-                            trade_usd = min(trade_usd, 25)
-                            c['reasons'].append('unvalidated — capped $25')
-                    else:
-                        trade_usd = min(trade_usd, 25)
-                        c['reasons'].append('unvalidated — capped $25')
-            except Exception:
-                pass
+                    seen.add(sym)
+                    proposals.append({
+                        'action': 'BUY',
+                        'symbol': sym,
+                        'coin_id': '',
+                        'chain': 'solana',
+                        'trade_usd': CHAIN_CAPS['solana'],
+                        'alpha_score': min(90, 50 + int(priority or 0) // 4),
+                        'confidence': 65,
+                        'reasons': f"Listing: {exchange_detail}",
+                        'sources': 'exchange_listing',
+                        'category': 'LISTING',
+                        'price_change_24h': 0,
+                        'age_hours': 0,
+                        'liquidity_usd': 0,
+                    })
+        except Exception as e:
+            print(f"    [agent] listings error: {e}")
 
-        # Social signal boost/block for DEX gems
-        if c.get('category') == 'DEX_GEM' and action in ('BUY', 'WATCH'):
-            try:
-                from social_monitor import get_social_signal
-                import sqlite3 as _sq2
-                # For SOL memes: only act if signal is fresh (< 15 min)
-                if chain in ('solana', 'bsc'):
-                    _sc = _sq2.connect('alphascope.db', timeout=10)
-                    _sr = _sc.execute(
-                        '''SELECT cached_at FROM token_social_cache
-                           WHERE symbol=? AND chain=?
-                           ORDER BY cached_at DESC LIMIT 1''',
-                        (sym, chain)).fetchone()
-                    _sc.close()
-                    if _sr:
-                        from datetime import datetime
-                        age_min = (datetime.now() - datetime.fromisoformat(_sr[0])).seconds / 60
-                        if age_min > 360:
-                            continue  # signal too stale (> 6h)
-                social = get_social_signal(sym, chain)
-                if social:
-                    sig = social.get('signal', 'NEUTRAL')
-                    sent = social.get('sentiment', 0)
-                    velocity = social.get('velocity', 'UNKNOWN')
-                    if sig == 'STRONG_BUY' and velocity == 'ACCELERATING':
-                        trade_usd = min(MAX_POSITION_USD, trade_usd * 1.5)  # size up
-                        confidence = min(90, confidence + 15)
-                        c['reasons'].append(f'social STRONG_BUY accelerating')
-                    elif sig in ('SELL', 'WATCH_OUT') or sent < -0.3:
-                        action = 'SKIP'
-                        proposals.append({'action':'SKIP','symbol':sym,'category':c.get('category',''),
-                                          'reason':f'social signal {sig} (sent:{sent:+.2f})',
-                                          'trade_usd':trade_usd,'alpha_score':alpha_score})
+        conn.close()
+    except Exception as e:
+        print(f"    [agent] DB error: {e}")
+
+    # Sort by alpha_score descending
+    proposals.sort(key=lambda x: -x.get('alpha_score', 0))
+
+    # Debug summary — SOL/BASE only (BSC removed)
+    sol_base = [p for p in proposals if p.get('chain') in ('solana', 'base')]
+    if sol_base:
+        print("    [agent] SOL/BASE: " + ", ".join(
+            f"{p['symbol']}(a:{p['alpha_score']},s:BUY,c:{p['confidence']})"
+            for p in sol_base[:6]))
+
+    return proposals[:20]  # cap at 20
+
+    proposals = []
+    seen = set()
+
+    # Load ban list once
+    banned_syms = set()
+    try:
+        import json as _j
+        for entry in _j.load(open('sim_ban_list.json')):
+            key = entry.split('|')[0]
+            banned_syms.add(key.split('_')[0])
+    except Exception:
+        pass
+
+    try:
+        conn = _sq.connect(MAIN_DB, timeout=10)
+
+        # ── 1. DEX gems — primary source ─────────────────────────────────────
+        try:
+            rows = conn.execute("""
+                SELECT symbol, chain, contract_address, dex_url, price_usd,
+                       liquidity_usd, age_hours, cross_score, price_change_24h
+                FROM dex_gems
+                WHERE fetched_at >= datetime('now', '-24 hours')
+                AND cross_score >= 4
+                ORDER BY cross_score DESC, liquidity_usd DESC
+                LIMIT 30
+            """).fetchall()
+            for sym, chain, contract, dex_url, price_db, liq, age, score, chg_24h in rows:
+                sym = sym.upper()
+                chain = (chain or 'solana').lower()
+                if sym in MAJORS or sym in banned_syms or sym in seen:
+                    continue
+                liq = liq or 0
+                if liq < LIQ_MIN.get(chain, 30_000):
+                    continue
+                chg_24h = float(chg_24h or 0)
+                if chg_24h < -80:
+                    continue  # already rugged
+                seen.add(sym)
+                trade_usd = CHAIN_CAPS.get(chain, 2)
+                alpha = min(100, int(score or 0) * 12 + 20)
+                proposals.append({
+                    'action': 'BUY',
+                    'symbol': sym,
+                    'coin_id': contract or dex_url or sym.lower(),
+                    'chain': chain,
+                    'trade_usd': trade_usd,
+                    'alpha_score': alpha,
+                    'confidence': 70,
+                    'reasons': f"DEX liq:${liq/1000:.0f}k age:{age:.0f}h score:{score}",
+                    'sources': 'dex_gems',
+                    'category': 'DEX_GEM',
+                    'price_change_24h': chg_24h,
+                    'age_hours': float(age or 99),
+                    'liquidity_usd': liq,
+                })
+        except Exception as e:
+            print(f"    [agent] dex_gems error: {e}")
+
+        # ── 2. Exchange listing signals (Tier 2: KuCoin/Gate/MEXC/OKX) ───────
+        try:
+            rows2 = conn.execute("""
+                SELECT coin, source_detail, engagement
+                FROM signals
+                WHERE source='exchange' AND signal_type='LISTING'
+                AND fetched_at >= datetime('now', '-4 hours')
+                AND engagement >= 100
+                ORDER BY engagement DESC LIMIT 8
+            """).fetchall()
+            for coin, exchange_detail, priority in rows2:
+                if not coin:
+                    continue
+                for sym in coin.split(','):
+                    sym = sym.strip().upper()
+                    if not sym or sym in MAJORS or sym in banned_syms or sym in seen:
                         continue
-            except ImportError:
-                pass
+                    seen.add(sym)
+                    proposals.append({
+                        'action': 'BUY',
+                        'symbol': sym,
+                        'coin_id': '',
+                        'chain': 'solana',
+                        'trade_usd': CHAIN_CAPS['solana'],
+                        'alpha_score': min(90, 50 + int(priority or 0) // 4),
+                        'confidence': 65,
+                        'reasons': f"Listing: {exchange_detail}",
+                        'sources': 'exchange_listing',
+                        'category': 'LISTING',
+                        'price_change_24h': 0,
+                        'age_hours': 0,
+                        'liquidity_usd': 0,
+                    })
+        except Exception as e:
+            print(f"    [agent] listings error: {e}")
 
-        if action == 'WATCH' and trade_usd == 0:
-            continue  # pure watch — no trade
+        conn.close()
+    except Exception as e:
+        print(f"    [agent] DB error: {e}")
 
-        # Gas check
-        # Use live gas for ETH, static for others
-        if chain == 'ethereum':
-            try:
-                from portfolio import get_eth_gas_usd
-                gas = get_eth_gas_usd()
-            except Exception:
-                gas = estimate_gas_price(chain)
-        else:
-            gas = estimate_gas_price(chain)
-        gas_pct = (gas / trade_usd * 100) if trade_usd > 0 else 100
+    # Sort by alpha_score descending
+    proposals.sort(key=lambda x: -x.get('alpha_score', 0))
 
-        if gas > float(get_config('max_gas_usd', str(MAX_GAS_USD))) and action != 'SELL':
-            proposals.append({
-                'action': 'SKIP', 'symbol': sym, 'category': c.get('category', ''),
-                'reason': f'gas ${gas:.2f} exceeds limit ${MAX_GAS_USD}',
-                'trade_usd': trade_usd, 'alpha_score': alpha_score,
-            })
-            continue
+    # Debug summary
+    sol_base = [p for p in proposals if p.get('chain') in ('solana', 'base', 'bsc')]
+    if sol_base:
+        print("    [agent] SOL/BASE: " + ", ".join(
+            f"{p['symbol']}(a:{p['alpha_score']},s:BUY,c:{p['confidence']})"
+            for p in sol_base[:6]))
 
-        # For small CAUTION positions ($50), allow higher gas % threshold
-        gas_limit_pct = 20 if trade_usd <= 50 else 8
-        if gas_pct > gas_limit_pct and action not in ('SELL', 'REDUCE'):
-            proposals.append({
-                'action': 'SKIP', 'symbol': sym, 'category': c.get('category', ''),
-                'reason': f'gas {gas_pct:.0f}% of trade — use L2 or wait',
-                'trade_usd': trade_usd, 'alpha_score': alpha_score,
-            })
-            continue
-
-        reasons_str = ' | '.join(c['reasons'][:3])
-        sources_str = ','.join(set(c['sources']))
-
-        proposals.append({
-            'action': action,
-            'symbol': sym,
-            'coin_id': c.get('coin_id', sym.lower()),
-            'chain': chain,
-            'category': c.get('category', 'UNKNOWN'),
-            'trade_usd': round(trade_usd, 2),
-            'price_usd': price,
-            'gas_usd': round(gas, 2),
-            'confidence': confidence,
-            'alpha_score': alpha_score,
-            'reasons': reasons_str,
-            'sources': sources_str,
-            'is_holding': is_holding,
-            'url': c.get('url', c.get('dex_url', '')),
-            'mode': mode,
-            'executable': enabled and mode == 'LIVE',
-        })
-
-        if len(proposals) >= 20:  # cap proposals list
-            break
-
-    # Sort final list: SELL first (risk management), then by alpha_score
-    proposals.sort(key=lambda x: (
-        0 if x['action'] == 'SELL' else 1 if x['action'] == 'REDUCE' else 2,
-        -x.get('alpha_score', 0)
-    ))
-
-    return proposals
-
+    return proposals[:20]  # cap at 20
 
 
 def get_daily_pnl():
@@ -891,7 +823,10 @@ def get_airdrop_actions():
     """
     try:
         conn = get_db()
-        import pandas as pd
+        try:
+            import pandas as pd
+        except ImportError:
+            pd = None
         df = pd.read_sql_query(
             """SELECT project_name, qualification_steps, effort_level,
                       cost_estimate, deadline, legitimacy_score

@@ -159,6 +159,62 @@ def _find_related_channels(channel: str) -> list:
         return []
 
 
+
+
+def seed_known_telegram_channels():
+    """Pre-seed DB with known high-quality crypto Telegram channels.
+    Runs on first call only (skips if already seeded)."""
+    KNOWN_CHANNELS = [
+        # Whale alerts / on-chain
+        ('lookonchain',    'whale',   50000),
+        ('spotonchain',    'whale',   30000),
+        ('wublock',        'whale',   20000),
+        # News
+        ('cointelegraph',  'news',    500000),
+        ('DecryptMedia',   'news',    100000),
+        ('theblockres',    'news',    80000),
+        ('bitcoinmagazine','news',    200000),
+        # Signals / alpha
+        ('FatPigSignals',  'signals', 40000),
+        ('CryptoSignalHub','signals', 30000),
+        # DeFi
+        ('HyperliquidX',   'defi',    50000),
+        ('GMXio',          'defi',    30000),
+        ('AaveAave',       'defi',    40000),
+        ('JupiterExchange','defi',    60000),
+        # SOL ecosystem
+        ('raydiumprotocol','solana',  40000),
+        ('JitoLabs',       'solana',  20000),
+        # BASE
+        ('Aerodrome_Finance','base',  15000),
+        # Airdrops
+        ('AirdropAlert',   'airdrop', 100000),
+        ('AirdropBob',     'airdrop', 50000),
+        ('CryptoAirdropsOfficial','airdrop',80000),
+        # Macro
+        ('glassnode',      'macro',   60000),
+        ('coinmetrics',    'macro',   40000),
+        # Meme / DEX
+        ('dexscreener',    'dex',     100000),
+        ('pepecoineth',    'meme',    30000),
+    ]
+    conn = get_db()
+    already = conn.execute("SELECT COUNT(*) FROM telegram_sources WHERE status='ACTIVE'").fetchone()[0]
+    if already >= 10:
+        conn.close()
+        return  # already seeded
+    now = datetime.now().isoformat()
+    for channel, category, members in KNOWN_CHANNELS:
+        conn.execute("""
+            INSERT OR IGNORE INTO telegram_sources
+            (channel, category, status, members, validated_at, last_checked, added_to_fetcher)
+            VALUES (?, ?, 'ACTIVE', ?, ?, ?, 0)
+        """, (channel, category, members, now, now))
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM telegram_sources WHERE status='ACTIVE'").fetchone()[0]
+    conn.close()
+    print(f"  📡 Seeded {count} Telegram channels")
+
 def discover_telegram_channels(max_new=50):
     """
     BFS discovery: start from seed channels, find cross-references,
@@ -257,7 +313,7 @@ def discover_reddit_subs(max_new=100):
                 continue
 
             data = r.json().get('data', {})
-            subs = data.get('subscribers', 0)
+            subs = data.get('subscribers') or 0  # API returns None sometimes
 
             # Get related subs from sidebar
             r2 = requests.get(
@@ -281,7 +337,7 @@ def discover_reddit_subs(max_new=100):
                 for item in results:
                     sub_data = item.get('data', {})
                     name = sub_data.get('display_name', '')
-                    subscribers = sub_data.get('subscribers', 0)
+                    subscribers = sub_data.get('subscribers') or 0  # API returns None
                     desc = (sub_data.get('public_description', '') or '').lower()
 
                     if not name or subscribers < MIN_REDDIT_SUBSCRIBERS:
@@ -300,7 +356,7 @@ def discover_reddit_subs(max_new=100):
                            VALUES (?,?,?,?,?)""",
                         (name, subscribers,
                          'VALIDATED' if subscribers > MIN_REDDIT_SUBSCRIBERS else 'REJECTED',
-                         min(10, subscribers // 100000), now))
+                         min(10, (subscribers or 0) // 100000), now))
                     conn.commit()
                     validated += 1
 

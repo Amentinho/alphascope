@@ -156,16 +156,31 @@ def alert_new_airdrop_signals():
             rows = []
 
         # Also check pre-launch gems
-        pre_rows = main_conn.execute("""
-            SELECT project_name, chain, score, status, website_url,
-                   contract_address, presale_link, description
-            FROM pre_launch_gems
-            WHERE score >= ?
-            AND status IN ('presale', 'Presale', 'PRESALE', 'upcoming')
-            AND detected_at >= datetime('now', '-48 hours')
-            ORDER BY score DESC
-            LIMIT 10
-        """, (MIN_PRESALE_SCORE,)).fetchall() if _table_exists(main_conn, 'pre_launch_gems') else []
+        pre_rows = []
+        if _table_exists(main_conn, 'pre_launch_gems'):
+            try:
+                pre_rows = main_conn.execute("""
+                    SELECT project_name,
+                           COALESCE(chain, blockchain, network, '?') as chain,
+                           score, status, website_url,
+                           contract_address, presale_link, description
+                    FROM pre_launch_gems
+                    WHERE score >= ?
+                    AND status IN ('presale', 'Presale', 'PRESALE', 'upcoming')
+                    AND detected_at >= datetime('now', '-48 hours')
+                    ORDER BY score DESC
+                    LIMIT 10
+                """, (MIN_PRESALE_SCORE,)).fetchall()
+            except Exception as _pq:
+                # Table exists but schema differs — try minimal query
+                try:
+                    pre_rows = main_conn.execute(
+                        "SELECT project_name, '?' as chain, score, status, "
+                        "website_url, contract_address, presale_link, description "
+                        "FROM pre_launch_gems WHERE score >= ? LIMIT 10",
+                        (MIN_PRESALE_SCORE,)).fetchall()
+                except Exception:
+                    pre_rows = []
 
         main_conn.close()
     except Exception as e:
@@ -357,6 +372,22 @@ def start_hunter_thread(interval_minutes=60):
 
 
 # ── Standalone run ────────────────────────────────────────────────────────────
+def scan_airdrops():
+    """Scan for airdrop opportunities — reads from DB signals and project_watchlist."""
+    try:
+        alert_new_airdrop_signals()
+    except Exception as e:
+        print(f"  airdrop scan error: {e}")
+
+
+def scan_presales():
+    """Scan for presale opportunities — reads from pre_launch_gems table."""
+    try:
+        alert_new_airdrop_signals()  # reuses same signal path for presales
+    except Exception as e:
+        print(f"  presale scan error: {e}")
+
+
 if __name__ == '__main__':
     print("\n=== AlphaScope Opportunity Hunter ===")
     print(f"  Scanning airdrops (min score: {MIN_AIRDROP_SCORE})")
