@@ -386,10 +386,6 @@ class SimPortfolio:
         # Snapshot real wallet balances at T=0
         self.wallet_balances = self._snapshot_wallet_balances()
         self.wallet_balances_t0 = dict(self.wallet_balances)
-        if self.wallet_balances:
-            live = sum(b['usd'] for b in self.wallet_balances.values())
-            if live > 10:
-                self.starting_real = live
 
     def _snapshot_wallet_balances(self) -> dict:
         """Get real on-chain wallet balances. Called at start and after each tx."""
