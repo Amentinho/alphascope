@@ -6,10 +6,30 @@ Searches crypto cashtags on X and analyzes sentiment.
 import requests
 import sqlite3
 import time
+import os
 from datetime import datetime
 
-TWITTER_API_KEY = "new1_1597ef833361479ba82c88ff32b2fb8c"
-CASHTAGS = ['$BTC', '$ETH', '$SOL', '$LINK', '$ARB', '$SUI', '$DOGE', '$AVAX']
+def _env(key, default=''):
+    val = os.environ.get(key, '')
+    if val:
+        return val
+    try:
+        with open('.env') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f'{key}='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
+
+TWITTER_API_KEY = _env('TWITTER_API_KEY', '')
+
+try:
+    from token_intelligence import TRACKED_TOKENS
+    CASHTAGS = [f'${sym}' for sym in TRACKED_TOKENS.keys()]
+except Exception:
+    CASHTAGS = ['$BTC', '$ETH', '$SOL', '$LINK', '$ARB', '$SUI', '$DOGE', '$AVAX']
 
 POSITIVE = ['bull', 'moon', 'pump', 'buy', 'long', 'breakout', 'surge', 'rally', 'green', 'up', 'ath', 'accumulate', 'bullish', 'send it', 'lets go']
 NEGATIVE = ['bear', 'dump', 'sell', 'short', 'crash', 'drop', 'red', 'down', 'rekt', 'scam', 'rug', 'bearish', 'dead', 'over']
@@ -57,6 +77,9 @@ def save_sentiment(cashtag, tweet_count, avg_likes, engagement, score, label, bu
 def fetch_x_sentiment():
     """Fetch and analyze X sentiment for all monitored cashtags."""
     init_x_tables()
+    if not TWITTER_API_KEY:
+        print("  X/Twitter sentiment skipped — set TWITTER_API_KEY in .env")
+        return
     print("  Fetching X/Twitter sentiment...")
     now = datetime.now().isoformat()
 

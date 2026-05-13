@@ -96,7 +96,16 @@ AIRDROP_SUBS = [
     'arbitrum','optimismCollective','starknet','zkSync',
 ]
 
-TWITTER_API_KEY = "new1_1597ef833361479ba82c88ff32b2fb8c"
+TWITTER_API_KEY = os.environ.get('TWITTER_API_KEY', '')
+try:
+    if not TWITTER_API_KEY:
+        with open('.env') as _env_file:
+            for _line in _env_file:
+                if _line.strip().startswith('TWITTER_API_KEY='):
+                    TWITTER_API_KEY = _line.split('=', 1)[1].strip()
+                    break
+except Exception:
+    pass
 CASHTAGS = [
     # Majors
     '$BTC','$ETH','$SOL','$BNB','$XRP','$DOGE','$AVAX','$NEAR',

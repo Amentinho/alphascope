@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 def _load_config():
     """Load API keys and feature flags from .env"""
     config = {
-        'twitter_key': 'new1_1597ef833361479ba82c88ff32b2fb8c',
+        'twitter_key': '',
         'twitter_enabled': False,
         'openai_key': '',
     }

@@ -205,6 +205,27 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True):
 SIM_DB = 'sim.db'      # sim writes here (no contention with fetcher)
 MAIN_DB = 'alphascope.db'  # read-only: prices, dex_gems, signals
 
+
+def _env(key, default=''):
+    val = os.environ.get(key, '')
+    if val:
+        return val
+    try:
+        with open('.env') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f'{key}='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
+
+
+MIN_WATCHLIST_SEEN = int(_env('SIM_MIN_WATCHLIST_SEEN', '2'))
+MIN_WATCHLIST_AGE_MIN = float(_env('SIM_MIN_WATCHLIST_AGE_MIN', '5'))
+ENABLE_AI_RISK_VETO = _env('ENABLE_AI_RISK_VETO', 'false').lower().strip() == 'true'
+AI_MIN_TOTAL_SCORE = int(_env('AI_MIN_TOTAL_SCORE', '16'))
+
 # ── Single-writer DB queue ─────────────────────────────────────────────────────
 import queue as _queue
 _db_write_queue = _queue.Queue()
@@ -1090,6 +1111,35 @@ def _load_listing_proposals(portfolio):
 
 
 
+def _established_curve(binance_pair):
+    """Multi-timeframe Binance curve for established-token entries."""
+    try:
+        r = requests.get(
+            'https://api.binance.com/api/v3/klines',
+            params={'symbol': binance_pair, 'interval': '15m', 'limit': 17},
+            timeout=6)
+        if r.status_code != 200:
+            return None
+        k15 = r.json()
+        if len(k15) < 5:
+            return None
+        last = float(k15[-1][4])
+        open_15m = float(k15[-2][1])
+        open_1h = float(k15[-5][1])
+        open_4h = float(k15[0][1])
+        vol_recent = sum(float(k[5]) for k in k15[-4:])
+        vol_prior = sum(float(k[5]) for k in k15[-8:-4]) if len(k15) >= 8 else 0
+        return {
+            'price': last,
+            'chg_15m': (last - open_15m) / open_15m * 100 if open_15m else 0,
+            'chg_1h': (last - open_1h) / open_1h * 100 if open_1h else 0,
+            'chg_4h': (last - open_4h) / open_4h * 100 if open_4h else 0,
+            'volume_ratio': vol_recent / max(vol_prior, 1),
+        }
+    except Exception:
+        return None
+
+
 def _load_established_proposals(portfolio):
     """
     Dynamic established token proposals driven entirely by token_intelligence scores.
@@ -1131,11 +1181,11 @@ def _load_established_proposals(portfolio):
             print("    📊 Established: no fresh token intelligence data")
             return []
 
-        # Step 2: BTC macro regime gate — if BTC is very bearish, hold off all buys
+        # Step 2: BTC macro regime gate — bearish BTC only permits strongest setups.
         btc_score = next((r[1] for r in rows if r[0].upper() == 'BTC'), None)
-        if btc_score is not None and btc_score < -0.3:
-            print(f"    📊 Established: BTC macro score {btc_score:.2f} → bear regime, skipping established buys")
-            return []
+        bear_regime = btc_score is not None and btc_score < -0.3
+        if bear_regime:
+            print(f"    📊 Established: BTC macro score {btc_score:.2f} → bear regime, requiring STRONG_BUY + uptrend")
 
         for sym, score, signal, conf, notes in rows:
             sym = sym.upper()
@@ -1148,6 +1198,8 @@ def _load_established_proposals(portfolio):
             if signal not in ('BUY', 'STRONG_BUY'):
                 continue
             if score < 0.1:
+                continue
+            if bear_regime and (signal != 'STRONG_BUY' or score < 0.35):
                 continue
 
             # Step 4: must have a known tradeable contract — no guessing
@@ -1163,7 +1215,7 @@ def _load_established_proposals(portfolio):
             if f"{sym}_{chain}" in portfolio.holdings:
                 continue  # already in sim position
 
-            # Step 5: live price check — not crashing, not overbought
+            # Step 5: live price check — not crashing, not overbought, and not rolling over.
             try:
                 r = requests.get(
                     f"https://api.binance.com/api/v3/ticker/24hr?symbol={registry['binance']}",
@@ -1175,6 +1227,17 @@ def _load_established_proposals(portfolio):
                 chg = float(data.get('priceChangePercent', 0))
                 if price <= 0 or chg > 10 or chg < -12:
                     continue  # skip if pumped >10% or dumping >12%
+                curve = _established_curve(registry['binance'])
+                if not curve:
+                    continue
+                if curve['chg_15m'] < -1.5:
+                    continue
+                if curve['chg_1h'] < -2.0:
+                    continue
+                if curve['chg_1h'] < 0 and curve['chg_4h'] < 0:
+                    continue
+                if bear_regime and curve['chg_1h'] <= 0:
+                    continue
             except Exception:
                 continue
 
@@ -1191,10 +1254,15 @@ def _load_established_proposals(portfolio):
                 'alpha_score': min(95, 60 + int(score * 100)),
                 'cross_score': 8,
                 'sources': f'intel:score={score:.2f},sig={signal}',
-                'reasons': [f'intel_{sym}:{signal}:{notes[:40]}'],
+                'reasons': [f'intel_{sym}:{signal}:{notes[:40]} '
+                            f"curve15m:{curve['chg_15m']:+.1f}% "
+                            f"curve1h:{curve['chg_1h']:+.1f}% "
+                            f"curve4h:{curve['chg_4h']:+.1f}%"],
                 'category': 'ESTABLISHED',
                 'liquidity_usd': 999_000_000,
                 'age_hours': 0,
+                'price_change_24h': chg,
+                'established_curve': curve,
             })
 
     except Exception as e:
@@ -1219,8 +1287,290 @@ def _executor_dry_run():
 
 DAILY_LOSS_LIMIT_USD = 200.0   # Stop new buys if trading P&L drops below -$200
 
+
+def _ensure_strategy_tables():
+    """Tables for deferred candidates, skip reasons, and price snapshots."""
+    try:
+        conn = sqlite3.connect(SIM_DB, timeout=10)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('''CREATE TABLE IF NOT EXISTS buy_candidates (
+            key TEXT PRIMARY KEY,
+            symbol TEXT,
+            chain TEXT,
+            category TEXT,
+            coin_id TEXT,
+            first_seen_at TEXT,
+            last_seen_at TEXT,
+            seen_count INTEGER DEFAULT 0,
+            first_price REAL DEFAULT 0,
+            last_price REAL DEFAULT 0,
+            last_score REAL DEFAULT 0,
+            status TEXT DEFAULT 'WATCHING',
+            last_reason TEXT DEFAULT '',
+            snapshot_json TEXT DEFAULT ''
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS agent_skips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            chain TEXT,
+            category TEXT,
+            reason TEXT,
+            price_usd REAL DEFAULT 0,
+            proposal_json TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS token_price_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            chain TEXT,
+            coin_id TEXT,
+            price_usd REAL,
+            liquidity_usd REAL,
+            volume_24h REAL,
+            price_change_m5 REAL,
+            price_change_h1 REAL,
+            price_change_h6 REAL,
+            price_change_24h REAL,
+            buy_sell_ratio REAL,
+            sampled_at TEXT DEFAULT (datetime('now'))
+        )''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"    strategy table init error: {e}")
+
+
+def _skip_proposal(p, reason, price=0):
+    """Log a skipped proposal so dry-run tuning has evidence."""
+    sym = p.get('symbol', '')
+    chain = p.get('chain', '')
+    cat = p.get('category', '')
+    print(f"    SKIP {sym} -- {reason}")
+    try:
+        _ensure_strategy_tables()
+        conn = sqlite3.connect(SIM_DB, timeout=5)
+        conn.execute(
+            "INSERT INTO agent_skips (symbol,chain,category,reason,price_usd,proposal_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (sym, chain, cat, reason[:240], float(price or 0),
+             json.dumps(p, default=str)[:3000]))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _best_dex_pair(contract, chain):
+    """Fetch best-liquidity DexScreener pair for a contract on the expected chain."""
+    if not contract or len(str(contract)) < 20:
+        return None
+    try:
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{contract}',
+            timeout=8)
+        if r.status_code != 200:
+            return None
+        pairs = r.json().get('pairs', []) or []
+        if chain:
+            same_chain = [p for p in pairs
+                          if p.get('chainId', '').lower() == chain.lower()]
+            pairs = same_chain or pairs
+        if not pairs:
+            return None
+        return max(pairs, key=lambda p: float(
+            p.get('liquidity', {}).get('usd', 0) or 0))
+    except Exception:
+        return None
+
+
+def _market_snapshot(symbol, chain, coin_id, fallback_price=0):
+    """Current DEX curve/pressure snapshot used before any speculative buy."""
+    pair = _best_dex_pair(coin_id, chain)
+    snap = {
+        'price': float(fallback_price or 0),
+        'liquidity': 0.0,
+        'volume_24h': 0.0,
+        'm5': 0.0,
+        'h1': 0.0,
+        'h6': 0.0,
+        'h24': 0.0,
+        'buy_sell_ratio': 0.0,
+        'source': 'none',
+    }
+    if pair:
+        pc = pair.get('priceChange', {}) or {}
+        txns = pair.get('txns', {}) or {}
+        h24_tx = txns.get('h24', {}) or {}
+        h1_tx = txns.get('h1', {}) or {}
+        buys = int(h1_tx.get('buys', 0) or h24_tx.get('buys', 0) or 0)
+        sells = int(h1_tx.get('sells', 0) or h24_tx.get('sells', 0) or 0)
+        snap.update({
+            'price': float(pair.get('priceUsd', 0) or fallback_price or 0),
+            'liquidity': float(pair.get('liquidity', {}).get('usd', 0) or 0),
+            'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0),
+            'm5': float(pc.get('m5', 0) or 0),
+            'h1': float(pc.get('h1', 0) or 0),
+            'h6': float(pc.get('h6', 0) or 0),
+            'h24': float(pc.get('h24', 0) or 0),
+            'buy_sell_ratio': buys / max(sells, 1),
+            'source': pair.get('dexId', 'dexscreener'),
+        })
+    try:
+        _ensure_strategy_tables()
+        conn = sqlite3.connect(SIM_DB, timeout=5)
+        conn.execute(
+            "INSERT INTO token_price_samples "
+            "(symbol,chain,coin_id,price_usd,liquidity_usd,volume_24h,"
+            "price_change_m5,price_change_h1,price_change_h6,price_change_24h,"
+            "buy_sell_ratio) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (symbol, chain, coin_id, snap['price'], snap['liquidity'],
+             snap['volume_24h'], snap['m5'], snap['h1'], snap['h6'],
+             snap['h24'], snap['buy_sell_ratio']))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    return snap
+
+
+def _candidate_watchlist_gate(p, price, snapshot):
+    """
+    Defer speculative buys until the same candidate survives more than one cycle.
+    Established coins skip this because Binance/intelligence gates already refresh.
+    """
+    if p.get('category') == 'ESTABLISHED':
+        return True, 'established'
+    _ensure_strategy_tables()
+    key = f"{p.get('symbol','')}_{p.get('chain','')}_{p.get('coin_id','')[:18]}"
+    now = datetime.now()
+    try:
+        conn = sqlite3.connect(SIM_DB, timeout=5)
+        row = conn.execute(
+            "SELECT first_seen_at, seen_count, first_price FROM buy_candidates WHERE key=?",
+            (key,)).fetchone()
+        if row:
+            first_seen_raw, seen_count, first_price = row
+            try:
+                first_seen = datetime.fromisoformat(first_seen_raw)
+            except Exception:
+                first_seen = now
+            seen_count = int(seen_count or 0) + 1
+            first_price = float(first_price or price or 0)
+            age_min = (now - first_seen).total_seconds() / 60
+            status = 'READY' if (seen_count >= MIN_WATCHLIST_SEEN or
+                                 age_min >= MIN_WATCHLIST_AGE_MIN) else 'WATCHING'
+            conn.execute(
+                "UPDATE buy_candidates SET last_seen_at=?, seen_count=?, last_price=?, "
+                "last_score=?, status=?, last_reason=?, snapshot_json=? WHERE key=?",
+                (now.isoformat(), seen_count, price, p.get('alpha_score', 0),
+                 status, 'seen_again', json.dumps(snapshot, default=str)[:2000], key))
+            conn.commit()
+            conn.close()
+            if status == 'READY':
+                if first_price > 0 and price < first_price * 0.98:
+                    return False, f'watchlist price declined {((price-first_price)/first_price*100):.1f}% since first seen'
+                return True, f'watchlist ready ({seen_count} sightings, {age_min:.1f}m)'
+            return False, f'watching candidate ({seen_count}/{MIN_WATCHLIST_SEEN} sightings, {age_min:.1f}m)'
+        conn.execute(
+            "INSERT OR REPLACE INTO buy_candidates "
+            "(key,symbol,chain,category,coin_id,first_seen_at,last_seen_at,"
+            "seen_count,first_price,last_price,last_score,status,last_reason,snapshot_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (key, p.get('symbol',''), p.get('chain',''), p.get('category',''),
+             p.get('coin_id',''), now.isoformat(), now.isoformat(), 1, price,
+             price, p.get('alpha_score', 0), 'WATCHING', 'first_seen',
+             json.dumps(snapshot, default=str)[:2000]))
+        conn.commit()
+        conn.close()
+    except Exception:
+        return True, 'watchlist unavailable'
+    return False, 'watching candidate (first sighting)'
+
+
+def _social_snapshot(symbol, chain):
+    try:
+        from social_monitor import get_social_signal
+        return get_social_signal(symbol, chain)
+    except Exception:
+        return None
+
+
+def _speculative_market_gate(p, price):
+    """Curve + social confirmation for gems/listings before buy."""
+    cat = p.get('category', '')
+    if cat == 'ESTABLISHED':
+        return True, 'established', {}
+    sym = p.get('symbol', '')
+    chain = p.get('chain', '')
+    coin_id = p.get('coin_id', '')
+    snap = _market_snapshot(sym, chain, coin_id, fallback_price=price)
+    social = _social_snapshot(sym, chain)
+    social_sig = (social or {}).get('signal', 'UNKNOWN')
+
+    h1 = snap.get('h1', 0)
+    h24 = float(p.get('price_change_24h', 0) or snap.get('h24', 0) or 0)
+    m5 = snap.get('m5', 0)
+    ratio = snap.get('buy_sell_ratio', 0)
+
+    if social and social_sig in ('SELL', 'WATCH_OUT'):
+        return False, f'social veto {social_sig}', snap
+    if h24 < -25:
+        return False, f'price curve declining {h24:.1f}%/24h', snap
+    if h1 < -5:
+        return False, f'price curve declining {h1:.1f}%/1h', snap
+    if m5 < -8:
+        return False, f'short-term dump {m5:.1f}%/5m', snap
+    if ratio and ratio < 0.75:
+        return False, f'sell pressure buy/sell={ratio:.2f}', snap
+
+    # If social attention exists, require price confirmation rather than buying mentions alone.
+    if social and int(social.get('tweets') or 0) >= 3 and h1 < 0 and h24 < 0:
+        return False, 'mentions present but price curve is declining', snap
+
+    # For DEX gems without any cached social confirmation, require stronger market proof.
+    if cat in ('DEX_GEM', 'LISTING') and not social:
+        if h1 < 0 and h24 <= 0:
+            return False, 'no social cache and curve is not positive', snap
+        if ratio and ratio < 1.0:
+            return False, f'no social cache and weak buy pressure {ratio:.2f}', snap
+
+    return True, 'curve/social ok', snap
+
+
+def _ai_risk_gate(p):
+    """Optional paid OpenAI/token-validator veto after cheap checks pass."""
+    if not ENABLE_AI_RISK_VETO:
+        return True, 'disabled'
+    if p.get('category') not in ('DEX_GEM', 'LISTING'):
+        return True, 'not_applicable'
+    contract = p.get('coin_id', '')
+    if not contract or len(contract) < 20:
+        return True, 'no_contract'
+    try:
+        from token_validator import validate_dex_gem
+        row = {
+            'symbol': p.get('symbol', ''),
+            'contract_address': contract,
+            'chain': p.get('chain', ''),
+            'name': p.get('symbol', ''),
+            'liquidity_usd': p.get('liquidity_usd', 0),
+            'volume_24h': p.get('volume_24h', 0),
+            'price_change_24h': p.get('price_change_24h', 0),
+            'age_hours': p.get('age_hours', 0),
+            'dex': p.get('dex', ''),
+        }
+        result = validate_dex_gem(row, openai_key='')
+        verdict = result.get('verdict', 'UNKNOWN')
+        total = int(result.get('total_score', 0) or 0)
+        if verdict == 'AVOID' or total < AI_MIN_TOTAL_SCORE:
+            return False, f'AI/token validator veto {verdict} score:{total}/20'
+        return True, f'AI/token validator {verdict} score:{total}/20'
+    except Exception as e:
+        return False, f'AI/token validator failed closed: {str(e)[:80]}'
+
 def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
     actions = 0
+    _ensure_strategy_tables()
 
     # Circuit breaker — stop new buys if daily loss limit hit
     trading_pnl = portfolio._trading_value() - portfolio.starting_trading
@@ -1243,10 +1593,11 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             if action in ('BUY','ACCUMULATE') and conf >= MIN_SIGNAL_CONF:
                 price = resolve_price(sym, chain=ch)
                 key = f"{sym}_{ch}"
-                if price > 0 and key not in portfolio.holdings and portfolio.can_buy(ch, 50):
-                    ok, msg = portfolio.buy(sym, ch, 50, price, 'portfolio_signal')
+                trade_usd = min(2, portfolio.cash.get(ch, 0))
+                if price > 0 and key not in portfolio.holdings and trade_usd > 0 and portfolio.can_buy(ch, trade_usd):
+                    ok, msg = portfolio.buy(sym, ch, trade_usd, price, 'portfolio_signal')
                     if ok:
-                        print(f"    SIGNAL BUY {sym} $50 @ ${price:.4f}")
+                        print(f"    SIGNAL BUY {sym} ${trade_usd:.0f} @ ${price:.4f}")
                         actions += 1
             elif action == 'SELL' and conf >= 80:
                 price = resolve_price(sym, chain=ch)
@@ -1351,12 +1702,14 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         # Block offensive/inappropriate token names
         _BLOCKED_TERMS = {'nigga','nigger','negro','nazi','hitler','rape','isis','porn'}
         if any(t in sym.lower() for t in _BLOCKED_TERMS):
+            _skip_proposal(p, 'blocked offensive token name')
             continue
 
         # Block obvious low-quality / scam name patterns
         _SCAM_PATTERNS = ['nocoin','noscam','rugpull','honeypot','scamcoin',
                           'ponzi','fakeusd','fakebtc','fakeeth','fakesol']
         if any(p in sym.lower() for p in _SCAM_PATTERNS):
+            _skip_proposal(p, 'blocked scam-like token name')
             continue
 
         # SOL: PumpFun tokens — executor now handles bonding curve directly
@@ -1377,34 +1730,52 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         if key in portfolio.holdings:
             continue
         if sym in stop_lossed_syms:
+            _skip_proposal(p, 'symbol in stop-loss/ban list')
             continue
         chain_limit = 4 if chain in ('solana', 'bsc') else 3
         if chain_counts.get(chain, 0) >= chain_limit:
+            _skip_proposal(p, f'chain position limit reached for {chain}')
             continue
         if not portfolio.can_buy(chain, trade_usd):
+            _skip_proposal(p, f'insufficient paper cash for {chain}')
             continue
 
         # Always fetch live price — never trust stale DB price_usd
         price = resolve_price(sym, coin_id=p.get('coin_id', ''), chain=chain, use_cache=False)
         if not price or price <= 0:
-            print(f"    SKIP {sym} -- price unavailable on {chain}")
+            _skip_proposal(p, f'price unavailable on {chain}')
             continue
         if price < 1e-9:
-            print(f'    SKIP {sym} -- price dust (${price:.2e})')
+            _skip_proposal(p, f'price dust (${price:.2e})', price=price)
             continue
 
         # ATH/rug check — if token already crashed >80% in 24h, skip
         # This catches post-rug tokens and pump-and-dumps
         price_change_24h = float(p.get('price_change_24h', 0) or 0)
         if price_change_24h < -80:
-            print(f'    SKIP {sym} -- crashed {price_change_24h:.0f}% in 24h (likely rug)')
+            _skip_proposal(p, f'crashed {price_change_24h:.0f}% in 24h (likely rug)', price=price)
             _write_persistent_ban(sym, chain, f'crashed {price_change_24h:.0f}% in 24h')
             continue
         # Additional check: if age < 6h and already down >50%, fast dump
         age_hours = float(p.get('age_hours', 999) or 999)
         if age_hours < 6 and price_change_24h < -50:
-            print(f'    SKIP {sym} -- fast dump {price_change_24h:.0f}% in {age_hours:.1f}h')
+            _skip_proposal(p, f'fast dump {price_change_24h:.0f}% in {age_hours:.1f}h', price=price)
             _write_persistent_ban(sym, chain, f'fast dump {price_change_24h:.0f}%')
+            continue
+
+        market_ok, market_reason, market_snapshot = _speculative_market_gate(p, price)
+        if not market_ok:
+            _skip_proposal(p, market_reason, price=price)
+            continue
+
+        watch_ok, watch_reason = _candidate_watchlist_gate(p, price, market_snapshot)
+        if not watch_ok:
+            _skip_proposal(p, watch_reason, price=price)
+            continue
+
+        ai_ok, ai_reason = _ai_risk_gate(p)
+        if not ai_ok:
+            _skip_proposal(p, ai_reason, price=price)
             continue
 
         ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'),
@@ -1419,6 +1790,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             print(f"    BUY {sym} ${trade_usd:.0f} @ ${price:.8f} | {str(p.get('reasons', ''))[:50]}")
             chain_counts[chain] = chain_counts.get(chain, 0) + 1
             actions += 1
+        else:
+            _skip_proposal(p, msg, price=price)
 
     return actions
 
