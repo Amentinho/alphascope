@@ -265,6 +265,7 @@ MIN_WATCHLIST_AGE_MIN = float(_env('SIM_MIN_WATCHLIST_AGE_MIN', '5'))
 ENABLE_AI_RISK_VETO = _env('ENABLE_AI_RISK_VETO', 'false').lower().strip() == 'true'
 AI_MIN_TOTAL_SCORE = int(_env('AI_MIN_TOTAL_SCORE', '16'))
 ESTABLISHED_ALLOW_TOPUPS = _env('SIM_ESTABLISHED_ALLOW_TOPUPS', 'false').lower().strip() == 'true'
+ESTABLISHED_MAX_PROPOSALS = int(_env('SIM_ESTABLISHED_MAX_PROPOSALS', '3'))
 
 # ── Single-writer DB queue ─────────────────────────────────────────────────────
 import queue as _queue
@@ -1095,13 +1096,33 @@ _CONTRACT_REGISTRY = {
              'binance': 'AAVEUSDT', 'sl': -5.0, 'tp': 10.0, 'max_usd': 2},
     'UNI':  {'chain': 'ethereum', 'coin_id': '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984',
              'binance': 'UNIUSDT',  'sl': -5.0, 'tp': 10.0, 'max_usd': 2},
+    'ONDO': {'chain': 'ethereum', 'coin_id': '0xfAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3',
+             'binance': 'ONDOUSDT', 'sl': -7.0, 'tp': 14.0, 'max_usd': 2},
+    'ENA':  {'chain': 'ethereum', 'coin_id': '0x57e114B691Db790C35207b2e685D4A43181e6061',
+             'binance': 'ENAUSDT',  'sl': -8.0, 'tp': 16.0, 'max_usd': 2},
+    'LDO':  {'chain': 'ethereum', 'coin_id': '0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32',
+             'binance': 'LDOUSDT',  'sl': -7.0, 'tp': 14.0, 'max_usd': 2},
+    'PENDLE': {'chain': 'ethereum', 'coin_id': '0x808507121B80c02388fAd14726482e061B8da827',
+             'binance': 'PENDLEUSDT', 'sl': -7.0, 'tp': 14.0, 'max_usd': 2},
+    'CRV':  {'chain': 'ethereum', 'coin_id': '0xD533a949740bb3306d119CC777fa900bA034cd52',
+             'binance': 'CRVUSDT',  'sl': -8.0, 'tp': 16.0, 'max_usd': 2},
+    'FET':  {'chain': 'ethereum', 'coin_id': '0xaea46A60368A7bD060eec7DF8CBa43b7EF41Ad85',
+             'binance': 'FETUSDT',  'sl': -8.0, 'tp': 16.0, 'max_usd': 2},
+    'NEAR': {'chain': 'ethereum', 'coin_id': '0x85F17Cf997934a597031b2E18a9aB6ebD4B9f6a4',
+             'binance': 'NEARUSDT', 'sl': -8.0, 'tp': 16.0, 'max_usd': 2},
+    'PEPE': {'chain': 'ethereum', 'coin_id': '0x6982508145454Ce325dDbE47a25d4ec3d2311933',
+             'binance': 'PEPEUSDT', 'sl': -10.0, 'tp': 20.0, 'max_usd': 1},
+    'SHIB': {'chain': 'ethereum', 'coin_id': '0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE',
+             'binance': 'SHIBUSDT', 'sl': -10.0, 'tp': 18.0, 'max_usd': 1},
     # ── BASE — native BASE ecosystem tokens ──────────────────────────────────
     'AERO': {'chain': 'base',     'coin_id': '0x940181a94A35A4569E4529A3CDfB74e38FD98631',
              'binance': 'AEROUSDT', 'sl': -6.0, 'tp': 12.0, 'max_usd': 2},
+    'VIRTUAL': {'chain': 'base',  'coin_id': '0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b',
+             'binance': 'VIRTUALUSDT', 'sl': -8.0, 'tp': 16.0, 'max_usd': 2},
     # BTC + HYPE → macro sentiment signals only, no on-chain execution
     # (BTC lives on its own chain; HYPE is Hyperliquid L1 native)
     # They stay in token_intelligence TRACKED_TOKENS for regime filtering.
-    '_MACRO_SIGNAL_ONLY': {'BTC', 'HYPE'},
+    '_MACRO_SIGNAL_ONLY': {'BTC', 'HYPE', 'SUI', 'AVAX', 'INJ'},
 }
 
 
@@ -1216,7 +1237,9 @@ def _load_established_proposals(portfolio):
 
         # Step 1: read all fresh token_intelligence scores
         rows = conn.execute("""
-            SELECT symbol, composite_score, signal, confidence, notes
+            SELECT symbol, composite_score, signal, confidence, notes,
+                   momentum_score, trending_score, news_score, reddit_score,
+                   twitter_score, price_24h_change, price_7d_change
             FROM token_intelligence
             WHERE id IN (
                 SELECT MAX(id) FROM token_intelligence
@@ -1237,7 +1260,10 @@ def _load_established_proposals(portfolio):
         if bear_regime:
             print(f"    📊 Established: BTC macro score {btc_score:.2f} → bear regime, requiring STRONG_BUY + uptrend")
 
-        for sym, score, signal, conf, notes in rows:
+        ranked = []
+        for row in rows:
+            (sym, score, signal, conf, notes, mom_score, trend_score,
+             news_score, reddit_score, twitter_score, chg_24_db, chg_7d_db) = row
             sym = sym.upper()
 
             # Skip macro-signal-only tokens — no on-chain execution possible
@@ -1299,10 +1325,31 @@ def _load_established_proposals(portfolio):
             except Exception:
                 continue
 
-            # Step 6: propose
+            # Step 6: rank across the broader established universe. This lets
+            # capital rotate into current sector leaders instead of only buying
+            # whatever is already in the wallet.
+            source_strength = (
+                max(float(news_score or 0), 0) * 12
+                + max(float(twitter_score or 0), 0) * 10
+                + max(float(reddit_score or 0), 0) * 5
+                + max(float(trend_score or 0), 0) * 8
+            )
+            curve_strength = (
+                max(curve['chg_1h'], 0) * 4
+                + max(curve['chg_4h'], 0) * 2
+                + max(curve['chg_15m'], 0) * 2
+                + max(curve.get('volume_ratio', 1) - 1, 0) * 3
+            )
+            rotation_score = (
+                60
+                + max(float(score or 0), 0) * 60
+                + max(float(mom_score or 0), 0) * 15
+                + source_strength
+                + curve_strength
+            )
             trade_usd = registry['max_usd'] if intelligence_buy else min(1, registry['max_usd'])
             setup_label = signal if intelligence_buy else 'TECHNICAL_ACCUMULATE'
-            proposals.append({
+            ranked.append((rotation_score, {
                 'action': 'BUY' if intelligence_buy else 'ACCUMULATE',
                 'symbol': sym,
                 'chain': chain,
@@ -1311,19 +1358,26 @@ def _load_established_proposals(portfolio):
                 'trade_usd': trade_usd,
                 'stop_loss_override': registry['sl'],
                 'take_profit_override': registry['tp'],
-                'alpha_score': min(95, 60 + int(max(score, 0.12) * 100)),
+                'alpha_score': min(95, int(rotation_score)),
                 'cross_score': 8,
                 'sources': f'intel:score={score:.2f},sig={setup_label}',
                 'reasons': [f'intel_{sym}:{setup_label}:{notes[:40]} '
                             f"curve15m:{curve['chg_15m']:+.1f}% "
                             f"curve1h:{curve['chg_1h']:+.1f}% "
-                            f"curve4h:{curve['chg_4h']:+.1f}%"],
+                            f"curve4h:{curve['chg_4h']:+.1f}% "
+                            f"news:{float(news_score or 0):+.2f} "
+                            f"tw:{float(twitter_score or 0):+.2f} "
+                            f"rank:{rotation_score:.0f}"],
                 'category': 'ESTABLISHED',
                 'liquidity_usd': 999_000_000,
                 'age_hours': 0,
                 'price_change_24h': chg,
                 'established_curve': curve,
-            })
+                'rotation_score': rotation_score,
+            }))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        proposals = [p for _, p in ranked[:max(1, ESTABLISHED_MAX_PROPOSALS)]]
 
     except Exception as e:
         print(f'  established error: {e}')

@@ -24,6 +24,16 @@ import os, time, json, sqlite3, requests
 from datetime import datetime, timedelta
 
 MAIN_DB = 'alphascope.db'
+ENABLE_EXTERNAL_NEWS_FETCH = os.environ.get('ENABLE_EXTERNAL_NEWS_FETCH', 'false').lower() == 'true'
+try:
+    if not ENABLE_EXTERNAL_NEWS_FETCH:
+        with open('.env') as _env_f:
+            for _line in _env_f:
+                if _line.strip().startswith('ENABLE_EXTERNAL_NEWS_FETCH='):
+                    ENABLE_EXTERNAL_NEWS_FETCH = _line.split('=', 1)[1].strip().lower() == 'true'
+                    break
+except Exception:
+    pass
 
 # ── Established tokens to track ───────────────────────────────────────────────
 # Tokens marked 'macro_only=True' are scored for regime filtering but never
@@ -42,13 +52,29 @@ TRACKED_TOKENS = {
     'LINK': {'cg_id': 'chainlink',       'binance': 'LINKUSDT', 'reddit': 'Chainlink'},
     'AAVE': {'cg_id': 'aave',            'binance': 'AAVEUSDT', 'reddit': 'Aave'},
     'UNI':  {'cg_id': 'uniswap',         'binance': 'UNIUSDT',  'reddit': 'UniSwap'},
+    'ONDO': {'cg_id': 'ondo-finance',    'binance': 'ONDOUSDT', 'reddit': 'CryptoCurrency'},
+    'ENA':  {'cg_id': 'ethena',          'binance': 'ENAUSDT',  'reddit': 'ethfinance'},
+    'LDO':  {'cg_id': 'lido-dao',        'binance': 'LDOUSDT',  'reddit': 'ethfinance'},
+    'PENDLE': {'cg_id': 'pendle',        'binance': 'PENDLEUSDT','reddit': 'defi'},
+    'CRV':  {'cg_id': 'curve-dao-token', 'binance': 'CRVUSDT',  'reddit': 'defi'},
+    'FET':  {'cg_id': 'fetch-ai',        'binance': 'FETUSDT',  'reddit': 'artificial'},
+    'NEAR': {'cg_id': 'near',            'binance': 'NEARUSDT', 'reddit': 'nearprotocol'},
+    'PEPE': {'cg_id': 'pepe',            'binance': 'PEPEUSDT', 'reddit': 'CryptoMoonShots'},
+    'SHIB': {'cg_id': 'shiba-inu',       'binance': 'SHIBUSDT', 'reddit': 'SHIBArmy'},
     # ── BASE ecosystem ────────────────────────────────────────────────────────
     'AERO': {'cg_id': 'aerodrome-finance','binance': 'AEROUSDT', 'reddit': 'base'},
+    'VIRTUAL': {'cg_id': 'virtual-protocol','binance': 'VIRTUALUSDT', 'reddit': 'base'},
     # ── Macro regime signals only — not traded on any supported chain ─────────
     'BTC':  {'cg_id': 'bitcoin',         'binance': 'BTCUSDT',  'reddit': 'Bitcoin',
              'macro_only': True},   # BTC lives on its own chain — regime signal only
     'HYPE': {'cg_id': 'hyperliquid',     'binance': 'HYPEUSDT', 'reddit': 'hyperliquid',
              'macro_only': True},   # Hyperliquid L1 native — no DEX on SOL/BASE/ETH
+    'SUI':  {'cg_id': 'sui',             'binance': 'SUIUSDT',  'reddit': 'sui',
+             'macro_only': True},
+    'AVAX': {'cg_id': 'avalanche-2',     'binance': 'AVAXUSDT', 'reddit': 'avalanche',
+             'macro_only': True},
+    'INJ':  {'cg_id': 'injective-protocol','binance': 'INJUSDT','reddit': 'injective',
+             'macro_only': True},
 }
 
 # Source weights in composite score
@@ -94,6 +120,8 @@ def _write_coin_buzz(conn, symbol, composite, signal, notes):
     # Convert composite [-1,1] to sentiment-compatible values
     mention_count = 10 if abs(composite) > 0.3 else 5
     # Use INSERT OR IGNORE to handle missing 'source' column gracefully
+    if not ENABLE_EXTERNAL_NEWS_FETCH:
+        return 0.0
     try:
         conn.execute("""
             INSERT INTO coin_buzz (coin, mention_count, avg_sentiment, source, fetched_at)
@@ -335,14 +363,14 @@ def run_token_intelligence():
         try:
             # Price momentum
             mom_score, chg_24h, chg_7d = _score_price_momentum(symbol, meta['binance'])
-            time.sleep(0.2)  # rate limit Binance
+            time.sleep(0.05)  # rate limit Binance without blocking quick refresh
 
             # CoinGecko trending
             trend_score = 0.5 if symbol in trending_syms else 0.0
 
             # News
             news_score = _score_news(symbol, meta['cg_id'], conn=conn)
-            time.sleep(0.3)
+            time.sleep(0.05)
 
             # Reddit + Twitter from DB
             reddit_score = _score_reddit(conn, symbol, meta['reddit'])
