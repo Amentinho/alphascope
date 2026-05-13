@@ -266,6 +266,14 @@ ENABLE_AI_RISK_VETO = _env('ENABLE_AI_RISK_VETO', 'false').lower().strip() == 't
 AI_MIN_TOTAL_SCORE = int(_env('AI_MIN_TOTAL_SCORE', '16'))
 ESTABLISHED_ALLOW_TOPUPS = _env('SIM_ESTABLISHED_ALLOW_TOPUPS', 'false').lower().strip() == 'true'
 ESTABLISHED_MAX_PROPOSALS = int(_env('SIM_ESTABLISHED_MAX_PROPOSALS', '3'))
+TARGET_ESTABLISHED_PCT = float(_env('SIM_TARGET_ESTABLISHED_PCT', '0.60'))
+TARGET_GEMS_PCT = float(_env('SIM_TARGET_GEMS_PCT', '0.25'))
+TARGET_LISTINGS_PCT = float(_env('SIM_TARGET_LISTINGS_PCT', '0.15'))
+SIM_ESTABLISHED_MAX_USD = float(_env('SIM_ESTABLISHED_MAX_USD', '2.0'))
+SIM_GEM_MAX_USD = float(_env('SIM_GEM_MAX_USD', '0.75'))
+SIM_LISTING_MAX_USD = float(_env('SIM_LISTING_MAX_USD', '1.0'))
+SIM_MIN_ALLOC_SCORE = float(_env('SIM_MIN_ALLOC_SCORE', '58'))
+SIM_MAX_NEW_BUYS_PER_CYCLE = int(_env('SIM_MAX_NEW_BUYS_PER_CYCLE', '4'))
 
 # ── Single-writer DB queue ─────────────────────────────────────────────────────
 import queue as _queue
@@ -602,7 +610,7 @@ class SimPortfolio:
         return self.cash.get(chain, 0) >= usd
 
     def buy(self, symbol, chain, usd, price, source='agent', contract='',
-            dex_url=''):
+            dex_url='', category='', allocation_score=0):
         if price <= 0:
             return False, f"price is zero"
         if not self.can_buy(chain, usd):
@@ -631,6 +639,8 @@ class SimPortfolio:
             'usd_spent': usd, 'source': source,
             'coin_id': contract,  # mint address for real execution
             'dex_url': dex_url,
+            'category': category or _proposal_family({'category': '', 'sources': source}),
+            'allocation_score': allocation_score,
             'is_real': False, '_zero_count': 0,
         }
         self.trades.append({
@@ -638,6 +648,7 @@ class SimPortfolio:
             'usd': usd, 'price': price, 'tokens': tokens,
             'time': datetime.now().isoformat(), 'source': source,
             'coin_id': contract, 'dex_url': dex_url,
+            'category': category, 'allocation_score': allocation_score,
         })
         try:
             if is_dry:
@@ -1684,6 +1695,118 @@ def _ai_risk_gate(p):
     except Exception as e:
         return False, f'AI/token validator failed closed: {str(e)[:80]}'
 
+
+def _proposal_family(p):
+    """Normalize proposal categories into portfolio allocation buckets."""
+    cat = (p.get('category') or '').upper()
+    if cat == 'ESTABLISHED' or 'intel:' in str(p.get('sources', '')):
+        return 'ESTABLISHED'
+    if cat in ('LISTING', 'NEW_LISTING'):
+        return 'LISTING'
+    if cat in ('DEX_GEM', 'TRENDING') or 'dex' in str(p.get('sources', '')).lower():
+        return 'GEM'
+    return 'GEM'
+
+
+def _category_targets():
+    total = max(TARGET_ESTABLISHED_PCT + TARGET_GEMS_PCT + TARGET_LISTINGS_PCT, 0.01)
+    return {
+        'ESTABLISHED': TARGET_ESTABLISHED_PCT / total,
+        'GEM': TARGET_GEMS_PCT / total,
+        'LISTING': TARGET_LISTINGS_PCT / total,
+    }
+
+
+def _category_exposure(portfolio):
+    exposure = {'ESTABLISHED': 0.0, 'GEM': 0.0, 'LISTING': 0.0}
+    for pos in portfolio.holdings.values():
+        if pos.get('is_real'):
+            continue
+        family = _proposal_family(pos)
+        price = resolve_price(
+            pos.get('symbol', ''),
+            coin_id=pos.get('coin_id', ''),
+            chain=pos.get('chain', ''),
+            dex_url=pos.get('dex_url', ''),
+        ) or pos.get('buy_price', 0)
+        exposure[family] = exposure.get(family, 0) + pos.get('amount', 0) * price
+    return exposure
+
+
+def _risk_adjusted_score(p, exposure, total_value):
+    family = _proposal_family(p)
+    score = float(p.get('rotation_score', p.get('alpha_score', 0)) or 0)
+
+    if family == 'ESTABLISHED':
+        score += 8
+        curve = p.get('established_curve') or {}
+        score += max(float(curve.get('chg_1h', 0) or 0), 0) * 2
+    elif family == 'LISTING':
+        score -= 6
+    else:
+        # Gems can outperform, but they need a bigger discount for rug/price-data risk.
+        score -= 14
+        liq = float(p.get('liquidity_usd', 0) or 0)
+        if liq < 50_000:
+            score -= 5
+        if float(p.get('price_change_24h', 0) or 0) < 0:
+            score -= 4
+
+    targets = _category_targets()
+    target_value = total_value * targets.get(family, 0.2)
+    current_value = exposure.get(family, 0)
+    if target_value > 0:
+        underweight = (target_value - current_value) / target_value
+        score += max(min(underweight, 1.0), -1.0) * 10
+    return round(score, 2)
+
+
+def _category_trade_cap(family):
+    if family == 'ESTABLISHED':
+        return SIM_ESTABLISHED_MAX_USD
+    if family == 'LISTING':
+        return SIM_LISTING_MAX_USD
+    return SIM_GEM_MAX_USD
+
+
+def _rank_and_size_proposals(portfolio, proposals):
+    """Professional-style allocator: rank all opportunities before spending."""
+    exposure = _category_exposure(portfolio)
+    total_value = max(portfolio._trading_value(), 1)
+    targets = _category_targets()
+    ranked = []
+    for p in proposals:
+        family = _proposal_family(p)
+        score = _risk_adjusted_score(p, exposure, total_value)
+        p['_family'] = family
+        p['_allocation_score'] = score
+        p['_target_pct'] = targets.get(family, 0)
+
+        target_value = total_value * targets.get(family, 0.2)
+        category_room = max(target_value - exposure.get(family, 0), 0)
+        if category_room <= 0 and score < 90:
+            p['_allocator_skip'] = f'{family.lower()} bucket already at target'
+            ranked.append((score, p))
+            continue
+        chain_cash = portfolio.cash.get(p.get('chain', 'solana'), 0)
+        desired = min(float(p.get('trade_usd', 0) or 0),
+                      _category_trade_cap(family),
+                      chain_cash)
+        if family != 'ESTABLISHED':
+            desired = min(desired, max(category_room, _category_trade_cap(family) * 0.5))
+        elif category_room > 0:
+            desired = min(desired, category_room)
+        p['trade_usd'] = max(0, round(desired, 4))
+        ranked.append((score, p))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    summary = []
+    for score, p in ranked[:8]:
+        summary.append(f"{p.get('symbol')}:{p.get('_family')}:{score:.0f}:${p.get('trade_usd',0):.2f}")
+    if summary:
+        print("    Allocator: " + " | ".join(summary))
+    return [p for _, p in ranked]
+
 def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
     actions = 0
     _ensure_strategy_tables()
@@ -1774,6 +1897,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
     else:
         print(f"    Proposals: " + " | ".join(
             f"{p['action']} {p['symbol']}({p.get('chain','?')[:3]})" for p in actionable[:10]))
+        proposals = _rank_and_size_proposals(portfolio, proposals)
 
     # Ban by symbol across all chains — strip |date suffix from dated entries
     stop_lossed_syms = {t['symbol'] for t in portfolio.trades
@@ -1794,6 +1918,8 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             ch = pos['chain']
             chain_counts[ch] = chain_counts.get(ch, 0) + 1
 
+    new_buys_this_cycle = 0
+
     for p in proposals:
         if p.get('action') == 'SKIP':
             continue
@@ -1807,6 +1933,18 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         trade_usd = min(p.get('trade_usd', 20), chain_caps.get(chain, 20))
 
         if not sym or action not in ('BUY', 'ACCUMULATE'):
+            continue
+        if new_buys_this_cycle >= SIM_MAX_NEW_BUYS_PER_CYCLE:
+            _skip_proposal(p, 'max new buys reached for this cycle')
+            continue
+        if p.get('_allocator_skip'):
+            _skip_proposal(p, p['_allocator_skip'])
+            continue
+        if float(p.get('_allocation_score', p.get('alpha_score', 0)) or 0) < SIM_MIN_ALLOC_SCORE:
+            _skip_proposal(p, f"allocation score too low ({p.get('_allocation_score', 0):.0f})")
+            continue
+        if trade_usd <= 0:
+            _skip_proposal(p, 'allocator assigned zero trade size')
             continue
 
         # PORTFOLIO category = real holdings, agent shouldn't sim-trade these
@@ -1905,7 +2043,9 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
 
         ok, msg = portfolio.buy(sym, chain, trade_usd, price, p.get('sources', 'agent'),
                               contract=p.get('coin_id', ''),
-                              dex_url=p.get('dex_url', ''))
+                              dex_url=p.get('dex_url', ''),
+                              category=p.get('_family') or p.get('category', ''),
+                              allocation_score=p.get('_allocation_score', 0))
         # Store override stop-loss/take-profit for established coins
         if ok and p.get('stop_loss_override'):
             key = f"{sym}_{chain}"
@@ -1916,6 +2056,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             print(f"    BUY {sym} ${trade_usd:.0f} @ ${price:.8f} | {str(p.get('reasons', ''))[:50]}")
             chain_counts[chain] = chain_counts.get(chain, 0) + 1
             actions += 1
+            new_buys_this_cycle += 1
         else:
             _skip_proposal(p, msg, price=price)
 

@@ -81,6 +81,32 @@ class StrategyGateTests(unittest.TestCase):
             simulation._market_snapshot = old_market
             simulation._social_snapshot = old_social
 
+    def test_allocator_prefers_stronger_established_and_sizes_gems_smaller(self):
+        class DummyPortfolio:
+            cash = {'ethereum': 10, 'solana': 10, 'base': 10}
+            holdings = {}
+
+            def _trading_value(self):
+                return 30
+
+        proposals = [
+            {
+                'symbol': 'ONDO', 'chain': 'ethereum', 'category': 'ESTABLISHED',
+                'rotation_score': 82, 'alpha_score': 82, 'trade_usd': 2,
+            },
+            {
+                'symbol': 'MOON', 'chain': 'solana', 'category': 'DEX_GEM',
+                'alpha_score': 82, 'liquidity_usd': 25_000,
+                'price_change_24h': 5, 'trade_usd': 2,
+            },
+        ]
+        ranked = simulation._rank_and_size_proposals(DummyPortfolio(), proposals)
+
+        self.assertEqual(ranked[0]['symbol'], 'ONDO')
+        gem = next(p for p in ranked if p['symbol'] == 'MOON')
+        self.assertLessEqual(gem['trade_usd'], simulation.SIM_GEM_MAX_USD)
+        self.assertGreater(ranked[0]['_allocation_score'], gem['_allocation_score'])
+
 
 if __name__ == '__main__':
     unittest.main()
