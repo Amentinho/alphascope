@@ -52,6 +52,8 @@ def _can_use_twitter(tier=1):
     global _credits_used
     if not TWITTER_ENABLED:
         return False
+    if not TWITTER_API_KEY:
+        return False
     if _credits_used >= MAX_CREDITS_PER_SESSION:
         return False
     return True
@@ -358,10 +360,11 @@ def run_social_monitoring():
     """
     init_social_tables()
     _CONFIG = _load_config()  # reload config each cycle
-    global TWITTER_ENABLED, _credits_used
+    global TWITTER_ENABLED, TWITTER_API_KEY, _credits_used
     TWITTER_ENABLED = _CONFIG['twitter_enabled']
+    TWITTER_API_KEY = _CONFIG.get('twitter_key', TWITTER_API_KEY)
 
-    if TWITTER_ENABLED:
+    if TWITTER_ENABLED and TWITTER_API_KEY:
         print(f"  Social monitoring... (Twitter ON | credits used: {_credits_used}/{MAX_CREDITS_PER_SESSION})")
     else:
         print("  Social monitoring... (Twitter OFF — set ENABLE_TWITTER_FETCH=true in .env to enable)")

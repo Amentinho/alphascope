@@ -24,16 +24,29 @@ import os, time, json, sqlite3, requests
 from datetime import datetime, timedelta
 
 MAIN_DB = 'alphascope.db'
-ENABLE_EXTERNAL_NEWS_FETCH = os.environ.get('ENABLE_EXTERNAL_NEWS_FETCH', 'false').lower() == 'true'
-try:
-    if not ENABLE_EXTERNAL_NEWS_FETCH:
+
+def _env(key, default=''):
+    val = os.environ.get(key, '')
+    if val:
+        return val
+    try:
         with open('.env') as _env_f:
             for _line in _env_f:
-                if _line.strip().startswith('ENABLE_EXTERNAL_NEWS_FETCH='):
-                    ENABLE_EXTERNAL_NEWS_FETCH = _line.split('=', 1)[1].strip().lower() == 'true'
-                    break
-except Exception:
-    pass
+                _line = _line.strip()
+                if _line.startswith(f'{key}='):
+                    return _line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
+
+ENABLE_EXTERNAL_NEWS_FETCH = _env('ENABLE_EXTERNAL_NEWS_FETCH', 'true').lower() == 'true'
+ENABLE_ESTABLISHED_TWITTER_FETCH = _env('ENABLE_ESTABLISHED_TWITTER_FETCH',
+                                        _env('ENABLE_TWITTER_FETCH', 'false')).lower() == 'true'
+ENABLE_ESTABLISHED_AI = _env('ENABLE_ESTABLISHED_AI', 'false').lower() == 'true'
+ESTABLISHED_TWITTER_MAX_PER_RUN = int(_env('ESTABLISHED_TWITTER_MAX_PER_RUN', '8'))
+ESTABLISHED_AI_MAX_PER_RUN = int(_env('ESTABLISHED_AI_MAX_PER_RUN', '4'))
+OPENAI_API_KEY = _env('OPENAI_API_KEY', '')
+TWITTER_API_KEY = _env('TWITTER_API_KEY', '')
 
 # ── Established tokens to track ───────────────────────────────────────────────
 # Tokens marked 'macro_only=True' are scored for regime filtering but never
@@ -120,8 +133,6 @@ def _write_coin_buzz(conn, symbol, composite, signal, notes):
     # Convert composite [-1,1] to sentiment-compatible values
     mention_count = 10 if abs(composite) > 0.3 else 5
     # Use INSERT OR IGNORE to handle missing 'source' column gracefully
-    if not ENABLE_EXTERNAL_NEWS_FETCH:
-        return 0.0
     try:
         conn.execute("""
             INSERT INTO coin_buzz (coin, mention_count, avg_sentiment, source, fetched_at)
@@ -252,6 +263,37 @@ def _score_news(symbol: str, cg_id: str, conn=None) -> float:
                 return max(-1.0, min(1.0, weighted / max(total_w, 1)))
         except Exception:
             pass
+    if not ENABLE_EXTERNAL_NEWS_FETCH:
+        return 0.0
+    # CryptoCompare news is unauthenticated and usually has broader coverage
+    # than CryptoPanic's free endpoint.
+    try:
+        rcc = requests.get(
+            'https://min-api.cryptocompare.com/data/v2/news/',
+            params={'lang': 'EN', 'categories': symbol},
+            timeout=8)
+        if rcc.status_code == 200:
+            articles = rcc.json().get('Data', [])[:20]
+            if articles:
+                pos_words = ('surge', 'rally', 'partnership', 'upgrade', 'launch',
+                             'adoption', 'record', 'bullish', 'growth', 'integrat')
+                neg_words = ('hack', 'exploit', 'lawsuit', 'sec ', 'crash', 'dump',
+                             'bearish', 'outage', 'fraud', 'delay')
+                score = 0
+                counted = 0
+                for a in articles:
+                    txt = f"{a.get('title','')} {a.get('body','')}".lower()
+                    if symbol.lower() not in txt and cg_id.replace('-', ' ') not in txt:
+                        continue
+                    pos = sum(1 for w in pos_words if w in txt)
+                    neg = sum(1 for w in neg_words if w in txt)
+                    if pos or neg:
+                        score += (pos - neg) / max(pos + neg, 1)
+                        counted += 1
+                if counted:
+                    return max(-1.0, min(1.0, score / counted))
+    except Exception:
+        pass
     try:
         r = requests.get(
             'https://cryptopanic.com/api/free/v1/posts/',
@@ -298,7 +340,7 @@ def _score_reddit(conn, symbol: str, subreddit: str) -> float:
 
 
 # ── Source 6: Twitter sentiment ───────────────────────────────────────────────
-def _score_twitter(conn, symbol: str) -> float:
+def _score_twitter(conn, symbol: str, project_name='') -> float:
     """Read Twitter sentiment from signals table."""
     try:
         row = conn.execute("""
@@ -338,7 +380,103 @@ def _score_twitter(conn, symbol: str) -> float:
             return max(-1.0, min(1.0, float(row[0] or 0)))
     except Exception:
         pass
+    if ENABLE_ESTABLISHED_TWITTER_FETCH and TWITTER_API_KEY:
+        try:
+            # Use the repo's social monitor so cache/credit behavior is shared.
+            from social_monitor import tier3_scan, _load_config
+            import social_monitor as _sm
+            cfg = _load_config()
+            _sm.TWITTER_API_KEY = cfg.get('twitter_key') or TWITTER_API_KEY
+            _sm.TWITTER_ENABLED = True
+            result = tier3_scan(symbol, chain='established',
+                                project_name=project_name or symbol)
+            if result and int(result.get('tweet_count') or 0) >= 3:
+                return max(-1.0, min(1.0, float(result.get('sentiment') or 0)))
+        except Exception:
+            pass
     return 0.0
+
+
+def _ai_cache_get(conn, symbol):
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS established_ai_cache (
+            symbol TEXT PRIMARY KEY,
+            ai_score REAL,
+            summary TEXT,
+            cached_at TEXT
+        )''')
+        row = conn.execute("""
+            SELECT ai_score, summary FROM established_ai_cache
+            WHERE symbol=? AND cached_at >= datetime('now', '-2 hours')
+        """, (symbol,)).fetchone()
+        if row:
+            return float(row[0] or 0), row[1] or 'cached'
+    except Exception:
+        pass
+    return None
+
+
+def _ai_cache_set(conn, symbol, score, summary):
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS established_ai_cache (
+            symbol TEXT PRIMARY KEY,
+            ai_score REAL,
+            summary TEXT,
+            cached_at TEXT
+        )''')
+        conn.execute("""
+            INSERT OR REPLACE INTO established_ai_cache
+            (symbol, ai_score, summary, cached_at) VALUES (?,?,?,datetime('now'))
+        """, (symbol, float(score), summary[:500]))
+        conn.commit()
+    except Exception:
+        pass
+
+
+def _score_established_ai(conn, symbol, meta, context):
+    """Optional paid OpenAI score for established tokens, cached for 2h."""
+    if not ENABLE_ESTABLISHED_AI or not OPENAI_API_KEY:
+        return 0.0, 'AI off'
+    cached = _ai_cache_get(conn, symbol)
+    if cached:
+        return cached
+    prompt = f"""You are a crypto portfolio risk analyst. Score {symbol} for a small short-term allocation.
+
+Context:
+- 24h change: {context.get('chg_24h', 0):+.2f}%
+- 7d change: {context.get('chg_7d', 0):+.2f}%
+- Fear & Greed: {context.get('fear_greed', 50)}
+- News sentiment score: {context.get('news_score', 0):+.2f}
+- Twitter sentiment score: {context.get('twitter_score', 0):+.2f}
+- Reddit sentiment score: {context.get('reddit_score', 0):+.2f}
+- CoinGecko trending: {context.get('trending', False)}
+
+Return JSON only:
+{{"score": <number from -1 to 1>, "summary": "one short reason"}}
+Positive means likely better risk-adjusted upside soon; negative means avoid."""
+    try:
+        r = requests.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={'Authorization': f'Bearer {OPENAI_API_KEY}',
+                     'Content-Type': 'application/json'},
+            json={
+                'model': _env('OPENAI_MODEL', 'gpt-4o-mini'),
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': 0.1,
+                'max_tokens': 120,
+            },
+            timeout=20)
+        if r.status_code == 200:
+            text = r.json()['choices'][0]['message']['content'].strip()
+            text = text.replace('```json', '').replace('```', '').strip()
+            data = json.loads(text)
+            score = max(-1.0, min(1.0, float(data.get('score', 0) or 0)))
+            summary = str(data.get('summary', 'AI scored'))
+            _ai_cache_set(conn, symbol, score, summary)
+            return score, summary
+    except Exception as e:
+        return 0.0, f'AI error: {str(e)[:60]}'
+    return 0.0, 'AI unavailable'
 
 
 # ── Main intelligence run ─────────────────────────────────────────────────────
@@ -359,6 +497,8 @@ def run_token_intelligence():
     print(f"    Trending: {', '.join(list(trending_syms)[:8])}")
 
     results = []
+    twitter_fetches = 0
+    ai_fetches = 0
     for symbol, meta in TRACKED_TOKENS.items():
         try:
             # Price momentum
@@ -374,10 +514,34 @@ def run_token_intelligence():
 
             # Reddit + Twitter from DB
             reddit_score = _score_reddit(conn, symbol, meta['reddit'])
-            twitter_score = _score_twitter(conn, symbol)
+            allow_twitter_fetch = (
+                ENABLE_ESTABLISHED_TWITTER_FETCH
+                and twitter_fetches < ESTABLISHED_TWITTER_MAX_PER_RUN
+            )
+            if not allow_twitter_fetch:
+                old = globals().get('ENABLE_ESTABLISHED_TWITTER_FETCH', False)
+                globals()['ENABLE_ESTABLISHED_TWITTER_FETCH'] = False
+                twitter_score = _score_twitter(conn, symbol, meta.get('cg_id', symbol))
+                globals()['ENABLE_ESTABLISHED_TWITTER_FETCH'] = old
+            else:
+                twitter_score = _score_twitter(conn, symbol, meta.get('cg_id', symbol))
+                twitter_fetches += 1
+
+            ai_score, ai_summary = 0.0, 'AI off'
+            if ENABLE_ESTABLISHED_AI and ai_fetches < ESTABLISHED_AI_MAX_PER_RUN:
+                ai_score, ai_summary = _score_established_ai(conn, symbol, meta, {
+                    'chg_24h': chg_24h,
+                    'chg_7d': chg_7d,
+                    'fear_greed': fg_value,
+                    'news_score': news_score,
+                    'twitter_score': twitter_score,
+                    'reddit_score': reddit_score,
+                    'trending': symbol in trending_syms,
+                })
+                ai_fetches += 1
 
             # Composite weighted score
-            composite = (
+            base_composite = (
                 WEIGHTS['fear_greed']     * fg_score +
                 WEIGHTS['price_momentum'] * mom_score +
                 WEIGHTS['trending']       * trend_score +
@@ -385,6 +549,9 @@ def run_token_intelligence():
                 WEIGHTS['reddit']         * reddit_score +
                 WEIGHTS['twitter']        * twitter_score
             )
+            composite = base_composite
+            if ENABLE_ESTABLISHED_AI and OPENAI_API_KEY:
+                composite = 0.85 * base_composite + 0.15 * ai_score
             composite = round(max(-1.0, min(1.0, composite)), 3)
 
             # Signal classification
@@ -403,7 +570,8 @@ def run_token_intelligence():
 
             notes = (f"F&G:{fg_value} 24h:{chg_24h:+.1f}% 7d:{chg_7d:+.1f}% "
                      f"trend:{'YES' if symbol in trending_syms else 'no'} "
-                     f"news:{news_score:+.2f} reddit:{reddit_score:+.2f} tw:{twitter_score:+.2f}"
+                     f"news:{news_score:+.2f} reddit:{reddit_score:+.2f} "
+                     f"tw:{twitter_score:+.2f} ai:{ai_score:+.2f} {ai_summary[:50]}"
                      + (" [macro_only]" if meta.get('macro_only') else ""))
 
             # Write to token_intelligence table
@@ -423,7 +591,8 @@ def run_token_intelligence():
 
             arrow = '▲' if composite > 0.1 else ('▼' if composite < -0.1 else '→')
             print(f"    {arrow} {symbol:<5} {signal:<12} score:{composite:+.2f} "
-                  f"({chg_24h:+.1f}%/24h, news:{news_score:+.2f})")
+                  f"({chg_24h:+.1f}%/24h, news:{news_score:+.2f}, "
+                  f"tw:{twitter_score:+.2f}, ai:{ai_score:+.2f})")
             results.append((symbol, composite, signal))
 
         except Exception as e:
