@@ -266,15 +266,17 @@ ENABLE_AI_RISK_VETO = _env('ENABLE_AI_RISK_VETO', 'false').lower().strip() == 't
 AI_MIN_TOTAL_SCORE = int(_env('AI_MIN_TOTAL_SCORE', '16'))
 ESTABLISHED_ALLOW_TOPUPS = _env('SIM_ESTABLISHED_ALLOW_TOPUPS', 'false').lower().strip() == 'true'
 ESTABLISHED_MAX_PROPOSALS = int(_env('SIM_ESTABLISHED_MAX_PROPOSALS', '3'))
-TARGET_ESTABLISHED_PCT = float(_env('SIM_TARGET_ESTABLISHED_PCT', '0.60'))
-TARGET_GEMS_PCT = float(_env('SIM_TARGET_GEMS_PCT', '0.25'))
-TARGET_LISTINGS_PCT = float(_env('SIM_TARGET_LISTINGS_PCT', '0.15'))
+TARGET_ESTABLISHED_PCT = float(_env('SIM_TARGET_ESTABLISHED_PCT', '0.70'))
+TARGET_GEMS_PCT = float(_env('SIM_TARGET_GEMS_PCT', '0.20'))
+TARGET_LISTINGS_PCT = float(_env('SIM_TARGET_LISTINGS_PCT', '0.10'))
 SIM_ESTABLISHED_MAX_USD = float(_env('SIM_ESTABLISHED_MAX_USD', '2.0'))
-SIM_GEM_MAX_USD = float(_env('SIM_GEM_MAX_USD', '0.75'))
+SIM_GEM_MAX_USD = float(_env('SIM_GEM_MAX_USD', '0.50'))
 SIM_LISTING_MAX_USD = float(_env('SIM_LISTING_MAX_USD', '1.0'))
-SIM_MIN_ALLOC_SCORE = float(_env('SIM_MIN_ALLOC_SCORE', '58'))
-SIM_MAX_NEW_BUYS_PER_CYCLE = int(_env('SIM_MAX_NEW_BUYS_PER_CYCLE', '4'))
+SIM_MIN_ALLOC_SCORE = float(_env('SIM_MIN_ALLOC_SCORE', '65'))
+SIM_MAX_NEW_BUYS_PER_CYCLE = int(_env('SIM_MAX_NEW_BUYS_PER_CYCLE', '2'))
 SIM_LIQUIDATE_ON_END = _env('SIM_LIQUIDATE_ON_END', 'dry').lower().strip()
+SIM_PRICE_MISS_EXIT_COUNT = int(_env('SIM_PRICE_MISS_EXIT_COUNT', '4'))
+SIM_FORCE_RUG_ON_PRICE_MISS = _env('SIM_FORCE_RUG_ON_PRICE_MISS', 'false').lower().strip() == 'true'
 
 # ── Single-writer DB queue ─────────────────────────────────────────────────────
 import queue as _queue
@@ -715,12 +717,18 @@ class SimPortfolio:
                 price = 0
             if not price or price <= 0:
                 pos['_zero_count'] = pos.get('_zero_count', 0) + 1
-                if pos['_zero_count'] >= 1:
-                    # Price unavailable = rug. Sell at near-zero.
-                    price = buy_price * 0.001
-                    print(f"    RUG {sym}: price=0, force stop-loss")
-                else:
+                family = _proposal_family(pos)
+                print(f"    PRICE MISS {sym} ({chain}) {pos['_zero_count']}/{SIM_PRICE_MISS_EXIT_COUNT}")
+                if family == 'ESTABLISHED':
                     continue
+                if pos['_zero_count'] < SIM_PRICE_MISS_EXIT_COUNT:
+                    continue
+                if not SIM_FORCE_RUG_ON_PRICE_MISS:
+                    # Missing API data is not proof of a rug. Keep the position
+                    # and let future samples or exact-pair pricing resolve it.
+                    continue
+                price = buy_price * 0.001
+                print(f"    RUG {sym}: repeated price misses, force stop-loss")
             else:
                 pos['_zero_count'] = 0
                 pos['_last_price'] = price
@@ -730,10 +738,17 @@ class SimPortfolio:
             if 'stop_loss_override' in pos_data:
                 effective_stop = pos_data['stop_loss_override']
             else:
-                effective_stop = {
-                    'solana': -20.0, 'bsc': -20.0,
-                    'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
-                }.get(chain, -30.0)
+                family = _proposal_family(pos_data)
+                if family == 'ESTABLISHED':
+                    effective_stop = {
+                        'solana': -8.0, 'base': -8.0,
+                        'ethereum': -8.0, 'arbitrum': -8.0
+                    }.get(chain, -8.0)
+                else:
+                    effective_stop = {
+                        'solana': -18.0, 'bsc': -18.0,
+                        'base': -18.0, 'ethereum': -18.0, 'arbitrum': -18.0
+                    }.get(chain, -18.0)
             if pnl_pct <= effective_stop:
                 ok, msg = self.sell(sym, chain, price, 'stop_loss')
                 if ok:
@@ -858,12 +873,17 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                         price = 0
                     if not price or price <= 0:
                         pos['_zero_count'] = pos.get('_zero_count', 0) + 1
-                        # Fire stop-loss after 1 failed price fetch (rug detected)
-                        if pos['_zero_count'] >= 1:
-                            price = buy_price * 0.001  # treat as near-zero
-                            print(f"\n    [MONITOR] {sym} price=0 -- RUG detected, stop-loss")
-                        else:
+                        family = _proposal_family(pos)
+                        print(f"\n    [MONITOR] PRICE MISS {sym} ({chain}) "
+                              f"{pos['_zero_count']}/{SIM_PRICE_MISS_EXIT_COUNT}")
+                        if family == 'ESTABLISHED':
                             continue
+                        if pos['_zero_count'] < SIM_PRICE_MISS_EXIT_COUNT:
+                            continue
+                        if not SIM_FORCE_RUG_ON_PRICE_MISS:
+                            continue
+                        price = buy_price * 0.001
+                        print(f"\n    [MONITOR] {sym} repeated price misses -- forced rug stop")
                     else:
                         pos['_zero_count'] = 0
                         pos['_last_price'] = price  # track last known price
@@ -873,10 +893,17 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                     if 'stop_loss_override' in pos_data:
                         effective_stop = pos_data['stop_loss_override']
                     else:
-                        effective_stop = {
-                            'solana': -20.0, 'bsc': -20.0,
-                            'base': -40.0, 'ethereum': -40.0, 'arbitrum': -35.0
-                        }.get(chain, stop_loss)
+                        family = _proposal_family(pos_data)
+                        if family == 'ESTABLISHED':
+                            effective_stop = {
+                                'solana': -8.0, 'base': -8.0,
+                                'ethereum': -8.0, 'arbitrum': -8.0
+                            }.get(chain, -8.0)
+                        else:
+                            effective_stop = {
+                                'solana': -18.0, 'bsc': -18.0,
+                                'base': -18.0, 'ethereum': -18.0, 'arbitrum': -18.0
+                            }.get(chain, stop_loss)
                     if pnl_pct <= effective_stop:
                         ok, msg = portfolio.sell(sym, chain, price, 'stop_loss')
                         if ok:
