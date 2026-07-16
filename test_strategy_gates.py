@@ -66,9 +66,9 @@ class StrategyGateTests(unittest.TestCase):
                 'm5': -1.0, 'h1': -1.0, 'h6': -2.0, 'h24': -3.0,
                 'buy_sell_ratio': 1.2, 'source': 'test',
             }
-            simulation._social_snapshot = lambda *a, **k: {
-                'signal': 'BUY', 'tweets': 10, 'sentiment': 0.5,
-            }
+            simulation._social_snapshot = lambda *a, **k: ({
+                'signal': 'BUY', 'tweets': 10, 'tweet_count': 10, 'sentiment': 0.5,
+            }, True)
             ok, reason, _ = simulation._speculative_market_gate({
                 'symbol': 'MENTIONED',
                 'chain': 'solana',

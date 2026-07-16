@@ -153,18 +153,6 @@ def fetch_rekt_news():
             except Exception:
                 pass
 
-        # Last fallback: parse known hacks from a hardcoded recent list
-        # This ensures Kelp DAO and other known hacks always show
-        KNOWN_RECENT_HACKS = [
-            {'protocol': 'Kelp DAO', 'coin_id': 'kelp-dao', 'type': 'EXPLOIT',
-             'severity': 'CRITICAL', 'amount': 290_000_000,
-             'description': 'rsETH oracle manipulation — $290M at risk, funds frozen',
-             'chain': 'ethereum', 'url': 'https://rekt.news/kelp-dao-rekt/',
-             'date': '2026-04-15', 'source': 'hardcoded'},
-        ]
-        for h in KNOWN_RECENT_HACKS:
-            events.append(h)
-
         print(f"      Found {len(events)} hack records")
     except Exception as e:
         print(f"      Failed: {e}")

@@ -355,21 +355,6 @@ def _score_twitter(conn, symbol: str, project_name='') -> float:
         pass
     try:
         row = conn.execute("""
-            SELECT sentiment_score, tweet_count, total_engagement
-            FROM x_sentiment
-            WHERE cashtag=?
-            AND fetched_at >= datetime('now', '-3 hours')
-            ORDER BY fetched_at DESC LIMIT 1
-        """, (f'${symbol}',)).fetchone()
-        if row:
-            sent = float(row[0] or 0)
-            tweets = int(row[1] or 0)
-            if tweets >= 3:
-                return max(-1.0, min(1.0, sent))
-    except Exception:
-        pass
-    try:
-        row = conn.execute("""
             SELECT sentiment_score, tweet_count
             FROM token_social_cache
             WHERE symbol=?

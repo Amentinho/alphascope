@@ -65,6 +65,79 @@ RUG_PATTERNS = ['v2', 'v3', 'inu2', 'classic', 'old', 'real', 'original']
 
 _stream_active = False
 _bought_this_session = set()    # avoid double-buying same token
+_portfolio_ref = None            # SimPortfolio instance — set by start_pumpfun_stream()
+PUMPFUN_TOTAL_SUPPLY = 1_000_000_000  # fixed for every standard PumpFun launch
+
+
+def _derive_price_usd(data: dict, mint: str) -> float:
+    """
+    Price a PumpFun token at buy time. Same technique as kol_tracker.py's
+    _derive_price_usd: ungraduated bonding-curve tokens have no DexScreener/
+    GeckoTerminal listing at all, but PumpPortal's own event payload carries
+    marketCapSol, and every standard PumpFun launch has a fixed 1B supply.
+    """
+    sol_price = 0.0
+    try:
+        from simulation import resolve_price
+        sol_price = resolve_price('SOL', chain='solana', use_cache=True)
+    except Exception:
+        pass
+
+    mcap_sol = float(data.get('marketCapSol', 0) or 0)
+    if mcap_sol > 0 and sol_price > 0:
+        return (mcap_sol / PUMPFUN_TOTAL_SUPPLY) * sol_price
+
+    try:
+        from simulation import resolve_price
+        symbol = data.get('symbol', '') or ''
+        price = resolve_price(symbol, coin_id=mint, chain='solana', use_cache=False)
+        if price > 0:
+            return price
+    except Exception:
+        pass
+    return 0.0
+
+
+def _register_position(mint, symbol, data, sol_amount=None, usd_amount=None):
+    """
+    Book a PumpFun buy into the shared sim portfolio so check_exits()/
+    run_price_monitor() actually manage stop-loss/take-profit on it.
+
+    Without this: buy_pumpfun_token() executes directly via PumpPortal,
+    bypassing portfolio.buy() entirely, and the dex_gems row this used to
+    write had price_usd/liquidity_usd hardcoded to 0 — which
+    _load_dex_proposals()'s liquidity filter silently drops forever. The
+    token just sat in the wallet with no automated exit, in either paper
+    or live mode.
+
+    Pass sol_amount for fresh-launch buys (SOL-denominated) or usd_amount
+    for graduation buys (which spend a flat USD amount via executor.on_buy).
+    """
+    if _portfolio_ref is None:
+        print(f"  ⚠️  PumpFun {symbol}: no portfolio wired up — not tracked for auto stop-loss/take-profit")
+        return
+    price_usd = _derive_price_usd(data, mint)
+    if price_usd <= 0:
+        print(f"  ⚠️  PumpFun {symbol}: price unavailable — NOT tracked for stop-loss/take-profit. Monitor manually.")
+        return
+    if usd_amount is not None:
+        usd_spent = usd_amount
+    else:
+        sol_price = 0.0
+        try:
+            from simulation import resolve_price
+            sol_price = resolve_price('SOL', chain='solana', use_cache=True)
+        except Exception:
+            pass
+        usd_spent = (sol_amount or 0) * sol_price if sol_price > 0 else 1.0
+    ok, msg = _portfolio_ref.record_position(
+        symbol, 'solana', usd_spent, price_usd,
+        source='pumpfun_stream', contract=mint,
+        dex_url=f"https://pump.fun/{mint}", category='DEX_GEM')
+    if ok:
+        print(f"  📡 PumpFun {symbol}: registered for exit management @ ${price_usd:.8g}")
+    else:
+        print(f"  ⚠️  PumpFun {symbol}: bought but NOT registered for auto-exit ({msg}) — needs manual monitoring")
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -355,6 +428,10 @@ def handle_graduation(data: dict):
         print(f"  📄 [PAPER] Graduation buy {symbol} ({mint[:8]}) — no real tx")
         _record_paper_buy(mint, symbol, BUY_SOL_AMOUNT)
         _bought_this_session.add(mint)
+        # Graduated = real AMM pool exists now, so this resolves via the
+        # normal DexScreener/GeckoTerminal path rather than marketCapSol.
+        # Matches the flat $1 the live branch below spends via on_buy().
+        _register_position(mint, symbol, data, usd_amount=1.0)
         return
     try:
         from executor import on_buy
@@ -364,6 +441,7 @@ def handle_graduation(data: dict):
             _bought_this_session.add(mint)
             print(f"  🎓 Graduation buy {symbol} ({mint[:8]}) ✅")
             _save_launch(mint, data, 80, bought=True)
+            _register_position(mint, symbol, data, usd_amount=1.0)
         else:
             print(f"  🎓 Graduation buy {symbol} failed: {result.get('error','')[:60]}")
     except Exception as e:
@@ -459,26 +537,7 @@ def _handle_new_token(data: dict):
         _bought_this_session.add(mint)
         _save_launch(mint, data, score, bought=True)
 
-        # Write to dex_gems so simulation.py can track it and set stop-loss
-        try:
-            conn = sqlite3.connect(MAIN_DB, timeout=5)
-            conn.execute("""INSERT OR IGNORE INTO dex_gems
-                (symbol, chain, contract_address, dex_url, price_usd, liquidity_usd,
-                 age_hours, cross_score, price_change_24h, fetched_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""", (
-                symbol, 'solana', mint,
-                f"https://pump.fun/{mint}",
-                0,          # price unknown at launch
-                0,          # liquidity unknown at launch
-                0,          # brand new
-                9,          # high score — manually bought
-                0,
-                datetime.now(timezone.utc).isoformat(),
-            ))
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+        _register_position(mint, symbol, data, BUY_SOL_AMOUNT)
 
         # Send Telegram alert
         try:
@@ -498,13 +557,23 @@ def _handle_new_token(data: dict):
 
 
 # ── Thread entry point ────────────────────────────────────────────────────────
-def start_pumpfun_stream():
-    """Start the PumpFun stream in a background daemon thread."""
-    global _stream_active
+def start_pumpfun_stream(portfolio=None):
+    """
+    Start the PumpFun stream in a background daemon thread.
+
+    portfolio: the running SimPortfolio instance. Required for bought
+    tokens to be registered for stop-loss/take-profit management — without
+    it, buys still execute (live mode) but nothing will ever sell them.
+    """
+    global _stream_active, _portfolio_ref
     if _stream_active:
         print("  [pumpfun] stream already running")
         return
     _stream_active = True
+    _portfolio_ref = portfolio
+    if portfolio is None:
+        print("  ⚠️  PumpFun stream: no portfolio passed — bought tokens will NOT "
+              "be tracked for auto stop-loss/take-profit")
 
     def _run():
         loop = asyncio.new_event_loop()

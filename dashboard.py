@@ -26,6 +26,15 @@ def get_db():
 def get_sim_db():
     return sqlite3.connect(SIM_DB, timeout=30)
 
+HUNTER_DB = _os.path.join(_BASE_DIR, 'hunter.db')
+SOURCES_DB = _os.path.join(_BASE_DIR, 'sources.db')
+
+def get_hunter_db():
+    return sqlite3.connect(HUNTER_DB, timeout=30)
+
+def get_sources_db():
+    return sqlite3.connect(SOURCES_DB, timeout=30)
+
 # ============================================================
 # DATA LOADERS
 # ============================================================
@@ -193,6 +202,54 @@ def load_dex_gems():
                ORDER BY cross_score DESC, liquidity_usd DESC LIMIT 25""", conn)
         conn.close()
         return df
+    except Exception:
+        return pd.DataFrame()
+
+def load_hunter_opportunities():
+    """Opportunity hunter's tracked airdrops/presales/launchpads — lives in
+    its own hunter.db, previously invisible from this dashboard."""
+    try:
+        conn = get_hunter_db()
+        df = pd.read_sql_query(
+            """SELECT type, name, score, status, chain, reward_estimate,
+                      deadline, url, detected_at
+               FROM tracked_opportunities
+               WHERE status IN ('NEW', 'ALERTED', 'PARTICIPATING')
+               ORDER BY score DESC, detected_at DESC LIMIT 20""", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def load_discovered_sources():
+    """Newly-discovered Telegram/Reddit/Twitter sources — lives in its own
+    sources.db, previously invisible from this dashboard."""
+    try:
+        conn = get_sources_db()
+        frames = []
+        # Each table names its identity column differently, and only two of
+        # the three even have a quality_score column — normalize both here
+        # rather than assuming a shared schema.
+        table_specs = (
+            ('telegram_sources', 'Telegram', 'channel', True),
+            ('reddit_sources',   'Reddit',   'subreddit', True),
+            ('twitter_sources',  'Twitter',  'username', False),
+        )
+        for table, platform, name_col, has_quality in table_specs:
+            try:
+                order_by = "ORDER BY quality_score DESC" if has_quality else "ORDER BY id DESC"
+                df = pd.read_sql_query(f"SELECT * FROM {table} {order_by} LIMIT 10", conn)
+                df.insert(0, 'platform', platform)
+                df['name'] = df[name_col]
+                if not has_quality:
+                    df['quality_score'] = None
+                frames.append(df)
+            except Exception:
+                continue
+        conn.close()
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True, sort=False)
     except Exception:
         return pd.DataFrame()
 
@@ -367,6 +424,7 @@ app.layout = html.Div(style={
             ('buzz', '🔥 Buzz'), ('narratives', '📡 Narratives'),
             ('listings', '🏦 Listings'), ('whales', '🐋 Whales'), ('news', '📰 News'),
             ('macro', '🏦 Macro'), ('reddit', '💬 Reddit'), ('x', '🐦 X'),
+            ('opportunities', '🔍 Opportunities'), ('discovery', '📡 Discovery'),
         ]
     ]),
 
@@ -574,7 +632,7 @@ def update_main(_):
 # ============================================================
 @app.callback(
     [Output('detail-panel', 'children'), Output('detail-panel', 'style')],
-    [Input(f'tab-{t}', 'n_clicks') for t in ['portfolio','agent','watchlist','dexgems','alpha','airdrops2','buzz','narratives','listings','whales','news','macro','reddit','x']],
+    [Input(f'tab-{t}', 'n_clicks') for t in ['portfolio','agent','watchlist','dexgems','alpha','airdrops2','buzz','narratives','listings','whales','news','macro','reddit','x','opportunities','discovery']],
 )
 def show_detail(*clicks):
     ctx = callback_context
@@ -852,7 +910,47 @@ def show_detail(*clicks):
                 html.Span(f"{r['sentiment_label']} ({score:+.2f})", style={'color': col}),
             ]))
         return items, style
-    
+
+    elif tab == 'opportunities':
+        df = load_hunter_opportunities()
+        items = [html.H3("🔍 Opportunity Hunter — Airdrops / Presales / Launchpads",
+                          style={'color': '#ffaa00', 'marginBottom': '10px'})]
+        if df.empty:
+            items.append(html.P("No tracked opportunities yet — opportunity_hunter.py populates this "
+                                 "(lives in hunter.db, separate from the main DB)", style={'color': '#666'}))
+        for _, r in df.iterrows():
+            emoji = {'AIRDROP': '🪂', 'PRESALE': '🚀', 'LAUNCHPAD': '🏦'}.get(r['type'], '📌')
+            status_col = '#ffdd00' if r['status'] in ('NEW', 'ALERTED') else '#00cc44' if r['status'] == 'PARTICIPATING' else '#888'
+            items.append(html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'padding': '6px 0',
+                                          'borderBottom': '1px solid #2a2a4a', 'flexWrap': 'wrap', 'gap': '8px'}, children=[
+                html.Span(f"{emoji} {r['name']} ({r['chain'] or '?'})", style={'color': '#fff', 'fontWeight': 'bold', 'minWidth': '160px'}),
+                html.Span(f"⭐{r['score']}", style={'color': '#888', 'fontSize': '11px'}),
+                html.Span(r.get('reward_estimate') or '', style={'color': '#00cc44', 'fontSize': '11px'}),
+                html.Span(r['status'], style={'color': status_col, 'fontSize': '11px'}),
+                html.Span(str(r.get('detected_at', ''))[:16], style={'color': '#555', 'fontSize': '10px'}),
+            ]))
+        return items, style
+
+    elif tab == 'discovery':
+        df = load_discovered_sources()
+        items = [html.H3("📡 Source Discovery — New Telegram/Reddit/Twitter Feeds",
+                          style={'color': '#00d4ff', 'marginBottom': '10px'})]
+        if df.empty:
+            items.append(html.P("No discovered sources yet — source_discovery.py populates this "
+                                 "(lives in sources.db, separate from the main DB)", style={'color': '#666'}))
+        for _, r in df.iterrows():
+            added = r.get('added_to_fetcher')
+            added_col = '#00cc44' if added else '#888'
+            quality = r.get('quality_score')
+            quality_str = f"quality:{quality:.0f}" if pd.notna(quality) else "quality: n/a"
+            items.append(html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'padding': '6px 0',
+                                          'borderBottom': '1px solid #2a2a4a', 'flexWrap': 'wrap', 'gap': '8px'}, children=[
+                html.Span(f"[{r.get('platform','?')}] {r.get('name', '?')}", style={'color': '#fff', 'fontWeight': 'bold', 'minWidth': '180px'}),
+                html.Span(quality_str, style={'color': '#888', 'fontSize': '11px'}),
+                html.Span('✅ in fetcher' if added else '⏳ not yet imported', style={'color': added_col, 'fontSize': '11px'}),
+            ]))
+        return items, style
+
     return [], {**CARD, 'display': 'none'}
 
 # ── AI BRIEF ──

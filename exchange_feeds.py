@@ -23,15 +23,25 @@ EXCHANGE_FEEDS = [
     ('Gate.io', 'https://www.gate.com/api/v3/announcement_html/list?type=newlistings&page=1&limit=20', 'json_gate'),
     ('MEXC', 'https://www.mexc.com/api/operateactivity/article/list?page=1&pageSize=20&type=2', 'json_mexc'),
     ('OKX', 'https://www.okx.com/api/v5/support/announcements?annType=announcements-new-listings&page=1', 'json_okx'),
+    ('Bybit', 'https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&limit=20', 'json_bybit'),
+
+    # The five below were disabled with no explanation in the source. Tested
+    # each endpoint directly (2026-07-16) — every one is genuinely broken,
+    # not just outdated caution: Bitget 404, Upbit 400, Bithumb 403, LBank
+    # 404. BingX returns HTTP 200 but serves its client-rendered SPA shell
+    # (content-type text/html) instead of the XML the URL implies — parses
+    # to 0 items every time, a silent failure rather than a loud one. (Bybit
+    # was in this same broken state — its legacy api2.bybit.com endpoint
+    # returned 405 — fixed above using the current documented V5 API.)
+    # Each exchange has moved or changed its public API since these URLs were
+    # written. Re-enabling any of them needs a current, verified endpoint —
+    # uncommenting as-is adds silent no-op calls, not real coverage. Left
+    # here as a to-do, not deleted, since the exchanges themselves are still
+    # worth covering once someone finds the new URLs.
     # ('Bitget', 'https://www.bitget.com/v1/cms/helpCenter/content/section/articles?firstSectionId=27&secondarySectionId=148&language=en_US&pageNo=1&pageSize=20', 'json_bitget'),
-    # ('Bybit', 'https://api2.bybit.com/announcements/api/search/v1/index/announcement-result?category=new_crypto&page_no=1&page_size=20&locale=en-US', 'json_bybit'),
-    
-    # Tier 3 — Asia-first (very early signals)
     # ('Upbit KR', 'https://api-manager.upbit.com/api/v1/announcements?os=web&per_page=20&category=trade', 'json_upbit'),
     # ('Bithumb KR', 'https://feed.bithumb.com/notice', 'rss'),
     # ('BingX', 'https://bingx.com/en-us/support/notice-center/articles/feed.xml', 'rss'),
-    
-    # Tier 4 — Specialty  
     # ('LBank', 'https://www.lbank.com/cms-api/v1/articles?categoryCode=announcement&pageNum=1&pageSize=20', 'json_lbank'),
 ]
 

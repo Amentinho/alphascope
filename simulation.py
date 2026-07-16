@@ -50,6 +50,101 @@ REAL_PORTFOLIO = {
 # Note: entry_price = your actual purchase price (cost basis), never changes
 # T=0 price = live price at sim launch, used for session P&L tracking
 
+def _live_sol_balance():
+    """
+    Read the live SOL balance for the wallet derived from SOL_PRIVATE_KEY.
+    Public-key derivation only — never touches the private key beyond
+    deriving the address, and never signs or sends anything.
+    """
+    try:
+        from executor import _sol_keypair, SOL_RPC_FALLBACKS
+        kp = _sol_keypair()
+        if not kp:
+            return None
+        pubkey = str(kp.pubkey())
+        for rpc in (SOL_RPC_FALLBACKS or ['https://api.mainnet-beta.solana.com']):
+            try:
+                r = requests.post(rpc, json={
+                    'jsonrpc': '2.0', 'id': 1, 'method': 'getBalance',
+                    'params': [pubkey]}, timeout=8)
+                if r.status_code == 200:
+                    lamports = r.json().get('result', {}).get('value')
+                    if lamports is not None:
+                        return lamports / 1e9
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _verify_real_portfolio_against_wallet(tolerance_pct=2.0):
+    """
+    Cross-check REAL_PORTFOLIO's hardcoded amounts against live on-chain
+    balances — EVM via wallet_reader.py, Solana via the SOL_PRIVATE_KEY's
+    derived public address. Cost basis (entry_price) can't be read on-chain
+    — that stays user-maintained — but the token AMOUNT can and should be
+    verified, since a manually-edited dict silently drifts from reality the
+    moment you buy/sell without updating this file.
+
+    Read-only: only warns on mismatch, never edits REAL_PORTFOLIO or the DB.
+    """
+    mismatches = []
+
+    try:
+        from executor import _env
+        addr = _env('EVM_WALLET_ADDRESS', '')
+    except Exception:
+        addr = ''
+
+    live_by_key = {}
+    if addr:
+        try:
+            from wallet_reader import import_evm_wallet
+            live = import_evm_wallet(addr, chains=['ethereum', 'base'], dry_run=True)
+            live_by_key = {(p['symbol'], p['chain']): p['amount'] for p in (live or [])}
+        except Exception as e:
+            print(f"  ⚠️  EVM wallet verification skipped: {e}")
+
+    for chain, positions in REAL_PORTFOLIO.items():
+        if chain not in ('ethereum', 'base'):
+            continue
+        for pos in positions:
+            live_amt = live_by_key.get((pos['symbol'], chain))
+            if live_amt is None:
+                continue
+            hardcoded_amt = pos['amount']
+            if hardcoded_amt <= 0:
+                continue
+            drift_pct = abs(live_amt - hardcoded_amt) / hardcoded_amt * 100
+            if drift_pct > tolerance_pct:
+                mismatches.append(
+                    f"{pos['symbol']} ({chain}): REAL_PORTFOLIO says {hardcoded_amt}, "
+                    f"wallet has {live_amt:.4f} ({drift_pct:+.1f}% drift)")
+
+    sol_live = _live_sol_balance()
+    if sol_live is not None:
+        for pos in REAL_PORTFOLIO.get('solana', []):
+            if pos['symbol'] != 'SOL' or pos['amount'] <= 0:
+                continue
+            drift_pct = abs(sol_live - pos['amount']) / pos['amount'] * 100
+            if drift_pct > tolerance_pct:
+                mismatches.append(
+                    f"SOL (solana): REAL_PORTFOLIO says {pos['amount']}, "
+                    f"wallet has {sol_live:.4f} ({drift_pct:+.1f}% drift)")
+    else:
+        print("  ⚠️  Solana wallet verification skipped: no SOL_PRIVATE_KEY or all RPCs failed")
+
+    if mismatches:
+        print("  ⚠️  REAL_PORTFOLIO is stale vs. live wallet balance:")
+        for m in mismatches:
+            print(f"      {m}")
+        print("      Update the hardcoded amounts in simulation.py's REAL_PORTFOLIO dict.")
+    else:
+        checked = [c for c, ok in (('ethereum/base', bool(live_by_key)), ('solana', sol_live is not None)) if ok]
+        print(f"  ✅ REAL_PORTFOLIO amounts match live wallet balance ({', '.join(checked) or 'nothing checked'})")
+
+
 CG_IDS = {
     'BTC':'bitcoin','ETH':'ethereum','SOL':'solana','BNB':'binancecoin',
     'LINK':'chainlink','HYPE':'hyperliquid','AAVE':'aave','UNI':'uniswap',
@@ -86,6 +181,14 @@ BINANCE_SYMBOLS = {
     'LINK':'LINKUSDT','HYPE':'HYPEUSDT','XRP':'XRPUSDT','ADA':'ADAUSDT',
     'DOGE':'DOGEUSDT','AVAX':'AVAXUSDT','ATOM':'ATOMUSDT','NEAR':'NEARUSDT',
     'ARB':'ARBUSDT','AAVE':'AAVEUSDT','UNI':'UNIUSDT','LTC':'LTCUSDT',
+    # Established registry tokens — must match _CONTRACT_REGISTRY 'binance' fields
+    # so buy price (Binance) and sell/exit price (resolve_price) use the SAME
+    # source. Mixing Binance-for-buy with GeckoTerminal/DexScreener-for-sell
+    # let a single bad third-party tick masquerade as a 4,000%+ "win".
+    'JUP':'JUPUSDT','RAY':'RAYUSDT','BONK':'BONKUSDT','WIF':'WIFUSDT',
+    'PYTH':'PYTHUSDT','ONDO':'ONDOUSDT','ENA':'ENAUSDT','LDO':'LDOUSDT',
+    'PENDLE':'PENDLEUSDT','CRV':'CRVUSDT','FET':'FETUSDT','PEPE':'PEPEUSDT',
+    'SHIB':'SHIBUSDT','AERO':'AEROUSDT','VIRTUAL':'VIRTUALUSDT',
 }
 
 
@@ -239,6 +342,21 @@ def resolve_price(symbol, coin_id='', chain='', use_cache=True, dex_url=''):
     if price > 0:
         _price_cache[cache_key] = (price, time.time())
     return price
+
+
+# Max plausible move between buy and a live exit tick. Positions really can
+# move fast, but a fresh DEX_GEM microcap doing 20x in one poll is far more
+# likely a bad tick (wrong pool matched, stale/corrupted API response) than
+# a genuine move. Catches exactly the JUP/RAY/BONK/WIF class of bug where a
+# single bad third-party tick got recorded as a 4,000%+ "win".
+MAX_SANE_PRICE_MULTIPLE = 20.0
+
+def _is_sane_exit_price(buy_price, price):
+    """Reject a resolved price that implausibly deviates from cost basis."""
+    if buy_price <= 0 or price <= 0:
+        return False
+    ratio = price / buy_price
+    return (1.0 / MAX_SANE_PRICE_MULTIPLE) <= ratio <= MAX_SANE_PRICE_MULTIPLE
 
 
 SIM_DB = 'sim.db'      # sim writes here (no contention with fetcher)
@@ -647,6 +765,54 @@ class SimPortfolio:
             print(f"    executor buy alert/balance error: {e}")
         return True, f"bought {tokens:.4f} {symbol} @ ${price:.8f}"
 
+    def record_position(self, symbol, chain, usd, price, source='agent',
+                        contract='', dex_url='', category='', allocation_score=0):
+        """
+        Book a position whose on-chain execution already happened elsewhere
+        (e.g. kol_tracker's direct PumpPortal copy-trade). Does NOT call
+        executor.on_buy — the caller already executed the real trade.
+        Once booked here it's a normal holding: check_exits() and
+        run_price_monitor() manage its stop-loss/take-profit exactly like
+        any other position. Without this, externally-executed buys had no
+        exit path at all — they'd sit in the wallet forever unmanaged.
+
+        Enforces the same per-chain position-count cap run_agent_cycle uses,
+        since kol_tracker.py and pumpfun_stream.py both call this on a
+        background thread with no visibility into what the main strategy
+        already holds — cash is naturally shared via self.cash, but the
+        position-count limit isn't, unless checked here too.
+        """
+        if price <= 0:
+            return False, "price is zero"
+        if not self.can_buy(chain, usd):
+            return False, f"insufficient cash (${self.cash.get(chain,0):.2f})"
+        chain_limit = 4 if chain in ('solana', 'bsc') else 3
+        current_count = sum(1 for pos in self.holdings.values()
+                            if pos.get('chain') == chain and not pos.get('is_real'))
+        if current_count >= chain_limit:
+            return False, f"chain position limit reached for {chain} ({current_count}/{chain_limit})"
+        tokens = usd / price
+        self.cash[chain] -= usd
+        key = f"{symbol}_{chain}"
+        self.holdings[key] = {
+            'symbol': symbol, 'chain': chain, 'amount': tokens,
+            'buy_price': price, 'buy_time': datetime.now().isoformat(),
+            'usd_spent': usd, 'source': source,
+            'coin_id': contract,
+            'dex_url': dex_url,
+            'category': category or _proposal_family({'category': '', 'sources': source}),
+            'allocation_score': allocation_score,
+            'is_real': False, '_zero_count': 0,
+        }
+        self.trades.append({
+            'action': 'BUY', 'symbol': symbol, 'chain': chain,
+            'usd': usd, 'price': price, 'tokens': tokens,
+            'time': datetime.now().isoformat(), 'source': source,
+            'coin_id': contract, 'dex_url': dex_url,
+            'category': category, 'allocation_score': allocation_score,
+        })
+        return True, f"recorded {tokens:.4f} {symbol} @ ${price:.8f}"
+
     def sell(self, symbol, chain, price, reason='signal'):
         key = f"{symbol}_{chain}"
         if key not in self.holdings:
@@ -714,6 +880,10 @@ class SimPortfolio:
                                       chain=chain, use_cache=False,
                                       dex_url=pos.get('dex_url', ''))
             except Exception:
+                price = 0
+            if price and price > 0 and not _is_sane_exit_price(buy_price, price):
+                print(f"    BAD TICK {sym} ({chain}): ${price:.8g} vs buy ${buy_price:.8g} "
+                      f"— rejecting, treating as price miss")
                 price = 0
             if not price or price <= 0:
                 pos['_zero_count'] = pos.get('_zero_count', 0) + 1
@@ -870,6 +1040,10 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                                               use_cache=True,
                                               dex_url=pos.get('dex_url', ''))
                     except Exception:
+                        price = 0
+                    if price and price > 0 and not _is_sane_exit_price(buy_price, price):
+                        print(f"\n    [MONITOR] BAD TICK {sym} ({chain}): ${price:.8g} "
+                              f"vs buy ${buy_price:.8g} — rejecting, treating as price miss")
                         price = 0
                     if not price or price <= 0:
                         pos['_zero_count'] = pos.get('_zero_count', 0) + 1
@@ -1622,24 +1796,87 @@ def _candidate_watchlist_gate(p, price, snapshot):
     return False, 'watching candidate (first sighting)'
 
 
-def _social_snapshot(symbol, chain):
+_LIVE_SEARCH_CATEGORIES = ('DEX_GEM', 'ESTABLISHED')
+
+def _social_snapshot(symbol, chain, category='', live_search=False):
+    """
+    Social signal for a buy candidate. Prefers the background cache (cheap,
+    already paid for). Only does a live, on-demand Twitter search when
+    live_search=True AND category is DEX_GEM or ESTABLISHED — a real gem is
+    expected to have organic momentum, and momentum on an established coin
+    right before spending real money is itself a leading pump signal. A
+    listing is validated by the exchange announcement itself, not virality,
+    so spending API credit searching for its ticker doesn't buy anything.
+
+    Without the live fallback, most candidates were relying entirely on
+    fetcher.py's background scan, which only covers ~8 new gems per
+    30-minute cycle and a fixed cashtag list for established coins — many
+    candidates reached this gate with zero real Twitter data, and "no
+    signal" looked identical to "we never checked."
+
+    Returns (snapshot_dict_or_None, checked: bool) — `checked` distinguishes
+    "we actively looked and found nothing" from "we never looked at all",
+    which matters for gems specifically (see _speculative_market_gate).
+    """
     try:
         from social_monitor import get_social_signal
-        return get_social_signal(symbol, chain)
+        cached = get_social_signal(symbol, chain)
+        if cached:
+            return cached, True
     except Exception:
-        return None
+        return None, False
+
+    if category not in _LIVE_SEARCH_CATEGORIES or not live_search:
+        return None, False
+
+    # No cache hit — do a live search, but only spend a credit if Twitter is
+    # actually configured and the session budget isn't exhausted. This also
+    # writes the result to token_social_cache via tier1_scan, so even when
+    # it can't change this cycle's already-computed established ranking, it
+    # feeds the next token_intelligence refresh with fresher data.
+    try:
+        from social_monitor import tier1_scan, _can_use_twitter, _load_config
+        cfg = _load_config()
+        if not cfg.get('twitter_enabled') or not cfg.get('twitter_key'):
+            return None, False
+        if not _can_use_twitter():
+            return None, False
+        return tier1_scan(symbol, chain, project_name=symbol), True
+    except Exception:
+        return None, False
 
 
 def _speculative_market_gate(p, price):
     """Curve + social confirmation for gems/listings before buy."""
     cat = p.get('category', '')
-    if cat == 'ESTABLISHED':
-        return True, 'established', {}
     sym = p.get('symbol', '')
     chain = p.get('chain', '')
+
+    if cat == 'ESTABLISHED':
+        # Price-curve gates for established coins are tighter and already
+        # handled upstream in _load_established_proposals() (15m/1h/4h
+        # momentum vs Binance). Here we only add a live Twitter check: real
+        # momentum on an established coin right before buying is a leading
+        # signal it may be starting to run — but absence of buzz is NOT
+        # penalized, since a legitimate established coin doesn't need
+        # retail virality the way a gem does. Only acute negative sentiment
+        # vetoes the buy.
+        social, _ = _social_snapshot(sym, chain, category=cat, live_search=True)
+        social_sig = (social or {}).get('signal', 'UNKNOWN')
+        snap = {'social_signal': social_sig, 'social_tweets': (social or {}).get('tweet_count', 0)}
+        if social and social_sig in ('SELL', 'WATCH_OUT'):
+            return False, f'social veto {social_sig}', snap
+        reason = 'established'
+        if social and social_sig in ('BUY', 'STRONG_BUY'):
+            reason = f"established + twitter momentum ({social_sig}, {social.get('tweet_count', 0)} tweets)"
+        return True, reason, snap
+
     coin_id = p.get('coin_id', '')
     snap = _market_snapshot(sym, chain, coin_id, fallback_price=price)
-    social = _social_snapshot(sym, chain)
+    # Live Twitter search for DEX_GEM only beyond this point — a real gem
+    # should have organic momentum; a listing is validated by the exchange
+    # itself, not virality.
+    social, social_checked = _social_snapshot(sym, chain, category=cat, live_search=True)
     social_sig = (social or {}).get('signal', 'UNKNOWN')
 
     h1 = snap.get('h1', 0)
@@ -1662,7 +1899,16 @@ def _speculative_market_gate(p, price):
     if social and int(social.get('tweets') or 0) >= 3 and h1 < 0 and h24 < 0:
         return False, 'mentions present but price curve is declining', snap
 
-    # For DEX gems without any cached social confirmation, require stronger market proof.
+    # Gems specifically: we actively searched Twitter for this ticker and
+    # found zero tweets. A real gem has organic momentum — a live-checked
+    # zero is a real negative signal, not just "we don't know", so reject
+    # outright rather than falling through to the softer curve-only check.
+    if cat == 'DEX_GEM' and social_checked and int((social or {}).get('tweet_count', 0) or 0) == 0:
+        return False, 'no Twitter momentum found for ticker (live-checked)', snap
+
+    # For gems/listings without any social confirmation at all (cache miss,
+    # and — for listings — no live check performed), require stronger
+    # market proof instead of buying on curve alone.
     if cat in ('DEX_GEM', 'LISTING') and not social:
         if h1 < 0 and h24 <= 0:
             return False, 'no social cache and curve is not positive', snap
@@ -2174,6 +2420,11 @@ def _write_persistent_ban(symbol, chain, reason=''):
 def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_PCT):
     init_sim_tables()
 
+    try:
+        _verify_real_portfolio_against_wallet()
+    except Exception as e:
+        print(f"  ⚠️  wallet verification error: {e}")
+
     # Gap 1: Crash recovery — check if there's an active sim to resume
     portfolio = None
     try:
@@ -2251,7 +2502,7 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     # Start PumpFun real-time stream (new token launches + graduations)
     try:
         from pumpfun_stream import start_pumpfun_stream
-        start_pumpfun_stream()
+        start_pumpfun_stream(portfolio)
     except ImportError:
         print("  ⚠️  pumpfun_stream.py not found — copy it to this folder")
     except Exception as _pf_err:
@@ -2260,7 +2511,7 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
     # Start KOL copy trader (dynamic wallet list — auto-refreshes from Kolscan/GMGN every 24h)
     try:
         from kol_tracker import start_kol_tracker
-        start_kol_tracker()
+        start_kol_tracker(portfolio)
     except ImportError:
         print("  ⚠️  kol_tracker.py not found — copy it to this folder")
     except Exception as _kol_err:

@@ -450,6 +450,61 @@ def fetch_reddit_data():
 # ============================================================
 # TELEGRAM
 # ============================================================
+def _parse_telegram_messages(html):
+    """
+    Parse Telegram's public preview page into [{'text', 'views'}, ...].
+    Uses a stateful HTML parser (not naive regex) so each message's view
+    count is correctly paired to that message, not to whichever div a
+    flat regex happens to match next.
+    """
+    from html.parser import HTMLParser
+
+    results = []
+
+    class _Parser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.in_text = False
+            self.in_views = False
+            self.cur_text = ""
+            self.cur_views = ""
+
+        def handle_starttag(self, tag, attrs):
+            cls = dict(attrs).get('class', '')
+            if 'tgme_widget_message_text' in cls:
+                self.in_text = True
+                self.cur_text = ""
+            if 'tgme_widget_message_views' in cls:
+                self.in_views = True
+                self.cur_views = ""
+
+        def handle_endtag(self, tag):
+            if self.in_text and tag in ('div', 'span'):
+                self.in_text = False
+                if self.cur_text.strip():
+                    results.append({'text': self.cur_text.strip()[:500], 'views': 0})
+            if self.in_views:
+                self.in_views = False
+                if results and self.cur_views.strip():
+                    try:
+                        v = self.cur_views.strip().replace('K', '000').replace('M', '000000').replace('.', '')
+                        results[-1]['views'] = int(float(v))
+                    except Exception:
+                        pass
+
+        def handle_data(self, data):
+            if self.in_text:
+                self.cur_text += data
+            if self.in_views:
+                self.cur_views += data
+
+    try:
+        _Parser().feed(html)
+    except Exception:
+        pass
+    return results
+
+
 def fetch_telegram_data():
     print("  Fetching Telegram...")
     now = datetime.now().isoformat()
@@ -461,11 +516,11 @@ def fetch_telegram_data():
                 headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
             if res.status_code != 200:
                 continue
-            messages = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', res.text, re.DOTALL)
-            clean = [re.sub(r'<[^>]+>', '', m).strip() for m in messages if len(re.sub(r'<[^>]+>', '', m).strip()) > 10]
+            parsed = [m for m in _parse_telegram_messages(res.text) if len(m['text']) > 10]
             conn = get_db()
             c = conn.cursor()
-            for msg in clean[-10:]:
+            for m in parsed[-10:]:
+                msg, views = m['text'], m['views']
                 msg_lower = msg.lower()
                 coins = detect_coins(msg, f'telegram:{channel}')
                 signal_type = 'NEWS'
@@ -478,10 +533,10 @@ def fetch_telegram_data():
                              sentiment_score, sentiment_label, engagement, url, fetched_at)
                              VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                     ('telegram', f'@{channel}', signal_type, msg[:200], msg[:500],
-                     ','.join(coins), sent_score, sent_label, 0, '', now))
+                     ','.join(coins), sent_score, sent_label, views, '', now))
             conn.commit()
             conn.close()
-            print(f"    @{channel}: {len(clean[-10:])} messages")
+            print(f"    @{channel}: {len(parsed[-10:])} messages")
         except Exception as e:
             print(f"    @{channel}: {e}")
         time.sleep(0.3)  # was 2s — 65 channels × 2s = 130s timeout

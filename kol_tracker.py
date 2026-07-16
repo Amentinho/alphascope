@@ -348,6 +348,8 @@ _tracker_active = False
 _copies_this_hour = 0
 _hour_reset_time = time.time() + 3600
 _copied_tokens = set()   # avoid copying same token twice
+_portfolio_ref = None    # SimPortfolio instance — set by start_kol_tracker()
+PUMPFUN_TOTAL_SUPPLY = 1_000_000_000  # fixed for every standard PumpFun launch
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -424,14 +426,12 @@ def _quick_score(mint: str, symbol: str) -> tuple[int, str]:
     except Exception:
         pass
 
-    # Check if already holding
+    # Check if already holding — read the live in-memory portfolio directly.
+    # (Previously queried a 'sim_portfolio' table from the wrong DB file —
+    # that table lives in sim.db, not alphascope.db — so this check always
+    # silently failed via the except-pass below.)
     try:
-        conn = sqlite3.connect('alphascope.db', timeout=3)
-        row = conn.execute(
-            "SELECT 1 FROM sim_portfolio WHERE symbol=? AND chain='solana' AND status='HOLDING'",
-            (symbol.upper(),)).fetchone()
-        conn.close()
-        if row:
+        if _portfolio_ref and f"{symbol.upper()}_solana" in _portfolio_ref.holdings:
             return 0, "already holding"
     except Exception:
         pass
@@ -446,6 +446,41 @@ def _quick_score(mint: str, symbol: str) -> tuple[int, str]:
 
     # KOL buy is itself +60 score
     return 65, ''
+
+
+def _derive_price_usd(trade_data: dict, mint: str) -> float:
+    """
+    Price a PumpFun token at the moment of copy.
+
+    Bonding-curve tokens (not yet graduated to Raydium) have NO DexScreener/
+    GeckoTerminal listing at all — those APIs return 0 for them. PumpPortal's
+    own trade payload carries marketCapSol though, and every standard PumpFun
+    launch has a fixed 1B token supply, so price_sol = marketCapSol / 1e9 is
+    reliable pre-graduation. For already-graduated tokens, fall back to the
+    same resolve_price() used everywhere else in the sim for consistency.
+    """
+    sol_price = 0.0
+    try:
+        from simulation import resolve_price
+        sol_price = resolve_price('SOL', chain='solana', use_cache=True)
+    except Exception:
+        pass
+
+    mcap_sol = float(trade_data.get('marketCapSol', 0) or 0)
+    if mcap_sol > 0 and sol_price > 0:
+        price_sol = mcap_sol / PUMPFUN_TOTAL_SUPPLY
+        return price_sol * sol_price
+
+    # Fallback — graduated tokens with a real AMM pool
+    try:
+        from simulation import resolve_price
+        symbol = trade_data.get('symbol', '') or ''
+        price = resolve_price(symbol, coin_id=mint, chain='solana', use_cache=False)
+        if price > 0:
+            return price
+    except Exception:
+        pass
+    return 0.0
 
 
 # ── Copy buy execution ────────────────────────────────────────────────────────
@@ -488,8 +523,32 @@ def _copy_buy(kol_wallet: str, kol_name: str, trade_data: dict):
         return
 
     if PAPER_MODE:
+        if _portfolio_ref is None:
+            print(f"  📄 [PAPER] KOL copy {kol_name} → {symbol}: no portfolio wired up, skipping")
+            _log_kol_trade(kol_wallet, kol_name, mint, symbol, kol_sol, 0,
+                           '', False, 'no portfolio reference')
+            return
+        price_usd = _derive_price_usd(trade_data, mint)
+        if price_usd <= 0:
+            print(f"  📄 [PAPER] KOL copy {kol_name} → {symbol}: no price available, "
+                  f"skipping (would be untracked)")
+            _log_kol_trade(kol_wallet, kol_name, mint, symbol, kol_sol, 0,
+                           '', False, 'no price available')
+            return
+        # Flat $1 paper stake, matching the real MAX_BUY_SOL (~$1) cap —
+        # the exact SOL/USD conversion doesn't change paper P&L% tracking.
+        usd_spent = 1.0
+        ok, msg = _portfolio_ref.record_position(
+            symbol, 'solana', usd_spent, price_usd,
+            source=f'kol_copy:{kol_name}', contract=mint,
+            dex_url=f"https://pump.fun/{mint}", category='DEX_GEM')
+        if not ok:
+            print(f"  📄 [PAPER] KOL copy {kol_name} → {symbol}: not recorded ({msg})")
+            _log_kol_trade(kol_wallet, kol_name, mint, symbol, kol_sol, 0,
+                           '', False, msg)
+            return
         print(f"  📄 [PAPER] KOL copy: {kol_name} → {symbol} "
-              f"({kol_sol:.2f} SOL) — no real tx sent")
+              f"({kol_sol:.2f} SOL) @ ${price_usd:.8g} — {msg}")
         _log_kol_trade(kol_wallet, kol_name, mint, symbol, kol_sol,
                        MAX_BUY_SOL, 'paper', True, 'paper_mode')
         _copied_tokens.add(mint)
@@ -571,19 +630,33 @@ def _copy_buy(kol_wallet: str, kol_name: str, trade_data: dict):
         _log_kol_trade(kol_wallet, kol_name, mint, symbol, kol_sol,
                        MAX_BUY_SOL, sig, True)
 
-        # Write to dex_gems so simulation.py tracks it with stop-loss
-        try:
-            conn = sqlite3.connect('alphascope.db', timeout=5)
-            conn.execute("""INSERT OR IGNORE INTO dex_gems
-                (symbol, chain, contract_address, dex_url, price_usd, liquidity_usd,
-                 age_hours, cross_score, price_change_24h, fetched_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""", (
-                symbol, 'solana', mint, f"https://pump.fun/{mint}",
-                0, 0, 0, 8, 0, datetime.now(timezone.utc).isoformat()))
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+        # Register with the sim portfolio so check_exits()/run_price_monitor()
+        # actually manage stop-loss/take-profit on this real position. Without
+        # this the token just sits in the wallet forever — the buy above
+        # executes on-chain via PumpPortal directly, bypassing portfolio.buy(),
+        # so nothing else in the codebase would ever know to sell it.
+        price_usd = _derive_price_usd(trade_data, mint)
+        if price_usd > 0 and _portfolio_ref is not None:
+            sol_price = 0.0
+            try:
+                from simulation import resolve_price
+                sol_price = resolve_price('SOL', chain='solana', use_cache=True)
+            except Exception:
+                pass
+            usd_spent = MAX_BUY_SOL * sol_price if sol_price > 0 else 1.0
+            ok, msg = _portfolio_ref.record_position(
+                symbol, 'solana', usd_spent, price_usd,
+                source=f'kol_copy:{kol_name}', contract=mint,
+                dex_url=f"https://pump.fun/{mint}", category='DEX_GEM')
+            if ok:
+                print(f"  🔱 KOL copy {symbol}: registered for exit management @ ${price_usd:.8g}")
+            else:
+                print(f"  ⚠️  KOL copy {symbol}: bought on-chain (tx {sig[:12]}...) but NOT "
+                      f"registered for auto-exit ({msg}) — needs MANUAL monitoring")
+        else:
+            print(f"  ⚠️  KOL copy {symbol}: bought on-chain (tx {sig[:12]}...) but price "
+                  f"could not be resolved — NOT tracked for stop-loss/take-profit. "
+                  f"Check this position manually.")
 
         # Telegram alert
         try:
@@ -704,12 +777,22 @@ async def _kol_stream_loop():
 
 
 # ── Thread entry point ────────────────────────────────────────────────────────
-def start_kol_tracker():
-    """Start the KOL copy trader in a background daemon thread."""
-    global _tracker_active
+def start_kol_tracker(portfolio=None):
+    """
+    Start the KOL copy trader in a background daemon thread.
+
+    portfolio: the running SimPortfolio instance. Required for copied buys to
+    be registered for stop-loss/take-profit management — without it, buys
+    still execute on-chain (live mode) but nothing will ever sell them.
+    """
+    global _tracker_active, _portfolio_ref
     if _tracker_active:
         return
     _tracker_active = True
+    _portfolio_ref = portfolio
+    if portfolio is None:
+        print("  ⚠️  KOL tracker: no portfolio passed — copied buys will NOT "
+              "be tracked for auto stop-loss/take-profit")
 
     def _run():
         loop = asyncio.new_event_loop()
