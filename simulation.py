@@ -394,7 +394,6 @@ SIM_MIN_ALLOC_SCORE = float(_env('SIM_MIN_ALLOC_SCORE', '65'))
 SIM_MAX_NEW_BUYS_PER_CYCLE = int(_env('SIM_MAX_NEW_BUYS_PER_CYCLE', '2'))
 SIM_LIQUIDATE_ON_END = _env('SIM_LIQUIDATE_ON_END', 'dry').lower().strip()
 SIM_PRICE_MISS_EXIT_COUNT = int(_env('SIM_PRICE_MISS_EXIT_COUNT', '4'))
-SIM_FORCE_RUG_ON_PRICE_MISS = _env('SIM_FORCE_RUG_ON_PRICE_MISS', 'false').lower().strip() == 'true'
 
 # ── Single-writer DB queue ─────────────────────────────────────────────────────
 import queue as _queue
@@ -887,18 +886,20 @@ class SimPortfolio:
                 price = 0
             if not price or price <= 0:
                 pos['_zero_count'] = pos.get('_zero_count', 0) + 1
-                family = _proposal_family(pos)
                 print(f"    PRICE MISS {sym} ({chain}) {pos['_zero_count']}/{SIM_PRICE_MISS_EXIT_COUNT}")
-                if family == 'ESTABLISHED':
-                    continue
                 if pos['_zero_count'] < SIM_PRICE_MISS_EXIT_COUNT:
                     continue
-                if not SIM_FORCE_RUG_ON_PRICE_MISS:
-                    # Missing API data is not proof of a rug. Keep the position
-                    # and let future samples or exact-pair pricing resolve it.
-                    continue
-                price = buy_price * 0.001
-                print(f"    RUG {sym}: repeated price misses, force stop-loss")
+                # Repeated misses no longer mean "wait indefinitely" — that let
+                # positions (including ESTABLISHED ones, previously exempt
+                # entirely) hold through data outages with zero stop-loss
+                # protection until the feed recovered, however far price had
+                # actually fallen by then (observed: -62%/-59%/-54% overshoots
+                # on a -8%/-18%/-20% configured band). Use the last genuinely
+                # resolved price to make a real risk decision instead of an
+                # arbitrary assumed-rug price or an indefinite hold.
+                price = pos.get('_last_price') or buy_price
+                print(f"    STALE PRICE {sym}: {pos['_zero_count']} misses — "
+                      f"evaluating stop-loss/take-profit against last known price ${price:.8g}")
             else:
                 pos['_zero_count'] = 0
                 pos['_last_price'] = price
@@ -1047,17 +1048,18 @@ def run_price_monitor(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFI
                         price = 0
                     if not price or price <= 0:
                         pos['_zero_count'] = pos.get('_zero_count', 0) + 1
-                        family = _proposal_family(pos)
                         print(f"\n    [MONITOR] PRICE MISS {sym} ({chain}) "
                               f"{pos['_zero_count']}/{SIM_PRICE_MISS_EXIT_COUNT}")
-                        if family == 'ESTABLISHED':
-                            continue
                         if pos['_zero_count'] < SIM_PRICE_MISS_EXIT_COUNT:
                             continue
-                        if not SIM_FORCE_RUG_ON_PRICE_MISS:
-                            continue
-                        price = buy_price * 0.001
-                        print(f"\n    [MONITOR] {sym} repeated price misses -- forced rug stop")
+                        # See check_exits() for why: repeated misses now use
+                        # the last genuinely resolved price to make a real
+                        # risk decision, instead of waiting indefinitely
+                        # (previous behavior let losses run unbounded through
+                        # data outages) or assuming a fake 99.9% rug.
+                        price = pos.get('_last_price') or buy_price
+                        print(f"\n    [MONITOR] STALE PRICE {sym}: {pos['_zero_count']} misses — "
+                              f"evaluating against last known price ${price:.8g}")
                     else:
                         pos['_zero_count'] = 0
                         pos['_last_price'] = price  # track last known price
