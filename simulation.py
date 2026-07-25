@@ -155,8 +155,22 @@ CG_IDS = {
 # ── Price resolver ────────────────────────────────────────────────────────────
 _price_cache = {}
 
-def _db_price(symbol):
-    """Read latest price from token_data table — populated by fetcher. Fast, no API call."""
+def _db_price(symbol, max_age_minutes=30):
+    """
+    Read latest price from token_data table — populated by fetcher. Fast, no
+    API call. Requires the row to be fresh (default: within 30 minutes,
+    matching fetcher.py's own refresh cadence via run.py's scheduler).
+
+    Without the staleness check: a symbol fetcher.py stops actively
+    refreshing (observed: AAVE and UNI both frozen since 2026-06-05, over
+    6 weeks stale) would silently keep returning that ancient snapshot
+    forever. Combined with adding these symbols to BINANCE_SYMBOLS earlier
+    this session — which activates this cache fast-path in the background
+    price monitor — that meant stop-loss/take-profit decisions were being
+    made against a 6-week-old price instead of the live one, producing
+    exactly the AAVE (-30.6%) and UNI (-32.9%) overshoots past their
+    configured -8% established stop-loss band.
+    """
     try:
         import sqlite3 as _sq
         conn = _sq.connect(MAIN_DB, timeout=10)
@@ -165,8 +179,9 @@ def _db_price(symbol):
             """SELECT price_usd FROM token_data
                WHERE (UPPER(symbol)=UPPER(?) OR UPPER(coin_id)=UPPER(?))
                AND price_usd > 0
+               AND fetched_at >= datetime('now', ?)
                ORDER BY fetched_at DESC LIMIT 1""",
-            (symbol, symbol)).fetchone()
+            (symbol, symbol, f'-{max_age_minutes} minutes')).fetchone()
         conn.close()
         if row and row[0] and float(row[0]) > 0:
             return float(row[0])
