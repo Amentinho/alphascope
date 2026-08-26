@@ -692,6 +692,49 @@ def _pumpfun_sell(kp, contract, raw_amount) -> dict:
     return {'success': False, 'error': 'PumpFun sell failed'}
 
 
+def _confirm_sol_signature(sig, timeout_sec=45, poll_interval=3):
+    """
+    Poll for genuine on-chain confirmation of a Solana signature.
+
+    Without this: submission functions treated "the RPC accepted our
+    request" as success — but an accepted transaction can still be silently
+    dropped (expired blockhash, network congestion, validator never picks
+    it up) and never lands in a block. That produced a real incident: a
+    live BONK buy alerted as a success, with a signature, a Solscan link,
+    and an internally-tracked position — but the transaction never actually
+    confirmed on any RPC, so no SOL was spent and no tokens were received.
+    The wallet (correctly) never showed it; the bot (incorrectly) thought
+    it held it.
+
+    Returns (confirmed: bool, detail: str).
+    """
+    if not sig or not isinstance(sig, str) or len(sig) < 40:
+        return False, 'no valid signature to confirm'
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for rpc in SOL_RPC_FALLBACKS:
+            try:
+                r = requests.post(rpc, json={
+                    'jsonrpc': '2.0', 'id': 1, 'method': 'getSignatureStatuses',
+                    'params': [[sig], {'searchTransactionHistory': True}],
+                }, timeout=8)
+                if r.status_code != 200:
+                    continue
+                statuses = r.json().get('result', {}).get('value', [])
+                if not statuses or not statuses[0]:
+                    continue
+                status = statuses[0]
+                if status.get('err'):
+                    return False, f'transaction failed on-chain: {status["err"]}'
+                conf = status.get('confirmationStatus', '')
+                if conf in ('confirmed', 'finalized'):
+                    return True, conf
+            except Exception:
+                continue
+        time.sleep(poll_interval)
+    return False, f'not confirmed on any RPC within {timeout_sec}s — likely dropped (expired blockhash/congestion)'
+
+
 def _jito_submit(signed_b64):
     """Submit tx bundle. Tries all Jito endpoints, falls back to direct Solana RPC."""
     # Try all Jito endpoints
@@ -831,13 +874,20 @@ def execute_sol_buy(symbol, contract, usd) -> dict:
                 signed_tx = tx
             except Exception as _se:
                 return {'success': False, 'error': f'SOL signing failed: {_se}'}
-        bundle = _jito_submit(base64.b64encode(bytes(signed_tx)).decode())
+        # Derive the real signature locally rather than trusting whatever
+        # the submission RPC/Jito echoes back — a Jito bundle response can
+        # fall through to a placeholder string with no real signature at all.
+        real_sig = str(signed_tx.signatures[0])
+        _jito_submit(base64.b64encode(bytes(signed_tx)).decode())
+        confirmed, detail = _confirm_sol_signature(real_sig)
+        if not confirmed:
+            return {'success': False, 'error': f'BUY not confirmed on-chain: {detail}', 'tx': real_sig}
         out = int(quote.get('outAmount', 0))
         price = (lamports / 1e9 * sol_price) / max(out, 1)
-        sol_url = f"https://solscan.io/tx/{bundle}"
+        sol_url = f"https://solscan.io/tx/{real_sig}"
         _tg(f"✅ <b>SOL BUY {symbol}</b>\n"
-            f'🔗 <a href="{sol_url}">{bundle[:16]}...</a>')
-        return {'success': True, 'tx': bundle, 'price': price,
+            f'🔗 <a href="{sol_url}">{real_sig[:16]}...</a>')
+        return {'success': True, 'tx': real_sig, 'price': price,
                 'sol_spent': lamports/1e9, 'impact': impact, 'url': sol_url}
     except ImportError:
         return {'success': False, 'error': 'pip install solana solders base58'}
@@ -984,13 +1034,17 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
                 signed_tx = tx
             except Exception as _se:
                 return {'success': False, 'error': f'SOL signing failed: {_se}'}
-        bundle = _jito_submit(base64.b64encode(bytes(signed_tx)).decode())
+        real_sig = str(signed_tx.signatures[0])
+        _jito_submit(base64.b64encode(bytes(signed_tx)).decode())
+        confirmed, detail = _confirm_sol_signature(real_sig)
+        if not confirmed:
+            return {'success': False, 'error': f'SELL not confirmed on-chain: {detail}', 'tx': real_sig}
         sol_out = int(quote.get('outAmount', 0)) / 1e9
-        sol_url = f"https://solscan.io/tx/{bundle}"
+        sol_url = f"https://solscan.io/tx/{real_sig}"
         _tg(f"✅ <b>SOL SELL {symbol}</b>\n"
             f"💵 {sol_out:.4f} SOL received\n"
-            f'🔗 <a href="{sol_url}">{bundle[:16]}...</a>')
-        return {'success': True, 'tx': bundle,
+            f'🔗 <a href="{sol_url}">{real_sig[:16]}...</a>')
+        return {'success': True, 'tx': real_sig,
                 'sol_received': sol_out, 'usd_received': sol_out * _sol_price(), 'url': sol_url}
     except Exception as e:
         err = str(e)
@@ -1032,9 +1086,15 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
                             signed_r = VersionedTransaction(tx_r.message, [kp])
                         except Exception:
                             signed_r = tx_r
-                        bundle_r = _jito_submit(base64.b64encode(bytes(signed_r)).decode())
+                        real_sig_r = str(signed_r.signatures[0])
+                        _jito_submit(base64.b64encode(bytes(signed_r)).decode())
+                        confirmed_r, detail_r = _confirm_sol_signature(real_sig_r)
+                        if not confirmed_r:
+                            return {'success': False,
+                                    'error': f'SELL retry not confirmed on-chain: {detail_r}',
+                                    'tx': real_sig_r}
                         sol_out_r = int(fresh_q.get('outAmount', 0)) / 1e9
-                        return {'success': True, 'tx': bundle_r,
+                        return {'success': True, 'tx': real_sig_r,
                                 'sol_received': sol_out_r,
                                 'usd_received': sol_out_r * _sol_price()}
             except Exception as _te:
@@ -1060,9 +1120,15 @@ def execute_sol_sell(symbol, contract, token_amount) -> dict:
                             signed2 = VersionedTransaction(tx2.message, [kp])
                         except Exception:
                             signed2 = tx2
-                        bundle2 = _jito_submit(base64.b64encode(bytes(signed2)).decode())
+                        real_sig2 = str(signed2.signatures[0])
+                        _jito_submit(base64.b64encode(bytes(signed2)).decode())
+                        confirmed2, detail2 = _confirm_sol_signature(real_sig2)
+                        if not confirmed2:
+                            return {'success': False,
+                                    'error': f'SELL retry (slippage) not confirmed on-chain: {detail2}',
+                                    'tx': real_sig2}
                         sol_out2 = int(fresh_quote.get('outAmount', 0)) / 1e9
-                        return {'success': True, 'tx': bundle2,
+                        return {'success': True, 'tx': real_sig2,
                                 'sol_received': sol_out2,
                                 'usd_received': sol_out2 * _sol_price()}
             except Exception as e2:
