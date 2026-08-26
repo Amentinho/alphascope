@@ -1609,7 +1609,7 @@ def _executor_dry_run():
         return True
 
 
-DAILY_LOSS_LIMIT_USD = 200.0   # Stop new buys if trading P&L drops below -$200
+DAILY_LOSS_LIMIT_USD = float(_env('SIM_DAILY_LOSS_LIMIT_USD', '200.0'))   # Stop new buys if trading P&L drops below -this
 
 
 def _ensure_strategy_tables():
@@ -2481,6 +2481,19 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
                     if dynamic_cash > 1:
                         portfolio.cash[chain] = dynamic_cash
                         print(f"  💼 {chain}: trading cash set to ${dynamic_cash:.1f} (15% of ${bal['usd']:.0f} wallet)")
+            # starting_trading was set at construction using the hardcoded
+            # $200 default (STARTING_BALANCE_USD*2 + ETH_BUDGET_USD). Dynamic
+            # sizing above can shrink actual cash well below that (observed:
+            # $58 vs $200) — without rebasing here, the daily-loss circuit
+            # breaker (_trading_value() - starting_trading) computes a fake
+            # loss from a baseline mismatch, not a real one, and permanently
+            # blocks every buy for the rest of the session on cycle one.
+            new_starting_trading = sum(portfolio.cash.get(c, 0) for c in CHAINS)
+            if new_starting_trading > 0:
+                print(f"  💼 Rebasing starting_trading: ${portfolio.starting_trading:.1f} -> "
+                      f"${new_starting_trading:.1f} (matches live-sized cash)")
+                portfolio.starting_trading = new_starting_trading
+                portfolio.starting_total = portfolio.starting_trading + portfolio.starting_real
     except Exception:
         pass  # dry run or wallet not available — use hardcoded defaults
 
