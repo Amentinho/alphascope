@@ -38,16 +38,19 @@ NATIVE_TOKENS = {
 REAL_PORTFOLIO = {
     'ethereum': [
         {'symbol': 'LINK', 'coin_id': 'chainlink', 'amount': 60.9266, 'entry_price': 10.58},
-        {'symbol': 'ETH',  'coin_id': 'ethereum',  'amount': 0.1281,  'entry_price': 2329.01},
+        {'symbol': 'ETH',  'coin_id': 'ethereum',  'amount': 0.1063,  'entry_price': 2329.01},
     ],
     'base': [
-        {'symbol': 'ETH',  'coin_id': 'ethereum',  'amount': 0.0594,  'entry_price': 2329.01},
+        {'symbol': 'ETH',  'coin_id': 'ethereum',  'amount': 0.0350,  'entry_price': 2329.01},
     ],
     'solana': [
-        {'symbol': 'SOL',  'coin_id': 'solana',    'amount': 0.46,    'entry_price': 93.70},
+        {'symbol': 'SOL',  'coin_id': 'solana',    'amount': 0.4029,  'entry_price': 93.70},
     ],
 }
-# Note: entry_price = your actual purchase price (cost basis), never changes
+# Note: entry_price = your actual purchase price (cost basis), never changes.
+# amount is auto-corrected from your live wallet at every session start
+# (_verify_real_portfolio_against_wallet) — these values are just the
+# snapshot as of the last time that correction was reviewed and saved here.
 # T=0 price = live price at sim launch, used for session P&L tracking
 
 def _live_sol_balance():
@@ -78,7 +81,7 @@ def _live_sol_balance():
     return None
 
 
-def _verify_real_portfolio_against_wallet(tolerance_pct=2.0):
+def _verify_real_portfolio_against_wallet(tolerance_pct=2.0, auto_correct=True):
     """
     Cross-check REAL_PORTFOLIO's hardcoded amounts against live on-chain
     balances — EVM via wallet_reader.py, Solana via the SOL_PRIVATE_KEY's
@@ -87,7 +90,14 @@ def _verify_real_portfolio_against_wallet(tolerance_pct=2.0):
     verified, since a manually-edited dict silently drifts from reality the
     moment you buy/sell without updating this file.
 
-    Read-only: only warns on mismatch, never edits REAL_PORTFOLIO or the DB.
+    auto_correct=True (default): overwrites REAL_PORTFOLIO's in-memory
+    amounts with the live wallet values on mismatch, so every dollar figure
+    shown this session (dashboard, --results, alerts) reflects what you
+    actually hold — not a stale manually-maintained snapshot. entry_price
+    (cost basis) is never touched, since that can't be read on-chain.
+    Only the in-memory dict is changed — this file on disk is untouched,
+    so update the hardcoded values here too once you've confirmed the drift
+    is real and not a one-off RPC hiccup.
     """
     mismatches = []
 
@@ -121,6 +131,8 @@ def _verify_real_portfolio_against_wallet(tolerance_pct=2.0):
                 mismatches.append(
                     f"{pos['symbol']} ({chain}): REAL_PORTFOLIO says {hardcoded_amt}, "
                     f"wallet has {live_amt:.4f} ({drift_pct:+.1f}% drift)")
+                if auto_correct:
+                    pos['amount'] = live_amt
 
     sol_live = _live_sol_balance()
     if sol_live is not None:
@@ -132,14 +144,23 @@ def _verify_real_portfolio_against_wallet(tolerance_pct=2.0):
                 mismatches.append(
                     f"SOL (solana): REAL_PORTFOLIO says {pos['amount']}, "
                     f"wallet has {sol_live:.4f} ({drift_pct:+.1f}% drift)")
+                if auto_correct:
+                    pos['amount'] = sol_live
     else:
         print("  ⚠️  Solana wallet verification skipped: no SOL_PRIVATE_KEY or all RPCs failed")
 
     if mismatches:
-        print("  ⚠️  REAL_PORTFOLIO is stale vs. live wallet balance:")
+        if auto_correct:
+            print("  🔧 REAL_PORTFOLIO was stale vs. live wallet balance — corrected in memory for this session:")
+        else:
+            print("  ⚠️  REAL_PORTFOLIO is stale vs. live wallet balance:")
         for m in mismatches:
             print(f"      {m}")
-        print("      Update the hardcoded amounts in simulation.py's REAL_PORTFOLIO dict.")
+        if not auto_correct:
+            print("      Update the hardcoded amounts in simulation.py's REAL_PORTFOLIO dict.")
+        else:
+            print("      Update the hardcoded amounts in simulation.py's REAL_PORTFOLIO dict "
+                  "to make this permanent — this correction only lasts for this session.")
     else:
         checked = [c for c, ok in (('ethereum/base', bool(live_by_key)), ('solana', sol_live is not None)) if ok]
         print(f"  ✅ REAL_PORTFOLIO amounts match live wallet balance ({', '.join(checked) or 'nothing checked'})")
