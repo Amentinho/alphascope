@@ -1,5 +1,16 @@
 venv/
+.venv/
 alphascope.db
+alphascope.db-shm
+alphascope.db-wal
 __pycache__/
 .env
 coin_registry.json
+scweet_state.db
+hunter.db
+sources.db
+sim.db
+sim.db-shm
+sim.db-wal
+sim_ban_list.json.bak
+*.log
