@@ -2231,9 +2231,15 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
         chain    = p.get('chain', 'solana')
         action   = p.get('action', '')
         cat      = p.get('category', '')
-        # Per-chain hard caps
-        chain_caps = {'solana': 1, 'base': 2, 'ethereum': 2}
-        trade_usd = min(p.get('trade_usd', 20), chain_caps.get(chain, 20))
+        # Trade size comes from the allocator (which already applies
+        # SIM_ESTABLISHED_MAX_USD/SIM_GEM_MAX_USD/SIM_LISTING_MAX_USD).
+        # A hardcoded $1/$2 per-chain cap used to silently override that
+        # here regardless of config — e.g. raising SIM_ESTABLISHED_MAX_USD
+        # to $10 had no effect on Solana trades, which stayed clamped to $1.
+        # The real safety ceiling remains executor.py's MAX_SOL_PER_TRADE /
+        # MAX_ETH_PER_TRADE, which independently clamp actual on-chain spend
+        # regardless of what trade_usd requests.
+        trade_usd = p.get('trade_usd', 20)
 
         if not sym or action not in ('BUY', 'ACCUMULATE'):
             continue
