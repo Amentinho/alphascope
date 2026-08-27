@@ -43,24 +43,39 @@ TWITTER_API_KEY = _CONFIG['twitter_key']
 TWITTER_ENABLED = _CONFIG['twitter_enabled']
 
 # Credit budget tracking (resets per session)
+import threading as _threading
 _credits_used = 0
+_credit_lock = _threading.Lock()
 MAX_CREDITS_PER_HOUR = 30   # conservative limit
 MAX_CREDITS_PER_SESSION = 100
 
 def _can_use_twitter(tier=1):
-    """Check if we should use Twitter based on budget and config."""
-    global _credits_used
+    """
+    Check if we should use Twitter based on budget and config.
+
+    Note: this is a check, not a reservation — real API work (a search,
+    a scan) happens between this call and the later _record_credit_use()
+    at every call site today. The lock here closes the low-level torn-read
+    risk on the shared counter now that multiple chain-agent threads call
+    this concurrently, but does NOT make check-then-use atomic end to end;
+    3 threads racing right at the budget edge could still jointly exceed
+    MAX_CREDITS_PER_SESSION by a couple of credits. This is treated as
+    acceptable for a soft confirmation signal, not a hard financial limit —
+    revisit with a real reserve/commit scheme if that stops being true.
+    """
     if not TWITTER_ENABLED:
         return False
     if not TWITTER_API_KEY:
         return False
-    if _credits_used >= MAX_CREDITS_PER_SESSION:
-        return False
+    with _credit_lock:
+        if _credits_used >= MAX_CREDITS_PER_SESSION:
+            return False
     return True
 
 def _record_credit_use(n=1):
     global _credits_used
-    _credits_used += n
+    with _credit_lock:
+        _credits_used += n
 TWITTER_SEARCH  = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 
 # TTL by tier (minutes)

@@ -1938,7 +1938,15 @@ def execute_evm_sell(symbol, chain, contract, token_amount, decimals=18,
 
 
 # ── Unified interface called by simulation.py ─────────────────────────────────
-MAX_TRADE_USD = float(_env('EXECUTOR_MAX_TRADE_USD', '2.0'))  # live hard cap
+# Last-resort ceiling on any single live trade, regardless of what the
+# sizing model computes upstream — a backstop against a sizing bug, not a
+# routine limit. Expressed as a % of that chain's actual current raw wallet
+# balance (cash_left, passed in from SimPortfolio.buy()) rather than a fixed
+# dollar figure — a fixed $2 was silently neutering every legitimate attempt
+# to size trades larger, independent of what any other config said.
+MAX_TRADE_PCT_OF_WALLET = float(_env('EXECUTOR_MAX_TRADE_PCT_OF_WALLET', '0.35'))
+# Fallback only for the rare case cash_left isn't available at all.
+MAX_TRADE_USD_FALLBACK = float(_env('EXECUTOR_MAX_TRADE_USD', '2.0'))
 
 # BASE/ETH live execution disabled — RPC unreliable, tokens not received
 # Set to True only after confirming RPC works end-to-end
@@ -1947,7 +1955,11 @@ BASE_LIVE_ENABLED = True   # BASE live — Aerodrome first, ghost pool check add
 
 def on_buy(symbol, chain, usd, price, source='', contract='', cash_left=None):
     """Called by simulation on every BUY."""
-    real_usd = min(usd, MAX_TRADE_USD)
+    if cash_left and cash_left > 0:
+        max_trade_usd = cash_left * MAX_TRADE_PCT_OF_WALLET
+    else:
+        max_trade_usd = MAX_TRADE_USD_FALLBACK
+    real_usd = min(usd, max_trade_usd)
     if _is_dry_run():
         alert_buy(symbol, chain, real_usd, price, source, dry=True, cash_left=cash_left)
         return {'success': True, 'mode': 'paper', 'price': price}

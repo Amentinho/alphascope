@@ -19,8 +19,24 @@ Live execution requires: private key or hardware wallet signer (Phase 2b)
 import sqlite3
 import requests
 import json
+import os
 from datetime import datetime, timezone
 from typing import Optional
+
+
+def _env(key, default=''):
+    val = os.environ.get(key, '')
+    if val:
+        return val
+    try:
+        with open('.env') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f'{key}='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
 
 # ── Safety limits (paper trading respects these too) ──────────────────────────
 MAX_POSITION_USD     = 500       # Never put more than $500 in a single trade
@@ -500,7 +516,16 @@ def evaluate_signals():
     # Supported chains for DEX gems — ETH mainnet excluded (gas too high for $2 trades)
     # ETH mainnet only used for established tokens (LINK/AAVE/UNI) via token_intelligence
     SUPPORTED_CHAINS = {'solana', 'base'}
-    CHAIN_CAPS = {'solana': 1, 'base': 2}
+    # These are just the "initial ask" — simulation.py's allocator
+    # (_category_trade_cap) always applies the real SIM_GEM_MAX_USD/
+    # SIM_LISTING_MAX_USD cap afterward regardless of what's set here, so
+    # this doesn't change live behavior. It previously used its own
+    # disconnected {'solana':1,'base':2} dict instead of the same config
+    # values the rest of the system reads — harmless today only because the
+    # downstream cap happened to be smaller, but a duplicate hardcoded
+    # source of truth is exactly the pattern that caused today's other bugs.
+    GEM_TRADE_USD     = float(_env('SIM_GEM_MAX_USD', '0.75'))
+    LISTING_TRADE_USD = float(_env('SIM_LISTING_MAX_USD', '1.0'))
     LIQ_MIN    = {'solana': 20_000, 'base': 30_000}
     MAJORS = {'BTC','ETH','SOL','BNB','XRP','ADA','DOGE','SHIB','AVAX',
               'USDT','USDC','DAI','WBTC','WETH','WSOL'}
@@ -554,7 +579,7 @@ def evaluate_signals():
                 if chg_24h < -80:
                     continue  # already rugged
                 seen.add(sym)
-                trade_usd = CHAIN_CAPS.get(chain, 2)
+                trade_usd = GEM_TRADE_USD
                 alpha = min(100, int(score or 0) * 12 + 20)
                 proposals.append({
                     'action': 'BUY',
@@ -597,7 +622,7 @@ def evaluate_signals():
                         'symbol': sym,
                         'coin_id': '',
                         'chain': 'solana',
-                        'trade_usd': CHAIN_CAPS['solana'],
+                        'trade_usd': LISTING_TRADE_USD,
                         'alpha_score': min(90, 50 + int(priority or 0) // 4),
                         'confidence': 65,
                         'reasons': f"Listing: {exchange_detail}",
@@ -665,7 +690,7 @@ def evaluate_signals():
                 if chg_24h < -80:
                     continue  # already rugged
                 seen.add(sym)
-                trade_usd = CHAIN_CAPS.get(chain, 2)
+                trade_usd = GEM_TRADE_USD
                 alpha = min(100, int(score or 0) * 12 + 20)
                 proposals.append({
                     'action': 'BUY',
@@ -708,7 +733,7 @@ def evaluate_signals():
                         'symbol': sym,
                         'coin_id': '',
                         'chain': 'solana',
-                        'trade_usd': CHAIN_CAPS['solana'],
+                        'trade_usd': LISTING_TRADE_USD,
                         'alpha_score': min(90, 50 + int(priority or 0) // 4),
                         'confidence': 65,
                         'reasons': f"Listing: {exchange_detail}",
