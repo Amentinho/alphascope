@@ -1588,7 +1588,14 @@ def _load_established_proposals(portfolio):
                 + source_strength
                 + curve_strength
             )
-            trade_usd = registry['max_usd'] if intelligence_buy else min(1, registry['max_usd'])
+            # registry['max_usd'] is a per-token metadata field (was hardcoded
+            # $1-2 for every entry) — using it directly here silently
+            # overrode SIM_ESTABLISHED_MAX_USD, so raising that config value
+            # to $10 had no effect: the allocator's min(trade_usd, cap, cash)
+            # always picked the smaller hardcoded 2, not the intended 10.
+            # ACCUMULATE (weaker, non-BUY signal) still gets half-size,
+            # scaled off the real config value instead of a hardcoded $1 floor.
+            trade_usd = SIM_ESTABLISHED_MAX_USD if intelligence_buy else SIM_ESTABLISHED_MAX_USD / 2
             setup_label = signal if intelligence_buy else 'TECHNICAL_ACCUMULATE'
             ranked.append((rotation_score, {
                 'action': 'BUY' if intelligence_buy else 'ACCUMULATE',
@@ -2145,7 +2152,7 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             if action in ('BUY','ACCUMULATE') and conf >= MIN_SIGNAL_CONF:
                 price = resolve_price(sym, chain=ch)
                 key = f"{sym}_{ch}"
-                trade_usd = min(2, portfolio.cash.get(ch, 0))
+                trade_usd = min(SIM_ESTABLISHED_MAX_USD, portfolio.cash.get(ch, 0))
                 if price > 0 and key not in portfolio.holdings and trade_usd > 0 and portfolio.can_buy(ch, trade_usd):
                     ok, msg = portfolio.buy(sym, ch, trade_usd, price, 'portfolio_signal')
                     if ok:
