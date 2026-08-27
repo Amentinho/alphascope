@@ -769,8 +769,10 @@ class SimPortfolio:
                 result = on_buy(symbol, chain, usd, price, source, contract,
                                 cash_left=cash_left)
                 if result and not result.get('success') and result.get('mode') != 'paper':
-                    _write_persistent_ban(symbol, chain, result.get('error', 'tx failed'))
-                    return False, f"real buy failed: {result.get('error', 'unknown')}"
+                    err = result.get('error', 'tx failed')
+                    if not _is_benign_execution_error(err):
+                        _write_persistent_ban(symbol, chain, err)
+                    return False, f"real buy failed: {err}"
         except Exception as e:
             if not _executor_dry_run():
                 return False, f"executor buy error: {e}"
@@ -2432,6 +2434,37 @@ def _clean_expired_bans(max_age_days=7):
         pass
     if removed:
         print(f"  🧹 Expired {removed} old bans (>{max_age_days}d)")
+
+
+_BENIGN_EXECUTION_ERROR_MARKERS = (
+    'exceeds limit',          # gas cost cap — an economic/environment constraint,
+                               # not a signal the token itself is bad
+    'No swap tx from Jupiter',  # transient Jupiter API hiccup
+    'not confirmed on-chain',   # dropped tx (congestion/expired blockhash),
+                                 # not a token quality problem
+    'Jupiter quote failed',
+    'RPC HTTP',
+    'No SOL keypair',
+    'No EVM wallet configured',
+    'web3 unavailable',
+)
+
+def _is_benign_execution_error(err) -> bool:
+    """
+    True if a live-buy failure reflects a transient/economic execution
+    constraint rather than the token itself being bad.
+
+    Without this: every failed live buy — including a benign gas-cap
+    rejection at a trade size too small to clear current gas prices — wrote
+    a 7-day ban via _write_persistent_ban(). One session of gas-capped
+    Ethereum attempts banned nearly the entire established-coin universe
+    (AAVE, UNI, CRV, FET, ONDO, PENDLE, SHIB, ENA, VIRTUAL, AERO, NEAR all
+    banned the same day), which then blocked those same coins from ever
+    being retried even after the trade-size fix that would have let their
+    gas actually clear.
+    """
+    err = str(err or '')
+    return any(marker in err for marker in _BENIGN_EXECUTION_ERROR_MARKERS)
 
 
 def _write_persistent_ban(symbol, chain, reason=''):
