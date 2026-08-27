@@ -2735,7 +2735,22 @@ def run_simulation(hours=6, cycle_min=5, stop_loss=STOP_LOSS_PCT, take_profit=TA
             except Exception as e:
                 print(f"  Refresh error: {e}")
 
-        actions = run_agent_cycle(portfolio, stop_loss, take_profit)
+        try:
+            actions = run_agent_cycle(portfolio, stop_loss, take_profit)
+        except Exception as _cycle_err:
+            # Without this: any unhandled exception here — a malformed API
+            # response, an edge case not yet hit — crashes the entire
+            # process. caffeinate dies with it, nothing auto-restarts it,
+            # and every open position stops being monitored for the rest
+            # of an unattended run. One bad cycle should not end a 2-week
+            # session; log it, alert, and keep going.
+            actions = 0
+            print(f"  ⚠️  Agent cycle error: {_cycle_err} — continuing to next cycle")
+            try:
+                from executor import alert_error
+                alert_error(f"Agent cycle failed: {str(_cycle_err)[:200]} — sim continues")
+            except Exception:
+                pass
         print(f"  Actions: {actions}")
         portfolio.print_status()
         try:
