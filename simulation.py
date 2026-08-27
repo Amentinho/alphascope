@@ -564,8 +564,16 @@ class SimPortfolio:
         port.starting_real = port._real_cost_basis()
         port.starting_trading = (STARTING_BALANCE_USD * 2) + ETH_BUDGET_USD
         port.starting_total = port.starting_trading + port.starting_real
-        port.wallet_balances = {}
-        port.wallet_balances_t0 = {}
+        # Without this, wallet_balances stayed permanently empty on any
+        # restored (crash-recovered) session — run_simulation()'s dynamic
+        # cash-sizing block checks `if ... and portfolio.wallet_balances:`,
+        # so an empty dict silently skipped it entirely, leaving cash stuck
+        # at the hardcoded $50/$50/$100 defaults instead of live-wallet
+        # sizing. Over a 2-week unattended run, any crash or restart would
+        # hit this path and quietly revert cash sizing without anyone
+        # noticing until they went looking for it.
+        port.wallet_balances = port._snapshot_wallet_balances()
+        port.wallet_balances_t0 = dict(port.wallet_balances)
 
         # Restore open sim positions from DB
         try:
