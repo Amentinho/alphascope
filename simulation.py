@@ -559,11 +559,13 @@ class SimPortfolio:
         port.holdings = {}
         port.trades = []
         port._saved_count = 0
+        port._lock = threading.Lock()
         port._seed_real()
         port.t0_prices = {}
         port.starting_real = port._real_cost_basis()
         port.starting_trading = (STARTING_BALANCE_USD * 2) + ETH_BUDGET_USD
         port.starting_total = port.starting_trading + port.starting_real
+        port.starting_trading_by_chain = {ch: port.cash[ch] for ch in CHAINS}
         # Without this, wallet_balances stayed permanently empty on any
         # restored (crash-recovered) session — run_simulation()'s dynamic
         # cash-sizing block checks `if ... and portfolio.wallet_balances:`,
@@ -610,6 +612,11 @@ class SimPortfolio:
         self.holdings = {}
         self.trades = []
         self._saved_count = 0
+        # Multiple ChainAgent threads now touch holdings/trades concurrently
+        # (each only mutates its own chain's cash key, which needs no lock,
+        # but all agents share these two flat structures) — guards buy/sell/
+        # record_position/check_exits against two agents mutating at once.
+        self._lock = threading.Lock()
         self._seed_real()
         # Capture T=0 live prices for intra-sim PnL reference
         self.t0_prices = self._snapshot_prices()
@@ -617,6 +624,11 @@ class SimPortfolio:
         # SOL + BASE each get STARTING_BALANCE_USD, ETH gets ETH_BUDGET_USD
         self.starting_trading = (STARTING_BALANCE_USD * 2) + ETH_BUDGET_USD
         self.starting_total = self.starting_trading + self.starting_real
+        # Per-chain analog of starting_trading — lets each ChainAgent run its
+        # own independent circuit breaker against its own chain's baseline
+        # instead of the combined 3-chain sum. Rebased in run_simulation()'s
+        # dynamic-cash-sizing block exactly like starting_trading is today.
+        self.starting_trading_by_chain = {ch: self.cash[ch] for ch in CHAINS}
         # Snapshot real wallet balances at T=0
         self.wallet_balances = self._snapshot_wallet_balances()
         self.wallet_balances_t0 = dict(self.wallet_balances)
@@ -750,6 +762,32 @@ class SimPortfolio:
             total += pos['amount'] * (p or pos['buy_price'])
         return total
 
+    def holdings_for(self, chain):
+        """Filtered view of holdings for one chain — used by ChainAgent so
+        each agent only ever reasons about its own chain's positions, even
+        though holdings itself stays one shared dict (see class docstring
+        note in the multi-agent plan: splitting into 3 objects would force
+        copy-pasting the benign-error ban logic in buy() three times)."""
+        return {k: v for k, v in self.holdings.items() if v.get('chain') == chain}
+
+    def trades_for(self, chain):
+        """Filtered view of trades for one chain."""
+        return [t for t in self.trades if t.get('chain') == chain]
+
+    def trading_value_for(self, chain):
+        """Per-chain analog of _trading_value() — this chain's cash plus
+        the current priced value of this chain's open positions only.
+        Used by each ChainAgent's own independent circuit breaker instead
+        of the combined 3-chain sum."""
+        total = self.cash.get(chain, 0)
+        for key, pos in self.holdings_for(chain).items():
+            if pos.get('is_real'):
+                continue
+            p = resolve_price(pos['symbol'], coin_id=pos.get('coin_id', ''),
+                              chain=pos['chain'], dex_url=pos.get('dex_url', ''))
+            total += pos['amount'] * (p or pos['buy_price'])
+        return total
+
     def can_buy(self, chain, usd):
         return self.cash.get(chain, 0) >= usd
 
@@ -777,25 +815,33 @@ class SimPortfolio:
             if not _executor_dry_run():
                 return False, f"executor buy error: {e}"
             is_dry = True
+        # cash[chain] is only ever touched by that chain's own agent thread
+        # (each chain has exactly one agent), so this specific line needs no
+        # lock — but holdings/trades are shared flat structures written by
+        # all 3 agents, so the compound insert+append below is locked to
+        # stay consistent (e.g. check_exits() never sees a holdings entry
+        # with no matching trade record, or two agents' appends corrupting
+        # each other mid-write).
         self.cash[chain] -= usd
         key = f"{symbol}_{chain}"
-        self.holdings[key] = {
-            'symbol': symbol, 'chain': chain, 'amount': tokens,
-            'buy_price': price, 'buy_time': datetime.now().isoformat(),
-            'usd_spent': usd, 'source': source,
-            'coin_id': contract,  # mint address for real execution
-            'dex_url': dex_url,
-            'category': category or _proposal_family({'category': '', 'sources': source}),
-            'allocation_score': allocation_score,
-            'is_real': False, '_zero_count': 0,
-        }
-        self.trades.append({
-            'action': 'BUY', 'symbol': symbol, 'chain': chain,
-            'usd': usd, 'price': price, 'tokens': tokens,
-            'time': datetime.now().isoformat(), 'source': source,
-            'coin_id': contract, 'dex_url': dex_url,
-            'category': category, 'allocation_score': allocation_score,
-        })
+        with self._lock:
+            self.holdings[key] = {
+                'symbol': symbol, 'chain': chain, 'amount': tokens,
+                'buy_price': price, 'buy_time': datetime.now().isoformat(),
+                'usd_spent': usd, 'source': source,
+                'coin_id': contract,  # mint address for real execution
+                'dex_url': dex_url,
+                'category': category or _proposal_family({'category': '', 'sources': source}),
+                'allocation_score': allocation_score,
+                'is_real': False, '_zero_count': 0,
+            }
+            self.trades.append({
+                'action': 'BUY', 'symbol': symbol, 'chain': chain,
+                'usd': usd, 'price': price, 'tokens': tokens,
+                'time': datetime.now().isoformat(), 'source': source,
+                'coin_id': contract, 'dex_url': dex_url,
+                'category': category, 'allocation_score': allocation_score,
+            })
         try:
             if is_dry:
                 from executor import on_buy
@@ -831,31 +877,36 @@ class SimPortfolio:
             return False, "price is zero"
         if not self.can_buy(chain, usd):
             return False, f"insufficient cash (${self.cash.get(chain,0):.2f})"
-        chain_limit = 4 if chain in ('solana', 'bsc') else 3
-        current_count = sum(1 for pos in self.holdings.values()
-                            if pos.get('chain') == chain and not pos.get('is_real'))
-        if current_count >= chain_limit:
-            return False, f"chain position limit reached for {chain} ({current_count}/{chain_limit})"
         tokens = usd / price
-        self.cash[chain] -= usd
         key = f"{symbol}_{chain}"
-        self.holdings[key] = {
-            'symbol': symbol, 'chain': chain, 'amount': tokens,
-            'buy_price': price, 'buy_time': datetime.now().isoformat(),
-            'usd_spent': usd, 'source': source,
-            'coin_id': contract,
-            'dex_url': dex_url,
-            'category': category or _proposal_family({'category': '', 'sources': source}),
-            'allocation_score': allocation_score,
-            'is_real': False, '_zero_count': 0,
-        }
-        self.trades.append({
-            'action': 'BUY', 'symbol': symbol, 'chain': chain,
-            'usd': usd, 'price': price, 'tokens': tokens,
-            'time': datetime.now().isoformat(), 'source': source,
-            'coin_id': contract, 'dex_url': dex_url,
-            'category': category, 'allocation_score': allocation_score,
-        })
+        # Count-check-then-insert is locked as one unit — two concurrent
+        # callers (e.g. kol_tracker and pumpfun_stream firing at once) could
+        # otherwise both pass the count check before either inserts, jointly
+        # exceeding chain_limit.
+        with self._lock:
+            chain_limit = 4 if chain in ('solana', 'bsc') else 3
+            current_count = sum(1 for pos in self.holdings.values()
+                                if pos.get('chain') == chain and not pos.get('is_real'))
+            if current_count >= chain_limit:
+                return False, f"chain position limit reached for {chain} ({current_count}/{chain_limit})"
+            self.holdings[key] = {
+                'symbol': symbol, 'chain': chain, 'amount': tokens,
+                'buy_price': price, 'buy_time': datetime.now().isoformat(),
+                'usd_spent': usd, 'source': source,
+                'coin_id': contract,
+                'dex_url': dex_url,
+                'category': category or _proposal_family({'category': '', 'sources': source}),
+                'allocation_score': allocation_score,
+                'is_real': False, '_zero_count': 0,
+            }
+            self.trades.append({
+                'action': 'BUY', 'symbol': symbol, 'chain': chain,
+                'usd': usd, 'price': price, 'tokens': tokens,
+                'time': datetime.now().isoformat(), 'source': source,
+                'coin_id': contract, 'dex_url': dex_url,
+                'category': category, 'allocation_score': allocation_score,
+            })
+        self.cash[chain] -= usd
         return True, f"recorded {tokens:.4f} {symbol} @ ${price:.8f}"
 
     def sell(self, symbol, chain, price, reason='signal'):
@@ -891,15 +942,24 @@ class SimPortfolio:
                 return False, f"executor sell error: {e}"
             is_dry = True
 
-        self.cash[chain] = self.cash.get(chain, 0) + sell_val
-        del self.holdings[key]
-        self.trades.append({
-            'action': 'SELL', 'symbol': symbol, 'chain': chain,
-            'usd': sell_val, 'price': price, 'tokens': tokens,
-            'buy_price': pos['buy_price'],
-            'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason,
-            'time': datetime.now().isoformat(),
-        })
+        with self._lock:
+            # Guard against a second concurrent sell() on the same key
+            # (e.g. check_exits() and run_price_monitor() both deciding to
+            # exit the same position in the same instant) double-deleting
+            # and double-crediting cash. Cash credit lives INSIDE the lock,
+            # after this check — crediting first and checking after would
+            # double-credit on exactly the race this guard exists to stop.
+            if key not in self.holdings:
+                return False, "already sold (concurrent exit)"
+            self.cash[chain] = self.cash.get(chain, 0) + sell_val
+            del self.holdings[key]
+            self.trades.append({
+                'action': 'SELL', 'symbol': symbol, 'chain': chain,
+                'usd': sell_val, 'price': price, 'tokens': tokens,
+                'buy_price': pos['buy_price'],
+                'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason,
+                'time': datetime.now().isoformat(),
+            })
         try:
             # Refresh wallet balance after real sell
             if not is_dry:
@@ -1452,7 +1512,7 @@ def _established_curve(binance_pair):
         return None
 
 
-def _load_established_proposals(portfolio):
+def _load_established_proposals(portfolio, chain=None):
     """
     Dynamic established token proposals driven entirely by token_intelligence scores.
 
@@ -1463,10 +1523,18 @@ def _load_established_proposals(portfolio):
       3. Filter: only BUY/STRONG_BUY signals, score >= +0.1
       4. Look up contract in _CONTRACT_REGISTRY — skip if unknown or macro-only
       5. Verify price momentum from Binance (not crashing)
-      6. Propose with $2 cap and tight SL/TP from registry
+      6. Propose sized by the sizing model, tight SL/TP from registry
 
     New tokens get added automatically by updating token_intelligence.py TRACKED_TOKENS.
     No changes to simulation.py needed.
+
+    chain: optional filter (e.g. 'solana') for ChainAgent's per-chain
+    pipeline — when set, only that chain's registry entries are scored at
+    all (skipped before the Binance API call, not after), and the Top-N
+    ranking/ESTABLISHED_MAX_PROPOSALS cap applies within that one chain
+    instead of across the combined 3-chain universe. None (default)
+    preserves the original combined-ranking behavior for the old
+    run_agent_cycle() path.
     """
     import sqlite3 as _sq
     proposals = []
@@ -1520,12 +1588,14 @@ def _load_established_proposals(portfolio):
             if not registry or not isinstance(registry, dict):
                 continue  # not in registry or is a set (macro-only marker)
 
-            chain = registry['chain']
-            if chain not in CHAINS:
+            registry_chain = registry['chain']
+            if registry_chain not in CHAINS:
                 continue
+            if chain is not None and registry_chain != chain:
+                continue  # ChainAgent's per-chain filter — skip before the Binance call
             if sym in real_syms and not ESTABLISHED_ALLOW_TOPUPS:
                 continue  # already holding in real wallet
-            if f"{sym}_{chain}" in portfolio.holdings:
+            if f"{sym}_{registry_chain}" in portfolio.holdings:
                 continue  # already in sim position
 
             # Step 5: live price check — not crashing, not overbought, and not rolling over.
@@ -1600,7 +1670,7 @@ def _load_established_proposals(portfolio):
             ranked.append((rotation_score, {
                 'action': 'BUY' if intelligence_buy else 'ACCUMULATE',
                 'symbol': sym,
-                'chain': chain,
+                'chain': registry_chain,
                 'coin_id': registry['coin_id'],
                 'price': price,
                 'trade_usd': trade_usd,
@@ -2219,6 +2289,29 @@ def run_agent_cycle(portfolio, stop_loss=STOP_LOSS_PCT, take_profit=TAKE_PROFIT_
             f"{p['action']} {p['symbol']}({p.get('chain','?')[:3]})" for p in actionable[:10]))
         proposals = _rank_and_size_proposals(portfolio, proposals)
 
+    actions += _process_buy_proposals(portfolio, proposals)
+    return actions
+
+
+def _process_buy_proposals(portfolio, proposals):
+    """
+    Shared per-proposal gate/ban/execute pipeline. Takes an already-built,
+    already-sized list of proposals — from either the old cross-chain
+    allocator (run_agent_cycle) or ChainAgent's per-chain conviction-scaled
+    sizing model — and runs every one through the same hard exclusions, rug
+    checks, market/watchlist/AI gates, and buy() call.
+
+    Extracted out of run_agent_cycle() so ChainAgent reuses this exact,
+    already-hardened logic (bad-tick guards, benign-error ban classification,
+    gas guards downstream in executor.py) instead of a parallel rewrite that
+    could silently drift from it. Note: SIM_MAX_NEW_BUYS_PER_CYCLE is enforced
+    PER CALL — when 3 ChainAgents each call this independently, each chain
+    gets its own new-buys-per-cycle budget rather than one shared budget
+    split three ways, consistent with full per-chain independence.
+
+    Returns the number of successful buy actions.
+    """
+    actions = 0
     # Ban by symbol across all chains — strip |date suffix from dated entries
     stop_lossed_syms = {t['symbol'] for t in portfolio.trades
                         if t['action'] == 'SELL' and t.get('reason') == 'stop_loss'}
